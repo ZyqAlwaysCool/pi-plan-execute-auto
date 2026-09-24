@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.pi-plan-execute-auto/
+*.tsbuildinfo

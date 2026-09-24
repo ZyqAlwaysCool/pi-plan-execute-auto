@@ -1,0 +1,28 @@
+name: Required sandbox security tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  sandbox:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install trusted system bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          test "$(stat -c %u /usr/bin/bwrap)" = 0
+          unshare -Ur true
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - run: npm run test:sandbox:required
+      - run: npm test
+# Real ACP provider integration is deliberately a separate, explicit billable job:
+# npm run test:acp:required, with saved provider auth and both routed model env vars.

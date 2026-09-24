@@ -1,0 +1,290 @@
+/** Public data contracts for pi-plan-execute-auto. */
+
+export const WORKFLOW_VERSION = 1 as const;
+export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
+export const RUNTIME_DIRECTORY = ".runtime";
+export const STATE_FILE = ".state.json";
+export const MANIFEST_FILE = "manifest.yaml";
+
+export type WorkflowStatus =
+  | "draft"
+  | "frozen"
+  | "running"
+  | "paused"
+  | "completed"
+  | "cancelled";
+
+export interface DocumentReference {
+  id: string;
+  path: string;
+  purpose: string;
+}
+
+export interface CommitContract {
+  required: true;
+  message: string;
+}
+
+export interface PhaseReference {
+  id: string;
+  order: number;
+  spec: string;
+  acceptance: string;
+  commit: CommitContract;
+}
+
+export interface Manifest {
+  version: 1;
+  documents: DocumentReference[];
+  phases: PhaseReference[];
+  max_review_rounds?: number;
+}
+
+export interface AcceptanceSelfTest {
+  id: string;
+  command: string;
+  required: boolean;
+}
+
+export interface AcceptanceContract {
+  version: 1;
+  phase_id: string;
+  scope: {
+    allowed_paths: string[];
+  };
+  self_tests: AcceptanceSelfTest[];
+  review: {
+    require_no_blocking_findings: true;
+  };
+  commit: {
+    required: true;
+    allow_empty: boolean;
+  };
+}
+
+export interface PackageFileInput {
+  path: string;
+  content: string;
+}
+
+export interface FinalizeInput {
+  run_id?: string;
+  manifest: Manifest;
+  files: PackageFileInput[];
+  approval?: "ask" | "approve" | "cancel";
+  start_stage_b?: boolean;
+  executor_model?: string;
+  reviewer_model?: string;
+}
+
+export interface PackageValidationIssue {
+  code: string;
+  path: string;
+  message: string;
+}
+
+export interface PhasePackage {
+  phase: PhaseReference;
+  spec: string;
+  acceptance: AcceptanceContract;
+}
+
+export interface ValidatedPackage {
+  root: string;
+  manifest: Manifest;
+  phases: PhasePackage[];
+  package_hash: string;
+  golden_files: string[];
+}
+
+export interface ExecutionSelfTestEvidence {
+  id: string;
+  command: string;
+  status: "passed" | "failed" | "skipped";
+  output?: string;
+}
+
+export interface ExecutionReport {
+  phase_id: string;
+  round: number;
+  base_commit: string;
+  status: "complete" | "blocked" | "failed";
+  summary: string;
+  changed_files: string[];
+  self_tests: ExecutionSelfTestEvidence[];
+  resolved_findings: string[];
+  known_issues: string[];
+  executor_session_id?: string;
+}
+
+export type ReviewVerdict = "PASS" | "REWORK";
+
+export interface ReviewFinding {
+  id: string;
+  severity: string;
+  summary: string;
+  evidence: string;
+  blocking: boolean;
+}
+
+export interface ReviewReport {
+  phase_id: string;
+  round: number;
+  base_commit: string;
+  verdict: ReviewVerdict;
+  summary: string;
+  findings: ReviewFinding[];
+  evidence: string[];
+  acceptance_assessment: string;
+  out_of_scope_changes: string[];
+  reviewer_session_id?: string;
+}
+
+export interface AcceptanceResult {
+  id: string;
+  command: string;
+  required: boolean;
+  exit_code: number | null;
+  passed: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+export interface PhaseCompletionRecord {
+  version: 1;
+  phase_id: string;
+  base_commit_sha: string;
+  phase_commit_sha: string;
+  committed_at: string;
+  review_rounds: number;
+  acceptance_results: AcceptanceResult[];
+  execution_report_path: string;
+  execution_report_sha256: string;
+  review_report_path: string;
+  review_report_sha256: string;
+  acceptance_report_path: string;
+  acceptance_report_sha256: string;
+  final_diff_path: string;
+  final_diff_sha256: string;
+  reviewed_diff_sha256: string;
+  package_hash: string;
+}
+
+export interface PhaseState {
+  phase_id: string;
+  status: "pending" | "running" | "paused" | "completed";
+  base_commit_sha?: string;
+  phase_commit_sha?: string;
+  committed_at?: string;
+  review_rounds: number;
+  execution_report_path?: string;
+  execution_report_paths: string[];
+  review_report_path?: string;
+  review_report_paths: string[];
+  acceptance_report_path?: string;
+  acceptance_results?: AcceptanceResult[];
+  unresolved_findings: ReviewFinding[];
+  executor_session_id?: string;
+  reviewer_session_id?: string;
+  final_diff_path?: string;
+  final_diff_sha256?: string;
+  reviewed_diff_sha256?: string;
+  completion_record_path?: string;
+  completion_record_sha256?: string;
+  last_error?: string;
+}
+
+export type ReasoningEffort = "low" | "medium" | "high" | "max";
+
+export interface WorkflowState {
+  version: 1;
+  run_id: string;
+  package_hash: string;
+  package_dir: string;
+  status: WorkflowStatus;
+  created_at: string;
+  approved_at?: string;
+  started_at?: string;
+  completed_at?: string;
+  executor_model?: string;
+  reviewer_model?: string;
+  reasoning_effort?: ReasoningEffort;
+  branch_name?: string;
+  worktree_path?: string;
+  /** Exact disposable dependency roots provisioned for this run; never a basename wildcard. */
+  controlled_environment_paths?: string[];
+  phases: PhaseState[];
+  pause_reason?: string | undefined;
+}
+
+export interface WorkflowStatusSnapshot {
+  run_id: string;
+  status: WorkflowStatus;
+  package_dir: string;
+  package_hash: string;
+  branch_name?: string | undefined;
+  worktree_path?: string | undefined;
+  current_phase?: string | undefined;
+  completed_phases: number;
+  total_phases: number;
+  pause_reason?: string | undefined;
+}
+
+export interface GitCommandResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+  killed?: boolean;
+}
+
+export interface GitOperations {
+  run(args: string[], options?: { signal?: AbortSignal | undefined; timeout?: number | undefined; cwd?: string | undefined }): Promise<GitCommandResult>;
+}
+
+export interface AcceptanceCommandRunner {
+  run(command: string, options?: { signal?: AbortSignal | undefined; timeout?: number | undefined }): Promise<GitCommandResult>;
+}
+
+export interface HarnessPair {
+  execute(
+    prompt: string,
+    round: number,
+    options?: { signal?: AbortSignal | undefined; phaseBaseCommit?: string | undefined },
+  ): Promise<ExecutionReport>;
+  rework(
+    prompt: string,
+    round: number,
+    options?: { signal?: AbortSignal | undefined; phaseBaseCommit?: string | undefined },
+  ): Promise<ExecutionReport>;
+  review(
+    prompt: string,
+    round: number,
+    options?: { signal?: AbortSignal | undefined },
+  ): Promise<ReviewReport>;
+  close(): Promise<void>;
+}
+
+export interface StageBStatusEvent {
+  phase_id: string;
+  round: number;
+  executor_status: "pending" | "running" | "complete" | "failed";
+  reviewer_status: "pending" | "running" | "pass" | "rework" | "failed";
+  message: string;
+}
+
+export interface StageBRunResult {
+  status: "completed" | "paused" | "aborted";
+  state: WorkflowState;
+  reason?: string | undefined;
+}
+
+export function isWorkflowStatus(value: unknown): value is WorkflowStatus {
+  return (
+    value === "draft" ||
+    value === "frozen" ||
+    value === "running" ||
+    value === "paused" ||
+    value === "completed" ||
+    value === "cancelled"
+  );
+}

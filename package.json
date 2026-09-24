@@ -1,0 +1,48 @@
+{
+  "name": "pi-plan-execute-auto",
+  "version": "0.1.0",
+  "description": "Pi-native phased planning, review, and phase-commit workflow extension",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "workflow",
+    "coding-agents"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp src/pi-acp-bootstrap.mjs dist/src/pi-acp-bootstrap.mjs",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:all": "npm run check && npm test",
+    "test:sandbox:required": "PI_PLAN_EXECUTE_REQUIRE_BWRAP_TESTS=1 tsx --test tests/sandbox.test.ts",
+    "test:acp:required": "tsx --test tests/real-acp.integration.ts",
+    "test:acp:builtins:required": "tsx --test tests/real-acp.builtins.integration.ts",
+    "format:check": "tsc -p tsconfig.json --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@automatalabs/workflows": "^7.0.1",
+    "jsonc-parser": "3.3.1",
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.0",
+    "@earendil-works/pi-tui": "0.87.0",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typebox": "1.3.27",
+    "typescript": "^5.8.3"
+  }
+}
