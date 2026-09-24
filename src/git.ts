@@ -545,7 +545,7 @@ export class GitWorkspace {
   async assertDedicatedIdentity(): Promise<void> {
     if (!this.dedicatedBranch || !this.dedicatedWorktreePath) {
       throw new GitPolicyError(
-        "Stage B requires a plugin-created dedicated branch and worktree.",
+        "Execution & Review requires a plugin-created dedicated branch and worktree.",
         "DEDICATED_WORKTREE_REQUIRED",
       );
     }
@@ -556,7 +556,7 @@ export class GitWorkspace {
     }
     if (branchResult.stdout.trim() !== this.dedicatedBranch || resolve(topResult.stdout.trim()) !== resolve(this.dedicatedWorktreePath)) {
       throw new GitPolicyError(
-        `Stage B is not running in its dedicated worktree (${this.dedicatedBranch} at ${this.dedicatedWorktreePath}).`,
+        `Execution & Review is not running in its dedicated worktree (${this.dedicatedBranch} at ${this.dedicatedWorktreePath}).`,
         "WORKTREE_IDENTITY_MISMATCH",
       );
     }
@@ -776,7 +776,7 @@ export async function ensureDedicatedWorktree(
   const dirty = await source.changedPaths(commandOptions);
   if (dirty.length > 0) {
     throw new GitPolicyError(
-      `Main worktree must be clean before creating a dedicated Stage B worktree: ${dirty.join(", ")}.`,
+      `Main worktree must be clean before creating the dedicated execution worktree: ${dirty.join(", ")}.`,
       "SOURCE_WORKTREE_DIRTY",
     );
   }

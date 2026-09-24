@@ -88,6 +88,7 @@ test("interactive wizard records only a separate human network consent and confi
   let codexProbes = 0;
   let cliProbes = 0;
   let manualInputs = 0;
+  let connectivityChecks = 0;
   const warnings: string[] = [];
   const discoverCodex = async () => { codexProbes += 1; return ["codex/gpt-6-luna"]; };
   const discoverClis = async () => { cliProbes += 1; return clis; };
@@ -101,7 +102,7 @@ test("interactive wizard records only a separate human network consent and confi
         if (title.includes("model (candidates")) return choices[0];
         if (title.startsWith("Executor:")) return choices[0];
         if (title.startsWith("Reviewer:")) return choices[1];
-        if (title.startsWith("ACP reasoning effort")) return choices[2];
+        if (title.startsWith("Reasoning effort")) return choices[2];
         if (title.startsWith("Maximum review rounds")) return choices[1];
         if (title.startsWith("Agent permission handling")) return choices[0];
         throw new Error(`Unexpected selection: ${title}`);
@@ -110,7 +111,8 @@ test("interactive wizard records only a separate human network consent and confi
       async confirm(title: string, message: string) {
         confirmations += 1;
         if (title.includes("discovery")) assert.match(message, /mounts no project files/);
-        else { assert.match(title, /ACP networking/); assert.match(message, /normal network access|normal standalone CLI session/); }
+        else if (title.includes("live Agent CLI connectivity")) assert.match(message, /may incur provider charges/);
+        else { assert.match(title, /Agent CLI network access/); assert.match(message, /normal network access|normal standalone CLI session/); }
         return consent;
       },
     },
@@ -121,18 +123,33 @@ test("interactive wizard records only a separate human network consent and confi
     assert.equal(cliProbes, 0); // No CLI or ACP process is launched before risk consent.
     assert.equal(await loadProjectPluginProfile(project, agentDir), undefined);
     consent = true;
-    const configured = await runSetupWizard(ctx, discoverClis, agentDir, discoverCodex, discoverEfforts);
-    assert.equal(confirmations, 3);
+    const configured = await runSetupWizard(
+      ctx,
+      discoverClis,
+      agentDir,
+      discoverCodex,
+      discoverEfforts,
+      async () => { connectivityChecks += 1; },
+    );
+    assert.equal(confirmations, 4);
     assert.equal(cliProbes, 1);
     assert.equal(codexProbes, 1);
     assert.equal(manualInputs, 0);
+    assert.equal(connectivityChecks, 2);
     assert.equal(configured?.executorModel, "opencode/deepseek-local/deepseek-flash");
     assert.equal(configured?.reviewerModel, "codex/gpt-6-luna");
     assert.equal(configured?.reasoningEffort, "high");
     assert.equal(configured?.reviewRoundLimit, 5);
     assert.equal(configured?.permissionMode, "autonomous");
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), configured);
-    const fallback = await runSetupWizard(ctx, clis, agentDir, async () => { throw new Error("ACP catalog unavailable"); }, discoverEfforts);
+    const fallback = await runSetupWizard(
+      ctx,
+      clis,
+      agentDir,
+      async () => { throw new Error("ACP catalog unavailable"); },
+      discoverEfforts,
+      async () => { connectivityChecks += 1; },
+    );
     assert.equal(fallback?.reviewerModel, "codex/gpt-6-luna");
     assert.equal(manualInputs, 1);
     assert.match(warnings.join("\n"), /ACP catalog unavailable.*Enter an exact model ID manually/);
@@ -149,7 +166,7 @@ test("all four backend routes share one wizard; reasoning is the intersection of
     cwd: project, hasUI: true, ui: {
       notify() {},
       async confirm(title: string, message: string) {
-        if (title.includes("billable")) { smokeApprovals += 1; assert.match(message, /incur charges/); }
+        if (title.includes("live Agent CLI connectivity")) { smokeApprovals += 1; assert.match(message, /may incur provider charges/); }
         return true;
       },
       async select(title: string, choices: string[]) {
@@ -157,7 +174,7 @@ test("all four backend routes share one wizard; reasoning is the intersection of
         if (title.startsWith("Reviewer: choose")) return choices[1];
         if (title.includes("claude model")) { assert.deepEqual(choices.slice(0, 1), ["claude/sonnet"]); return choices[0]; }
         if (title.includes("pi model")) { assert.deepEqual(choices.slice(0, 1), ["pi/openai-codex/gpt-5.5"]); return choices[0]; }
-        if (title.startsWith("ACP reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "backend default", "Cancel"]); return "high"; }
+        if (title.startsWith("Reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "backend default", "Cancel"]); return "high"; }
         if (title.startsWith("Maximum review rounds")) return choices[1];
         if (title.startsWith("Agent permission handling")) return choices[1];
         throw new Error(`Unexpected choice: ${title}`);
@@ -183,15 +200,15 @@ test("all four backend routes share one wizard; reasoning is the intersection of
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("declined billable Claude/Pi provider preflight stores no project or consent file", async () => {
+test("declined live Agent CLI connectivity preflight stores no project or consent file", async () => {
   const { root, project, agentDir } = await fixture();
   const ctx = {
     cwd: project, hasUI: true, ui: {
       notify() {},
-      async confirm(title: string) { return !title.includes("billable"); },
+      async confirm(title: string) { return !title.includes("live Agent CLI connectivity"); },
       async select(title: string, choices: string[]) {
         if (title.includes("model (candidates")) return choices[0];
-        if (title.startsWith("ACP reasoning effort")) return "medium";
+        if (title.startsWith("Reasoning effort")) return "medium";
         if (title.startsWith("Maximum review rounds")) return choices[0];
         if (title.startsWith("Agent permission handling")) return choices[0];
         return choices[0];

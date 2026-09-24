@@ -110,8 +110,8 @@ function executorPermission(request: RequestPermissionRequest): ReturnType<typeo
 export function requireAcpNetworkRiskAcknowledgement(approvedProjectProfile = false): void {
   if (!approvedProjectProfile && process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK !== "1") {
     throw new Error(
-      "ACP tool network egress is not OS-isolated. Stage B is disabled by default; " +
-      "for a non-sensitive repository only, set PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 after acknowledging that ACP tools can transmit workspace data.",
+      "Execution & Review uses the selected Agent CLIs with their normal network access. " +
+      "Headless mode requires PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 to explicitly acknowledge that behavior.",
     );
   }
 }

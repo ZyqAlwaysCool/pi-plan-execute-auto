@@ -260,14 +260,19 @@ export async function runSetupWizard(
 ): Promise<ProjectPluginProfile | undefined> {
   if (!ctx.hasUI) throw new Error("Setup requires Pi's interactive UI (or RPC dialogs).");
   const preConsent = await ctx.ui.confirm(
-    "Allow model discovery network risk?",
+    "Allow Agent CLI discovery?",
     "CLI model discovery may access the host network. ACP catalog fallbacks for Claude, Codex, OpenCode and Pi use a temporary sandboxed read-only session. " +
     "ACP servers still share the host network namespace. Do not proceed for sensitive repositories. " +
     "Catalog discovery mounts no project files and submits no model turn. Selecting a backend without completed live tests will require a separate billable connectivity confirmation.",
   );
   if (!preConsent) return undefined;
   const detected = typeof clis === "function" ? await clis() : clis;
-  if (detected.length === 0) throw new Error("No working Claude, Codex, OpenCode or Pi CLI was found on PATH. Install and authenticate a supported harness before setup.");
+  if (detected.length === 0) throw new Error("No working Claude, Codex, OpenCode or Pi CLI was found on PATH. Install and authenticate a supported Agent CLI before setup.");
+  notify(
+    ctx,
+    ["Agent CLI preflight", ...detected.map((cli) => `✓ ${cli.backend}: ${cli.version} (${cli.executable})`)].join("\n"),
+    "info",
+  );
   const catalogs = new Map<AcpBackend, Promise<string[]>>();
   const catalog = (backend: AcpBackend) => {
     let pending = catalogs.get(backend);
@@ -283,7 +288,7 @@ export async function runSetupWizard(
     : discoverEfforts(ctx.cwd, supportedBackendForModel(reviewerModel), reviewerModel);
   const [executorEfforts, reviewerEfforts] = await Promise.all([executorEffortsPromise, reviewerEffortsPromise]);
   const available = (["low", "medium", "high", "max"] as const).filter((effort) => executorEfforts.includes(effort) && reviewerEfforts.includes(effort));
-  const effortChoice = await ctx.ui.select("ACP reasoning effort (shared by both selected models)", [...available, "backend default", "Cancel"]);
+  const effortChoice = await ctx.ui.select("Reasoning effort (shared by both selected models)", [...available, "backend default", "Cancel"]);
   if (!effortChoice || effortChoice === "Cancel") return undefined;
   const reasoningEffort = effortChoice === "backend default" ? undefined : selectStageBReasoningEffort(effortChoice);
 
@@ -309,20 +314,18 @@ export async function runSetupWizard(
   if (!permissionChoice || permissionChoice === "Cancel") return undefined;
   const permissionMode: AgentPermissionMode = permissionChoice === askLabel ? "ask" : "autonomous";
 
-  const needsLiveCheck = [...new Set([executorModel, reviewerModel])].filter((route) =>
-    supportedBackendForModel(route) === "claude" || supportedBackendForModel(route) === "pi");
+  const needsLiveCheck = [...new Set([executorModel, reviewerModel])];
   if (needsLiveCheck.length) {
     const allowCalls = await ctx.ui.confirm(
-      "Run billable Claude/Pi ACP connectivity checks?",
-      `Selected models: ${needsLiveCheck.join(", ")}. Each check sends a small prompt to the real provider from an isolated disposable repository, ` +
-      "after removing startup credential files. It may incur charges and still uses the host network. " +
-      "A failed check will NOT be replaced with another model or silently ignored. No project files are mounted.",
+      "Run live Agent CLI connectivity checks?",
+      `Selected routes: ${needsLiveCheck.join(", ")}. Each check opens the selected ACP/CLI in an isolated disposable repository and sends a tiny READY prompt. ` +
+      "This uses your normal CLI/provider configuration and may incur provider charges. A failed check stops setup; the plugin never substitutes another model. No project files are mounted.",
     );
     if (!allowCalls) return undefined;
     for (const route of needsLiveCheck) await verifyConnectivity(ctx.cwd, route, reasoningEffort);
   }
   const consent = await ctx.ui.confirm(
-    "Enable ACP networking for this project?",
+    "Confirm normal Agent CLI network access?",
     `Executor: ${executorModel}\nReviewer: ${reviewerModel}\nReasoning: ${reasoningEffort ?? "backend default"}\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\n\n` +
     "The selected Agent CLIs and their tools keep normal network access, matching a normal standalone CLI session. " +
     "The plugin still isolates the dedicated worktree and unrelated host files; this confirmation does not approve or start execution.",
@@ -762,7 +765,7 @@ async function startStageB(
     const envExecutor = process.env.PI_PLAN_EXECUTE_EXECUTOR_MODEL;
     const envReviewer = process.env.PI_PLAN_EXECUTE_REVIEWER_MODEL;
     if (!envExecutor || !envReviewer) {
-      return { status: "not_started", state, reason: "Headless Stage B requires explicit PI_PLAN_EXECUTE_EXECUTOR_MODEL and PI_PLAN_EXECUTE_REVIEWER_MODEL." };
+      return { status: "not_started", state, reason: "Headless Execution & Review requires explicit PI_PLAN_EXECUTE_EXECUTOR_MODEL and PI_PLAN_EXECUTE_REVIEWER_MODEL." };
     }
     if ((state.executor_model && state.executor_model !== envExecutor) || (state.reviewer_model && state.reviewer_model !== envReviewer) ||
       (options?.executorModel && options.executorModel !== envExecutor) || (options?.reviewerModel && options.reviewerModel !== envReviewer)) {
@@ -809,7 +812,7 @@ async function startStageB(
 
   const linked = linkedAbortSignal(options?.signal ?? ctx.signal, stageTimeoutMs());
   const active: ActiveRun = { controller: new AbortController(), startedAt: new Date().toISOString() };
-  const relay = () => linked.controller.abort(active.controller.signal.reason ?? new Error("Stage B stopped by human."));
+  const relay = () => linked.controller.abort(active.controller.signal.reason ?? new Error("Execution & Review stopped by human."));
   active.controller.signal.addEventListener("abort", relay, { once: true });
   activeRuns.set(runId, active);
   let harness: AgentPrismSessionPair | undefined;
@@ -854,6 +857,11 @@ async function startStageB(
       reviewerModel,
       ...(configuredReasoningEffort ? { reasoningEffort: configuredReasoningEffort } : {}),
       ...(profile ? { networkRiskApproved: true } : {}),
+      ...(executorModel.startsWith("codex/")
+        ? { executorMode: "agent" }
+        : executorModel.startsWith("opencode/")
+          ? { executorMode: "build" }
+          : {}),
       permissionMode: configuredPermissionMode,
       onPermissionChoice: async (role, request) => {
         if (!ctx.hasUI) return undefined;

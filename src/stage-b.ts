@@ -927,7 +927,7 @@ export class StageBController {
       await this.save();
       return { status: "completed", state: this.state };
     } catch (error) {
-      if (this.options.signal?.aborted) return this.pause(currentPhase, "Stage B was cancelled.", "ABORTED");
+      if (this.options.signal?.aborted) return this.pause(currentPhase, "Execution & Review was cancelled.", "ABORTED");
       if (error instanceof WorkflowPauseError) return this.pause(currentPhase, error.message, error.code);
       if (error instanceof GitPolicyError) return this.pause(currentPhase, error.message, error.code);
       const message = error instanceof Error ? error.message : String(error);
