@@ -429,6 +429,39 @@ test("OpenCode runtime rejects a PATH binary sourced from the project tree", {
   }
 });
 
+test("OpenCode runtime accepts a current-user-owned 0775 install tree outside protected roots", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-opencode-user-install-"));
+  const install = join(fixture, "user-install");
+  const bin = join(install, "bin");
+  const executable = join(bin, "opencode");
+  const worktree = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+  const previousPath = process.env.PATH;
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    await mkdir(bin, { recursive: true, mode: 0o775 });
+    await chmod(install, 0o775);
+    await chmod(bin, 0o775);
+    await writeFile(executable, "#!/bin/sh\nexit 0\n");
+    await chmod(executable, 0o755);
+    process.env.PATH = `${bin}:${previousPath ?? "/usr/bin:/bin"}`;
+    sandbox = await createSandboxedBackend({
+      role: "executor",
+      model: "opencode/opencode/big-pickle",
+      cwd: worktree,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+    });
+    assert.equal(sandbox.backendId, "opencode");
+    assert.ok((sandbox.config.args ?? []).includes(executable));
+  } finally {
+    await sandbox?.cleanup();
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
 test("an executable fake bwrap cannot pass provenance validation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "peac-fake-bwrap-"));
   const fake = join(directory, "bwrap");

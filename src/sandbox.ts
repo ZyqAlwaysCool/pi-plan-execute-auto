@@ -795,8 +795,23 @@ function assertTrustedExternalAgentBinary(
   let cursor = dirname(real);
   while (cursor !== dirname(cursor)) {
     const parent = statSync(cursor);
-    if ((parent.mode & 0o022) !== 0) {
-      throw new Error(`External agent binary has a group/world-writable parent directory: ${cursor}`);
+    // A user-installed CLI commonly lives below ~/.opencode with 0775 directories
+    // (notably on WSL with umask 0002). The current OS user is already a trusted
+    // host principal: requiring every user-owned ancestor to be non-group-writable
+    // rejects normal installations without defending against that same principal.
+    //
+    // Keep the actual executable non-group/world-writable above, always reject
+    // world-writable ancestors, and allow group-write only on directories owned
+    // by the current trusted user. Root/foreign-owned group-writable directories
+    // remain untrusted because another principal can replace path components.
+    if ((parent.mode & 0o002) !== 0) {
+      throw new Error(`External agent binary has a world-writable parent directory: ${cursor}`);
+    }
+    if ((parent.mode & 0o020) !== 0 && (uid === undefined || parent.uid !== uid)) {
+      throw new Error(`External agent binary has a group-writable parent directory not owned by the current user: ${cursor}`);
+    }
+    if (uid !== undefined && parent.uid !== 0 && parent.uid !== uid) {
+      throw new Error(`External agent binary has a parent directory owned by another user: ${cursor}`);
     }
     cursor = dirname(cursor);
   }
