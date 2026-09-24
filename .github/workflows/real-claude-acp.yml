@@ -1,0 +1,48 @@
+name: Manual Claude ACP integration
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Exact Claude ACP route to bill and validate
+        required: true
+        default: claude/sonnet
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  claude:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install trusted system bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          test "$(stat -c %u /usr/bin/bwrap)" = 0
+          unshare -Ur true
+      - run: npm ci
+      - name: Require protected Claude host credential
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_AUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "Configure ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY as a repository secret." >&2
+            exit 1
+          fi
+      - name: Run billable Claude Executor, Reviewer, and one-phase integration
+        env:
+          PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK: '1'
+          PI_PLAN_EXECUTE_ACP_TEST_CLAUDE_MODEL: ${{ inputs.model }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}
+        run: npm run test:acp:claude:required

@@ -1,29 +1,89 @@
-# Claude 与四端统一接入：凭据边界调研（尚未实施新通道）
+# Claude 与四端统一接入：安全凭据 Relay 已实现
 
-## 已核实的事实
+## 当前架构
 
-- 本项目安装的 `@automatalabs/acp-agents@3.3.0` 把 `claude` 列为内置后端，借助 `@agentclientprotocol/claude-agent-acp@0.79.0`（Claude Agent SDK）启动 ACP。`claude/sonnet` 是 AgentPrism 支持的路由；缺的不是 AgentPrism Claude adapter。
-- 当前宿主 `claude -p --model sonnet` 真请求返回 `OK`；当前进程设置了 `ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_BASE_URL`（未读取/输出值）。在独立 HOME/配置目录中移除前者，`claude auth status` 从 `loggedIn: true` 变为 false。宿主成功因此不能证明其具有可独立转移的登录凭据或访问默认 Anthropic 端点。沙箱所检查的 `~/.claude/.credentials.json` 不存在。
-- `src/sandbox.ts` 的 `--clearenv` 不转发宿主令牌、端点或整个 Claude 配置。Claude 真正的三项隔离测试目前 **0/3**，都在启动前因没有安全的独立凭据而拒绝；尚无沙箱 Claude provider 请求。Pi (`pi/openai-codex/gpt-5.5`) **3/3**，Codex/OpenCode 指定路由 **3/3**，不能把不同提供方或模型当作 Claude 的静默替代。
-- AgentPrism 的 `onAuth` / `AuthStore` 提供 `env` 和 ACP gateway `_meta` 凭据接口，后者不是秘密隔离。已安装 Claude ACP 的 `createEnvForProvider()` 将 gateway headers 组装到 `ANTHROPIC_CUSTOM_HEADERS`，并把 provider env 同时写到 Claude SDK 的 subprocess `env` 与 settings `env`；把真实 `Authorization` header 放在 ACP gateway `_meta` 仍会使秘密进入模型可能调用内部文件/执行工具的子进程环境。内存 AuthStore 的日志脱敏不能取代 OS 不可达证明。见 `node_modules/@agentclientprotocol/claude-agent-acp/dist/acp-agent.js`（`authenticate`、`createEnvForProvider`、`session/query`）及 `node_modules/@automatalabs/acp-agents/dist/auth/auth-types.d.ts`。
-- `clientHandlers` 只接管 ACP agent 主动委托给客户端的 fs/terminal 请求；AgentPrism 文档明确说明 agent 默认使用自身的内部文件/执行工具。因此配置客户端 permission deny、仅清理工具子进程 env、或使用文件描述符传令牌，都**未经证明**能阻止内部工具通过继承环境或 `/proc` 读取父进程秘密。不能作为现成修复。
+Stage B 的四个 backend 都走同一个宿主边界：
 
-## 方案比较
+```text
+Main Pi / StageBController
+  -> AgentPrism AcpAgent
+  -> run-scoped CustomBackendConfig
+  -> root-owned bubblewrap
+  -> backend ACP runtime
+     - claude-agent-acp
+     - codex-acp
+     - opencode acp
+     - pi-acp
+```
 
-| 方案 | 是否保留 Claude ACP 后端 | 当前判断 |
-| --- | --- | --- |
-| 用户自行完成独立 CLI 登录，且有安全可暂存的凭据文件 | 是 | 最小改动；只有该凭据在隔离 Claude ACP 中实际可用且首次模型请求前能安全移除磁盘副本才可判通过。目前宿主使用环境令牌，条件不满足。登录文件是否由当前 CLI 生成、删除时机是否影响后续请求，均须真实测试。 |
-| 直接向 Claude ACP / SDK 转发 `ANTHROPIC_AUTH_TOKEN` 或真实 gateway headers（包括 AgentPrism `onAuth` / gateway `_meta`） | 是 | **拒绝**：adapter 最终把秘密传到 SDK env/settings，不能证明模型可调用的内部 Bash/Read/子 agent 不可见。只用于非敏感仓库的网络风险同意，不是凭据泄露同意。 |
-| **可信宿主侧凭据注入代理**（建议为当前环境令牌模式设计） | 是 | 可行的研究方向，**未实施、未验收**。宿主可信进程独占读取现有令牌及原有 endpoint；Claude ACP 沙箱只见不含凭据的本地代理地址和无效占位认证值，宿主代理向固定批准的上游注入真实认证。不能直接把真实 headers 交给 AgentPrism gateway auth。需要严格 OS/协议边界及合成+真实 ACP 测试，不能现在宣称成功。 |
-| 使用 Pi/OpenCode 的 Anthropic 模型作为 `pi/...` / `opencode/...` | 否 | 或能调用相同模型家族，但执行器、权限/工具及登录语义均非 Claude Code ACP；仅在用户明确选择该路由且真实测试通过时可用，不算 Claude 后端验收。 |
+`AcpAgent` 是一 agent 一独立 ACP process/connection 的 SDK 路径，不经过 AgentPrism runner pool。插件没有把 Executor/Reviewer 实现成 Main Pi 或其它 backend 的 subagent：Executor 持有自己的完整 ACP session，并在同一 phase 的 REWORK turn 间保持；每个 Reviewer round 创建新的完整 ACP session。真实集成测试还断言完整 Stage B 中 Executor 与 Reviewer 的 session id 不相同。
 
-## 建议的宿主凭据代理验收门槛
+## Claude 凭据边界
 
-1. 插件仅由可信宿主侧代码读取认证环境，**不在命令行、文件、ACP `_meta`、子进程 env、MCP 参数、报告、日志中携带真实秘密**。代理进程位于 ACP PID/挂载命名空间之外；只为获批准的仓库、run、backend、上游 origin 和模型绑定；项目可编辑缓存不能更换目标或授予同意。没有相应人类网络风险同意则拒绝。
-2. 沙箱内只看到固定本地端点、非敏感占位凭据；代理只允许固定 Anthropic-compatible API 路径/方法，限定请求大小、并发、超时、速率和重定向；拒绝任意 URL、HTTP CONNECT、带密钥的重定向/响应头、来自沙箱的认证头透传。正确处理 SSE streaming、中断与代理 HTTP(S) 出口。令牌仅在可信宿主请求上游时注入，不通过返回值反射。模型工具仍可向这个受限代理发起可能计费的请求：不是模型用量或 ACP 网络出口隔离，应明确提示人类。
-3. 上游 endpoint 必须由用户拥有的配置与独立批准记录确定；不可静默从定制 gateway 切回默认 Anthropic、改路由、换模型或降思考强度。测试精确请求 model 字段和 ACP 公告的选定值；上游内部重新映射模型若不可验证，则须如实标注。凭据从宿主环境消失、代理退出、恢复时须 fail closed，并清理监听端点。
-4. 先在合成仓库用**假令牌/假上游**证明：模型可执行 Bash/Read、读 `/proc`、跟随链接、读取 env/FD、向代理发送畸形路径、重定向、重复/大请求和取消时不能获得假令牌或宿主文件；检查进程死后无监听者/磁盘副本，再经单独批准做可能计费的 Claude Executor、Reviewer、完整阶段真实测试。任何失败不降级/不宣称四端通过。
+Claude 不再要求把真实 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 或宿主 `.claude` credential 文件放进 bubblewrap。创建 Claude sandbox 时，可信宿主进程启动一个 run-private loopback relay：
 
-## 结论
+1. relay 在宿主读取 `ANTHROPIC_AUTH_TOKEN`（优先）或 `ANTHROPIC_API_KEY`，以及可选的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS`；
+2. sandbox 只得到不可用于上游认证的 dummy token 和随机高熵 capability URL；
+3. relay 只接受 loopback、该 capability、POST，以及 `/v1/messages` / `/v1/messages/count_tokens`；
+4. 请求 body 必须声明与用户批准的 `claude/<model>` route 匹配的 model；精确 model id 精确匹配，Claude 的 `sonnet` / `opus` / `haiku` CLI alias 只允许对应 family；
+5. sandbox 传入的 `Authorization` / `x-api-key` / Host 等敏感或 hop-by-hop headers 被丢弃，真实认证只由宿主 relay 注入；
+6. upstream redirect 不会自动跟随；带 credential/query/fragment 的 upstream URL 被拒绝；
+7. credential-bearing response headers 被移除，流式 body 使用跨 chunk secret scrubber，防止上游意外回显宿主 secret；
+8. request size、并发数、header/request/upstream timeout 都有硬上限；relay 生命周期绑定到 `SandboxedBackend.cleanup()`。
 
-**统一接入可在架构上实现，但目前仅有三个精确路由完成隔离验收。** 若目标是继续使用现有环境令牌加定制 endpoint，同时保留 Claude Code ACP 和现有凭据安全约束，可信宿主侧受限凭据代理是最有希望的方向；这是设计提案，不是已经通过的修复。实现和真实计费测试前，应先就代理的额外网络/用量风险取得明确批准。
+Claude sandbox 使用 `--clearenv`，不继承宿主 provider secret，也不继承宿主 HTTP(S) proxy；provider 请求只指向本地 relay。额外关闭 telemetry、error reporting、auto updater 和 Claude 非必要流量。
+
+## Claude session 强制策略
+
+run-scoped Claude custom backend 在每个 session 上强制：
+
+```json
+{
+  "claudeCode": {
+    "options": {
+      "settingSources": [],
+      "allowDangerouslySkipPermissions": false,
+      "disallowedTools": ["Agent", "Task", "WebSearch", "WebFetch"]
+    }
+  }
+}
+```
+
+因此项目里的 `.claude/settings.json` / `.claude/settings.local.json`、用户 Claude settings、hooks/MCP 配置不能改变 Stage B 的执行策略；`bypassPermissions` 不进入可选 mode；Claude 的内部 Agent/Task subagent 路径被禁用。文件写边界仍由外层 bubblewrap 而不是 ACP mode/permission label 决定。
+
+## OpenCode 同步 hardening
+
+OpenCode 不再把整个宿主 `auth.json` 暂存进 sandbox。只提取所选 `provider/model` 对应的 provider credential entry；项目 provider JSONC 也只提取所选 provider/model，`apiKey` 可以来自 provider config 或独立 auth store。其它 provider secret 不进入 run scratch。
+
+外部 `opencode` executable 还会校验为可执行常规文件、不可 group/world-write、owner 为 root 或当前用户，并拒绝来自 source worktree、dedicated worktree、Golden root、`/tmp` 或 `/var/tmp` 的 PATH binary。这样项目不能通过修改 PATH 把自己的假 `opencode` 注入 Stage B。
+
+## 非计费验证
+
+required CI 对 hardening 分支执行：
+
+- `npm run check`
+- `npm run build`
+- `npm run test:sandbox:required`
+- `npm test`
+
+新增测试覆盖 Claude relay 的 auth header 替换、model/path pinning、query 拒绝、custom-header 保护、跨 chunk secret 回显脱敏、缺少凭据 fail-closed，以及实际 bwrap argv/env 中不出现宿主 Claude secret、宿主代理不被传入、Claude unsafe session feature 被锁定。OpenCode 测试覆盖 selected-provider credential isolation 和 project-PATH binary 拒绝。
+
+## 真实 provider 验收
+
+`tests/real-acp.builtins.integration.ts` 现在可以单独只跑 Claude：
+
+```bash
+PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 \
+PI_PLAN_EXECUTE_ACP_TEST_CLAUDE_MODEL=claude/<model> \
+npm run test:acp:claude:required
+```
+
+它包含三项 billable gate：真实 sandboxed Executor、真实 sandboxed Reviewer、完整单阶段 Stage B（包括 acceptance 与插件-owned phase commit）。完整 workflow 还断言 Executor/Reviewer session id 不同。
+
+仓库增加了手工 `workflow_dispatch` 的 Claude ACP integration workflow；它只从 GitHub protected secrets 读取宿主 Claude credential，不会把 secret 写入 repo 或 sandbox。
+
+## 尚未消除的边界
+
+**ACP actor 的任意网络 egress 仍未由内核限制为 provider-only。** Claude relay解决的是 credential non-disclosure 和 provider API pinning，不是 Bash/curl 等 agent tool 的通用 egress firewall。Stage B 因此仍要求 per-project 网络风险同意，且当前不得宣称适用于敏感仓库。Acceptance shell 已使用独立 network namespace，这一限制只针对需要 provider 网络的 ACP actors。
+
+在 provider-only egress 有 OS 级实现之前，安全结论应保持：filesystem + credential isolation 已强制，ACP arbitrary network egress 仍是已知显式风险。
