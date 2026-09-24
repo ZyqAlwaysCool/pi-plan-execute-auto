@@ -35,6 +35,9 @@ test("Claude credential relay injects host auth, pins model/path, and never refl
       "content-type": "text/event-stream",
       "authorization": "Bearer TOP_SECRET_RELAY_TOKEN",
       "x-tenant-route": "tenant-secret-value",
+      "x-upstream-echo": "TOP_SECRET_RELAY_TOKEN",
+      "location": "https://example.invalid/?secret=TOP_SECRET_RELAY_TOKEN",
+      "request-id": "request-TOP_SECRET_RELAY_TOKEN",
     });
     res.write('data: {"type":"message_start","secret":"TOP_SECRET_');
     res.end('RELAY_TOKEN","route":"tenant-secret-value"}\n\n');
@@ -64,6 +67,9 @@ test("Claude credential relay injects host auth, pins model/path, and never refl
     assert.match(text, /\[REDACTED\]/);
     assert.equal(response.headers.has("authorization"), false);
     assert.equal(response.headers.has("x-tenant-route"), false);
+    assert.equal(response.headers.has("x-upstream-echo"), false);
+    assert.equal(response.headers.has("location"), false);
+    assert.equal(response.headers.has("request-id"), false);
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.url, "/v1/messages");
     assert.equal(seen[0]?.authorization, "Bearer TOP_SECRET_RELAY_TOKEN");
@@ -128,6 +134,13 @@ test("Claude credential relay fails closed on missing auth and unsafe upstream/h
       env: { ANTHROPIC_AUTH_TOKEN: "secret", ANTHROPIC_BASE_URL: "https://user:pass@example.com" },
     }),
     /credential-free HTTP\(S\)/,
+  );
+  await assert.rejects(
+    startClaudeCredentialRelay({
+      modelRoute: "claude/sonnet",
+      env: { ANTHROPIC_AUTH_TOKEN: "fake-review-token", ANTHROPIC_BASE_URL: "http://192.0.2.10" },
+    }),
+    /non-loopback plaintext HTTP upstream/,
   );
   await assert.rejects(
     startClaudeCredentialRelay({

@@ -20,6 +20,11 @@ const FORBIDDEN_FORWARD_HEADERS = new Set([
 const REQUEST_HEADER_ALLOWLIST = new Set([
   "accept", "content-type", "anthropic-version", "anthropic-beta", "user-agent",
 ]);
+// Forward only protocol-essential response headers; arbitrary upstream headers can
+// echo a credential under a completely different name (including Location).
+const RESPONSE_HEADER_ALLOWLIST = new Set([
+  "content-type", "cache-control", "retry-after", "request-id", "x-request-id",
+]);
 
 export interface ClaudeCredentialRelayOptions {
   modelRoute: string;
@@ -75,6 +80,9 @@ function resolveUpstream(env: NodeJS.ProcessEnv): URL {
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new Error("ANTHROPIC_BASE_URL must be a credential-free HTTP(S) URL without query or fragment.");
   }
+  if (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    throw new Error("Claude relay refuses to transmit host credentials to a non-loopback plaintext HTTP upstream.");
+  }
   return url;
 }
 
@@ -96,7 +104,7 @@ function parseCustomHeaders(env: NodeJS.ProcessEnv): { headers: Record<string, s
       throw new Error(`ANTHROPIC_CUSTOM_HEADERS may not override protected header ${name}.`);
     }
     headers[name] = value;
-    if (value.length >= 8) secretValues.push(value);
+    if (value) secretValues.push(value);
   }
   return { headers, secretValues };
 }
@@ -146,11 +154,13 @@ function requestHeaders(source: IncomingHttpHeaders, hostHeaders: Record<string,
 function safeResponseHeaders(
   source: IncomingHttpHeaders,
   secretHeaderNames: ReadonlySet<string>,
+  secrets: readonly string[],
 ): Record<string, string | string[]> {
   const result: Record<string, string | string[]> = {};
   for (const [rawName, rawValue] of Object.entries(source)) {
     const name = rawName.toLowerCase();
     if (
+      !RESPONSE_HEADER_ALLOWLIST.has(name) ||
       HOP_BY_HOP_HEADERS.has(name) ||
       name === "content-length" ||
       name === "content-encoding" ||
@@ -160,6 +170,8 @@ function safeResponseHeaders(
       secretHeaderNames.has(name) ||
       rawValue === undefined
     ) continue;
+    const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+    if (values.some((value) => secrets.some((secret) => value.includes(secret)))) continue;
     result[name] = rawValue;
   }
   return result;
@@ -251,7 +263,7 @@ export async function startClaudeCredentialRelay(
     [credential.headerName]: credential.headerValue,
   };
   const secretHeaderNames = new Set<string>([credential.headerName, ...Object.keys(custom.headers)]);
-  const secrets = [...credential.secretValues, ...custom.secretValues].filter((value) => value.length >= 4);
+  const secrets = [...credential.secretValues, ...custom.secretValues].filter(Boolean);
   let active = 0;
   let closing = false;
   const sockets = new Set<import("node:net").Socket>();
@@ -320,7 +332,7 @@ export async function startClaudeCredentialRelay(
             resolve();
             return;
           }
-          const headersOut = safeResponseHeaders(upstreamResponse.headers, secretHeaderNames);
+          const headersOut = safeResponseHeaders(upstreamResponse.headers, secretHeaderNames, secrets);
           res.writeHead(upstreamResponse.statusCode ?? 502, headersOut);
           const scrubber = new SecretScrubber(secrets);
           upstreamResponse.pipe(scrubber).pipe(res);
