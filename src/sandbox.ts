@@ -3,12 +3,14 @@ import { execFile as execFileCallback, spawn } from "node:child_process";
 import {
   chmod,
   copyFile,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
   open,
   realpath,
   readFile,
+  readdir,
   rm,
   symlink,
   writeFile,
@@ -30,11 +32,6 @@ import { pipeline } from "node:stream/promises";
 import type { CustomBackendConfig } from "@automatalabs/workflows";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import type { GitCommandResult } from "./types.js";
-import {
-  resolveClaudeModelRoutingEnvironment,
-  startClaudeCredentialRelay,
-  type ClaudeCredentialRelay,
-} from "./claude-relay.js";
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
@@ -76,6 +73,7 @@ interface BackendRuntime {
   command: string;
   args: string[];
   credentialSources: Array<{ source: string; relativeTarget: string }>;
+  nativeStateSources?: Array<{ source: string; relativeTarget: string }>;
   extraBinary?: { source: string; target: string };
   nodeModulesRoot?: string;
   useNodeEnvProxy?: boolean;
@@ -128,7 +126,7 @@ export function supportedBackendForModel(model: string | undefined): SupportedAc
   const separator = model.indexOf("/");
   const backend = separator > 0 ? model.slice(0, separator).toLowerCase() : "";
   if (backend !== "claude" && backend !== "codex" && backend !== "opencode" && backend !== "pi") {
-    throw new Error(`ACP backend ${backend || "<default>"} is not allowlisted for isolated Stage B execution.`);
+    throw new Error(`ACP backend ${backend || "<default>"} is not allowlisted for isolated agent execution.`);
   }
   if (!model.slice(separator + 1).trim()) throw new Error(`ACP model route is incomplete: ${model}`);
   return backend;
@@ -169,21 +167,6 @@ export function findBubblewrap(): string {
     }
   }
   throw new Error("A root-owned system bubblewrap (bwrap) is required; refusing to start ACP without it.");
-}
-
-function requireClaudeSandboxTransport(): void {
-  const candidate = "/usr/bin/socat";
-  let real: string;
-  try {
-    real = realpathSync(candidate);
-  } catch {
-    throw new Error("Claude secure command sandbox requires the system socat package at /usr/bin/socat.");
-  }
-  const stat = statSync(real);
-  if (real !== candidate || !stat.isFile() || stat.uid !== 0 || (stat.mode & 0o022) !== 0 ||
-    accessSync(real, fsConstants.X_OK) !== undefined) {
-    throw new Error("Refusing untrusted socat; Claude secure command sandbox requires root-owned /usr/bin/socat.");
-  }
 }
 
 function findExecutable(name: string): string {
@@ -376,6 +359,7 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
       args: [nodeEntry],
       nodeModulesRoot: nodeModules,
       credentialSources: [{ source: join(codexHome, "auth.json"), relativeTarget: "codex-home/auth.json" }],
+      nativeStateSources: [{ source: codexHome, relativeTarget: "codex-home" }],
     };
   }
 
@@ -390,6 +374,8 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
     const entry = library;
     const nodeModules = realpathSync(outerNodeModulesRoot(library));
     const nodeBinary = realpathSync(process.execPath);
+    const claudeConfig = resolve(process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude"));
+    const piAgentDir = resolve(process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent"));
     return {
       command: join(RUNTIME_NODE_BIN, basename(nodeBinary)),
       args: [backend === "pi" ? `${RUNTIME_ROOT}/pi-acp-bootstrap.mjs` : join(RUNTIME_NODE_MODULES, relative(nodeModules, entry))],
@@ -401,7 +387,13 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
       } } : {}),
       credentialSources: backend === "claude"
         ? []
-        : [{ source: join(resolve(process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent")), "auth.json"), relativeTarget: "home/.pi/agent/auth.json" }],
+        : [{ source: join(piAgentDir, "auth.json"), relativeTarget: "home/.pi/agent/auth.json" }],
+      nativeStateSources: backend === "claude"
+        ? [
+            { source: claudeConfig, relativeTarget: "home/.claude" },
+            { source: join(homedir(), ".claude.json"), relativeTarget: "home/.claude.json" },
+          ]
+        : [{ source: piAgentDir, relativeTarget: "home/.pi/agent" }],
     };
   }
 
@@ -410,10 +402,15 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
   }
   const command = findExecutable("opencode");
   const xdgDataHome = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
+  const xdgConfigHome = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
   return {
     command: `${RUNTIME_ROOT}/opencode`,
     args: ["acp"],
     credentialSources: [{ source: join(xdgDataHome, "opencode", "auth.json"), relativeTarget: "data/opencode/auth.json" }],
+    nativeStateSources: [
+      { source: join(xdgDataHome, "opencode"), relativeTarget: "data/opencode" },
+      { source: join(xdgConfigHome, "opencode"), relativeTarget: "config/opencode" },
+    ],
     extraBinary: { source: command, target: `${RUNTIME_ROOT}/opencode` },
   };
 }
@@ -443,8 +440,7 @@ function addMinimalFilesystem(
   options: SandboxOptions,
   scratchPath: string,
   runtime: BackendRuntime,
-  claudeRelay?: ClaudeCredentialRelay,
-  claudeModelRoutingEnv: Readonly<Record<string, string>> = {},
+  backendId?: SupportedAcpBackend,
 ): void {
   const created = new Set<string>();
   const cwd = resolve(options.cwd);
@@ -452,17 +448,15 @@ function addMinimalFilesystem(
   const nodeBinary = realpathSync(process.execPath);
   const nodeBinDir = dirname(nodeBinary);
   const pluginNodeModules = runtime.nodeModulesRoot;
-  // Claude talks only to the trusted host relay. Never route the capability URL through
-  // an inherited HTTP(S) proxy; Pi may still need the already-vetted credential-free proxy.
-  const proxies = claudeRelay ? [] : safeProxyEnvironment();
+  const proxies = safeProxyEnvironment();
   const hasNodeHttpProxy = proxies.some(([key, value]) =>
     ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].includes(key) && /^https?:\/\//i.test(value),
   );
 
   args.push("--tmpfs", "/");
 
-  // Expose system executables, dynamic libraries and shared data, not the host root or /usr/local.
-  for (const hostPath of ["/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/share"]) {
+  // Expose system/user-installed executables and shared runtime data, not the host root or unrelated home directories.
+  for (const hostPath of ["/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/share", "/usr/local/bin", "/usr/local/lib", "/usr/local/share"]) {
     const source = tryRealpath(hostPath);
     if (!source) continue;
     ensureDirectoryArgs(args, created, hostPath);
@@ -554,6 +548,16 @@ function addMinimalFilesystem(
   args.push("--remount-ro", "/");
 
   const runtimeHome = "/tmp/run";
+  for (const [source, target] of [
+    [tryRealpath(join(homedir(), ".local", "bin")), `${runtimeHome}/home/.local/bin`],
+    [tryRealpath(join(homedir(), ".cargo", "bin")), `${runtimeHome}/home/.cargo/bin`],
+    [tryRealpath(join(homedir(), "bin")), `${runtimeHome}/home/bin`],
+  ] as const) {
+    if (!source) continue;
+    ensureDirectoryArgs(args, created, target);
+    args.push("--ro-bind", source, target);
+  }
+  const backendEnv = nativeBackendEnvironment(backendId);
   args.push(
     "--clearenv",
     "--setenv", "HOME", `${runtimeHome}/home`,
@@ -562,34 +566,47 @@ function addMinimalFilesystem(
     "--setenv", "TEMP", "/tmp",
     "--setenv", "CODEX_HOME", `${runtimeHome}/codex-home`,
     "--setenv", "CLAUDE_CONFIG_DIR", `${runtimeHome}/home/.claude`,
-    ...(claudeRelay ? [
-      "--setenv", "ANTHROPIC_BASE_URL", claudeRelay.baseUrl,
-      "--setenv", "ANTHROPIC_AUTH_TOKEN", claudeRelay.dummyAuthToken,
-      ...Object.entries(claudeModelRoutingEnv).flatMap(([key, value]) => ["--setenv", key, value]),
-      "--setenv", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1",
-      "--setenv", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1",
-      "--setenv", "DISABLE_TELEMETRY", "1",
-      "--setenv", "DISABLE_ERROR_REPORTING", "1",
-      "--setenv", "DISABLE_AUTOUPDATER", "1",
-    ] : []),
+    ...(backendId === "claude" ? ["--setenv", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1"] : []),
     "--setenv", "PI_CODING_AGENT_DIR", `${runtimeHome}/home/.pi/agent`,
-    "--setenv", "PI_OFFLINE", "1",
     "--setenv", "XDG_DATA_HOME", `${runtimeHome}/data`,
     "--setenv", "XDG_STATE_HOME", `${runtimeHome}/state`,
     "--setenv", "XDG_CACHE_HOME", `${runtimeHome}/cache`,
     "--setenv", "XDG_CONFIG_HOME", `${runtimeHome}/config`,
-    "--setenv", "OPENCODE_DISABLE_AUTOUPDATE", "1",
-    "--setenv", "PATH", `${RUNTIME_NODE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    "--setenv", "PATH", `${runtimeHome}/home/.local/bin:${runtimeHome}/home/.cargo/bin:${runtimeHome}/home/bin:${RUNTIME_NODE_BIN}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
     "--setenv", "LANG", "C.UTF-8",
     "--setenv", "LC_ALL", "C.UTF-8",
     "--setenv", "TERM", "dumb",
     ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? ["--setenv", "NODE_USE_ENV_PROXY", "1"] : []),
+    ...backendEnv.flatMap(([key, value]) => ["--setenv", key, value]),
     ...proxies.flatMap(([key, value]) => ["--setenv", key, value]),
     "--setenv", "GIT_OPTIONAL_LOCKS", "0",
     "--setenv", "GIT_CONFIG_NOSYSTEM", "1",
-    "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null",
+    "--setenv", "GIT_CONFIG_GLOBAL", `${runtimeHome}/home/.gitconfig`,
     "--chdir", cwd,
   );
+}
+
+function nativeBackendEnvironment(backendId: SupportedAcpBackend | undefined): Array<[string, string]> {
+  if (!backendId) return [];
+  const prefixes = backendId === "claude"
+    ? ["ANTHROPIC_", "CLAUDE_"]
+    : backendId === "codex"
+      ? ["OPENAI_", "CODEX_"]
+      : [
+          "OPENAI_", "ANTHROPIC_", "GOOGLE_", "GEMINI_", "DEEPSEEK_", "MISTRAL_",
+          "GROQ_", "OPENROUTER_", "AZURE_OPENAI_", "AWS_", "BEDROCK_", "VERTEX_", "OLLAMA_",
+        ];
+  const managed = new Set([
+    "HOME", "PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+  ]);
+  const entries: Array<[string, string]> = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!value || managed.has(key) || !prefixes.some((prefix) => key.startsWith(prefix))) continue;
+    if (value.includes("\0")) throw new Error(`Invalid NUL byte in ${key}; refusing to forward it into the agent sandbox.`);
+    entries.push([key, value]);
+  }
+  return entries;
 }
 
 function safeProxyEnvironment(): Array<[string, string]> {
@@ -865,6 +882,49 @@ async function stageTrustedExternalAgentBinary(source: string, scratchPath: stri
   }
 }
 
+async function copyNativeStateSource(source: string, target: string): Promise<boolean> {
+  let stat;
+  try {
+    stat = await lstat(source);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error(`Refusing symlinked Agent CLI state root: ${source}`);
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  if (stat.isDirectory()) {
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    for (const entry of await readdir(source)) {
+      await cp(join(source, entry), join(target, entry), {
+        recursive: true,
+        force: true,
+        preserveTimestamps: true,
+        verbatimSymlinks: true,
+      });
+    }
+    return true;
+  }
+  if (!stat.isFile()) throw new Error(`Unsupported Agent CLI state entry: ${source}`);
+  await copyFile(source, target);
+  return true;
+}
+
+async function stageNativeCliState(runtime: BackendRuntime, scratchPath: string): Promise<number> {
+  let backendStateCopied = 0;
+  for (const source of runtime.nativeStateSources ?? []) {
+    if (await copyNativeStateSource(source.source, join(scratchPath, "run", source.relativeTarget))) {
+      backendStateCopied += 1;
+    }
+  }
+  // Git user identity/preferences are useful to a normal CLI session, but they are
+  // not evidence that the selected Agent CLI itself has usable auth/config.
+  await copyNativeStateSource(
+    join(homedir(), ".gitconfig"),
+    join(scratchPath, "run", "home/.gitconfig"),
+  );
+  return backendStateCopied;
+}
+
 async function assertDedicatedWorktreePointer(cwd: string): Promise<void> {
   const path = join(cwd, ".git");
   const pointer = await lstat(path);
@@ -885,31 +945,20 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
   const bwrap = findBubblewrap();
   await assertDedicatedWorktreePointer(cwd);
   let runtime = backendRuntime(backendId);
-  if (backendId === "claude" && options.includeProviderCredentials) {
-    requireClaudeSandboxTransport();
-  }
   const trustedOpenCodeBinary = backendId === "opencode" && runtime.extraBinary
     ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
     : undefined;
-  const claudeModelRoutingEnv = backendId === "claude"
-    ? resolveClaudeModelRoutingEnvironment(process.env)
-    : {};
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
   const credentials: string[] = [];
-  let claudeRelay: ClaudeCredentialRelay | undefined;
   try {
     await prepareScratchLayout(scratchPath, cwd, options.signal);
+    const nativeStateCount = await stageNativeCliState(runtime, scratchPath);
     if (trustedOpenCodeBinary && runtime.extraBinary) {
       const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
       runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
     }
-    if (options.includeProviderCredentials) {
-      if (backendId === "claude") {
-        claudeRelay = await startClaudeCredentialRelay({
-          modelRoute: options.model,
-          modelRoutingEnv: claudeModelRoutingEnv,
-        });
-      } else if (backendId === "pi") {
+    if (options.includeProviderCredentials && nativeStateCount === 0) {
+      if (backendId === "pi") {
         credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
       } else if (backendId === "opencode") {
         const dataRoot = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
@@ -919,10 +968,12 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
         const selectedConfig = await stageSelectedOpenCodeProviderConfig(options.model, scratchPath, configRoot);
         if (selectedConfig) credentials.push(selectedConfig);
         if (!selectedAuth && !selectedConfig) {
-          throw new Error("No isolated saved credential/config was found for the selected OpenCode provider.");
+          throw new Error("No native or isolated saved credential/config was found for the selected OpenCode provider.");
         }
-      } else {
+      } else if (backendId === "codex") {
         credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
+      } else if (!process.env.ANTHROPIC_AUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
+        throw new Error("Claude CLI state/authentication is unavailable inside the isolated session; run Claude login or provide the same host auth environment used by the working CLI.");
       }
     }
     const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
@@ -931,44 +982,13 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
       { ...options, cwd, sourceRoot, goldenRoot },
       scratchPath,
       runtime,
-      claudeRelay,
-      claudeModelRoutingEnv,
+      backendId,
     );
     const config: CustomBackendConfig = {
       command: bwrap,
       args: [...commandArgs, "--", runtime.command, ...runtime.args],
-      ...(backendId === "claude" ? {
-        sessionMeta: {
-          claudeCode: {
-            options: {
-              settingSources: [],
-              allowDangerouslySkipPermissions: false,
-              disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
-              // Keep the full Claude agent session, but make command-tool
-              // subprocesses fail closed with no network access. The parent
-              // Claude process can reach the host credential relay; Bash,
-              // PowerShell and Monitor cannot call it or retry unsandboxed.
-              sandbox: {
-                enabled: true,
-                failIfUnavailable: true,
-                allowUnsandboxedCommands: false,
-                network: {
-                  strictAllowlist: true,
-                  allowedDomains: [],
-                  deniedDomains: ["localhost", "127.0.0.1", "[::1]"],
-                },
-                credentials: {
-                  envVars: [
-                    { name: "ANTHROPIC_AUTH_TOKEN", mode: "deny" },
-                    { name: "ANTHROPIC_API_KEY", mode: "deny" },
-                    { name: "ANTHROPIC_BASE_URL", mode: "deny" },
-                  ],
-                },
-              },
-            },
-          },
-        },
-      } : {}),
+      // Keep backend-native tools and settings. Worktree mounts and host-file
+      // isolation are the safety boundary; the plugin does not disable CLI tools.
       fork: { disposition: backendId === "claude" ? "id-only" : "live", cwd: "source-only" },
     };
     let cleaned = false;
@@ -983,19 +1003,11 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
       async cleanup() {
         if (cleaned) return;
         cleaned = true;
-        try {
-          await claudeRelay?.close();
-        } finally {
-          await rm(scratchPath, { recursive: true, force: true });
-        }
+        await rm(scratchPath, { recursive: true, force: true });
       },
     };
   } catch (error) {
-    try {
-      await claudeRelay?.close();
-    } finally {
-      await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
-    }
+    await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -1075,7 +1087,7 @@ async function runFilesystemProbe(options: SandboxOptions, runtime: BackendRunti
   try {
     await prepareProbeScratch(scratchPath);
     const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
-    addMinimalFilesystem(args, normalized, scratchPath, runtime);
+    addMinimalFilesystem(args, normalized, scratchPath, runtime, label as SupportedAcpBackend);
     await exerciseFilesystemBoundary(normalized, label, bwrap, args);
   } finally {
     await rm(scratchPath, { recursive: true, force: true });
@@ -1123,9 +1135,9 @@ export async function runSandboxedCommand(options: SandboxedCommandOptions): Pro
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-acceptance-"));
   try {
     await prepareScratchLayout(scratchPath, cwd, options.signal);
-    // Acceptance commands do not need provider access. Deny all network egress in the
-    // kernel rather than trusting shell commands or credential-free proxy settings.
-    const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-net"];
+    // Acceptance commands keep normal networking just like the Agent CLI sessions.
+    // The same filesystem/worktree boundary still applies.
+    const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
     addMinimalFilesystem(args, normalized, scratchPath, runtime);
     await exerciseFilesystemBoundary(normalized, "acceptance", bwrap, args);
     const timeout = options.timeout ?? 120_000;

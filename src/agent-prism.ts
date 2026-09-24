@@ -19,7 +19,8 @@ import {
   MAX_REPORT_LIST_ITEMS,
   MAX_REPORT_STRING_LENGTH,
 } from "./reports.js";
-import { createSandboxedBackend, verifySandboxBoundary, type SandboxedBackend } from "./sandbox.js";
+import { defaultIsolationProvider } from "./isolation-provider.js";
+import type { SandboxedBackend } from "./sandbox.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -206,10 +207,10 @@ export class AgentPrismSessionPair implements HarnessPair {
         includeProviderCredentials: true,
         ...(signal ? { signal } : {}),
       };
-      const sandbox = await createSandboxedBackend(sandboxOptions);
+      const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
       let agent: AcpAgent | undefined;
       try {
-        await verifySandboxBoundary(sandboxOptions);
+        await defaultIsolationProvider.verifyBoundary(sandboxOptions);
         agent = new AcpAgent({
           cwd: this.options.cwd,
           ...(model ? { model } : {}),
@@ -309,11 +310,11 @@ export class AgentPrismSessionPair implements HarnessPair {
       includeProviderCredentials: true,
       ...(options?.signal ? { signal: options.signal } : {}),
     };
-    const sandbox = await createSandboxedBackend(sandboxOptions);
+    const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
     let reviewer: AcpAgent | undefined;
     this.reviewer = undefined;
     try {
-      await verifySandboxBoundary(sandboxOptions);
+      await defaultIsolationProvider.verifyBoundary(sandboxOptions);
       // codex-acp's "read-only" mode actually requests workspaceWrite and runs a
       // second bubblewrap that must mkdir .agents under the OS-read-only worktree.
       // That inner sandbox fails before even read-only Git commands can run. Use

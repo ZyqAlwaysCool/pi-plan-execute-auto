@@ -51,7 +51,8 @@ import {
   type DetectedCli,
   type ProjectPluginProfile,
 } from "../src/plugin-config.js";
-import { findBubblewrap, runSandboxedCommand, supportedBackendForModel } from "../src/sandbox.js";
+import { defaultIsolationProvider } from "../src/isolation-provider.js";
+import { supportedBackendForModel } from "../src/sandbox.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
 import { StageBController } from "../src/stage-b.js";
 import type {
@@ -343,7 +344,12 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
   }
   try {
     if (!await ensureSetupRepository(ctx.cwd, ctx.ui)) return;
-    findBubblewrap();
+    const isolation = await defaultIsolationProvider.preflight();
+    notify(
+      ctx,
+      `Environment preflight\n✓ Isolation: ${isolation.provider}\n✓ bubblewrap: ${isolation.bubblewrap}\n✓ Linux user namespaces available\n✓ Agent/tool network: normal host networking\n✓ Extra socat dependency: not required`,
+      "info",
+    );
     const saved = await runSetupWizard(ctx, discoverAcpClis);
     notify(ctx, saved
       ? `Project configured: ${saved.executorModel} → ${saved.reviewerModel}; reasoning ${saved.reasoningEffort ?? "backend default"}; review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
@@ -384,7 +390,7 @@ async function commandResetConfig(ctx: ExtensionCommandContext): Promise<void> {
 function makeAcceptanceRunner(cwd: string, sourceRoot: string, goldenRoot: string): AcceptanceCommandRunner {
   return {
     async run(command, options) {
-      return runSandboxedCommand({
+      return defaultIsolationProvider.runAcceptanceCommand({
         cwd,
         sourceRoot,
         goldenRoot,
@@ -791,7 +797,7 @@ async function startStageB(
   try {
     supportedBackendForModel(executorModel);
     supportedBackendForModel(reviewerModel);
-    findBubblewrap();
+    await defaultIsolationProvider.preflight();
   } catch (error) {
     return { status: "not_started", state, reason: `[SANDBOX_UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}` };
   }
