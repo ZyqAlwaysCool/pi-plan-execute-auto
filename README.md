@@ -75,7 +75,7 @@ If the limit is exhausted without Reviewer `PASS`, the workflow pauses for the u
 
 Two modes are available:
 
-- **Autonomous** — keeps all CLI tools available and automatically selects a one-time allow option for ACP permission requests. This is intended for trusted repositories and unattended execution.
+- **Autonomous** — keeps all CLI tools available, prefers a one-time allow option, and falls back to another CLI-advertised allow option when necessary. This is intended for trusted repositories and unattended execution.
 - **Ask me** — keeps the same CLI capabilities but pauses on each ACP permission request and displays the exact options advertised by that CLI in Pi. The user's selected option ID is returned unchanged.
 
 The selected permission mode and review limit are frozen into each approved run. Changing setup later cannot silently change an active/frozen run.

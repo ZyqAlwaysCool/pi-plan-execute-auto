@@ -89,21 +89,23 @@ function invalidStructuredTurn(role: "executor" | "reviewer", turn: AcpAgentTurn
 }
 
 function selectedPermission(request: RequestPermissionRequest, allow: boolean): ReturnType<typeof selectPermissionOption> {
-  const wanted = request.options.find((option) =>
-    allow ? option.kind === "allow_once" : option.kind === "reject_once" || option.kind === "reject_always",
-  );
+  const wanted = allow
+    ? request.options.find((option) => option.kind === "allow_once")
+      ?? request.options.find((option) => option.kind === "allow_always")
+    : request.options.find((option) => option.kind === "reject_once")
+      ?? request.options.find((option) => option.kind === "reject_always");
   return wanted ? selectPermissionOption(request, wanted.optionId) : { outcome: { outcome: "cancelled" } };
 }
 
 function reviewerPermission(request: RequestPermissionRequest): ReturnType<typeof selectPermissionOption> {
-  // Codex requests permission even for read-only Git commands. The verified OS
-  // read-only mount is the boundary; grant one tool call, never a persistent grant.
+  // The verified OS read-only mount is the Reviewer write boundary. Autonomous
+  // mode prefers one-time grants and falls back to a CLI-advertised persistent allow.
   return selectedPermission(request, true);
 }
 
 function executorPermission(request: RequestPermissionRequest): ReturnType<typeof selectPermissionOption> {
-  // Allow one tool call only after the OS mount probe passed. The worktree is the
-  // only persistent writable project root; Git metadata remains read-only.
+  // Autonomous mode keeps the native CLI moving without user interaction. It
+  // prefers one-time grants; the dedicated worktree remains the host write boundary.
   return selectedPermission(request, true);
 }
 

@@ -308,7 +308,7 @@ export async function runSetupWizard(
     "Agent permission handling does not remove tools. Autonomous mode automatically accepts one-time tool permission prompts so execution can continue unattended. " +
     "Ask me mode keeps the same CLI capabilities but pauses on each ACP permission request and lets you choose one of that CLI's advertised options in Pi.",
     "info");
-  const autonomousLabel = "Autonomous — automatically approve one-time agent tool permission requests";
+  const autonomousLabel = "Autonomous — automatically approve agent tool permission requests";
   const askLabel = "Ask me — pause and show each agent permission request in Pi";
   const permissionChoice = await ctx.ui.select("Agent permission handling during Execution & Review", [autonomousLabel, askLabel, "Cancel"]);
   if (!permissionChoice || permissionChoice === "Cancel") return undefined;

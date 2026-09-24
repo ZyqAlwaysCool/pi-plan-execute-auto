@@ -295,7 +295,7 @@ test("headless fallback remains explicit, not a hidden default", async () => {
     process.env.PI_PLAN_EXECUTE_EXECUTOR_MODEL = "opencode/deepseek-local/deepseek-flash";
     process.env.PI_PLAN_EXECUTE_REVIEWER_MODEL = "codex/gpt-6-luna";
     process.env.PI_PLAN_EXECUTE_REASONING_EFFORT = "high";
-    await assert.rejects(approvedSetup(project, false, undefined, agentDir), /ACP tool network egress/);
+    await assert.rejects(approvedSetup(project, false, undefined, agentDir), /normal network access/);
     process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK = "1";
     assert.deepEqual(await approvedSetup(project, false, undefined, agentDir), {
       executorModel: "opencode/deepseek-local/deepseek-flash",
