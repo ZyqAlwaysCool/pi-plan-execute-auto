@@ -7,6 +7,7 @@ import {
 } from "@automatalabs/workflows";
 import { Type, type TSchema } from "typebox";
 import type {
+  AgentPermissionMode,
   ExecutionReport,
   HarnessPair,
   ReasoningEffort,
@@ -144,6 +145,11 @@ export interface AgentPrismSessionPairOptions {
   reasoningEffort?: ReasoningEffort;
   /** Verified user-owned project profile consent; headless runs may use the explicit env fallback. */
   networkRiskApproved?: boolean;
+  permissionMode?: AgentPermissionMode;
+  onPermissionChoice?: (
+    role: "executor" | "reviewer",
+    request: RequestPermissionRequest,
+  ) => Promise<string | undefined>;
   onLiveEvent?: (role: "executor" | "reviewer", event: string) => void;
 }
 
@@ -176,6 +182,16 @@ export class AgentPrismSessionPair implements HarnessPair {
     }
   }
 
+  private permissionResolver(role: "executor" | "reviewer") {
+    return async (request: RequestPermissionRequest) => {
+      if ((this.options.permissionMode ?? "autonomous") === "autonomous") {
+        return role === "executor" ? executorPermission(request) : reviewerPermission(request);
+      }
+      const optionId = await this.options.onPermissionChoice?.(role, request);
+      return optionId ? selectPermissionOption(request, optionId) : { outcome: { outcome: "cancelled" as const } };
+    };
+  }
+
   private async getExecutor(signal: AbortSignal | undefined, phaseBaseCommit: string): Promise<AcpAgent> {
     requireAcpNetworkRiskAcknowledgement(this.options.networkRiskApproved);
     if (this.executor && this.executorBaseCommit !== phaseBaseCommit) await this.closeExecutorSession();
@@ -204,7 +220,7 @@ export class AgentPrismSessionPair implements HarnessPair {
           schemaRetries: this.options.schemaRetries ?? 2,
           permissions: { defaultOutcome: "deny" },
           ...(signal ? { signal } : {}),
-          onPermissionRequest: executorPermission,
+          onPermissionRequest: this.permissionResolver("executor"),
           retainHistory: true,
         });
         await agent.ready();
@@ -303,7 +319,7 @@ export class AgentPrismSessionPair implements HarnessPair {
       // That inner sandbox fails before even read-only Git commands can run. Use
       // the adapter's no-inner-sandbox mode ONLY after verifying our own trusted
       // bubblewrap read-only mount; ACP permissions are never the write boundary.
-      const reviewerMode = this.options.reviewerMode ?? (sandbox.backendId === "codex" ? "agent-full-access" : sandbox.backendId === "pi" ? undefined : "plan");
+      const reviewerMode = this.options.reviewerMode ?? (sandbox.backendId === "codex" ? "agent-full-access" : undefined);
       reviewer = new AcpAgent({
         cwd,
         ...(model ? { model } : {}),
@@ -316,7 +332,7 @@ export class AgentPrismSessionPair implements HarnessPair {
         // receives only a one-shot grant, never a persistent allow_always grant.
         permissions: { defaultOutcome: "deny" },
         ...(options?.signal ? { signal: options.signal } : {}),
-        onPermissionRequest: reviewerPermission,
+        onPermissionRequest: this.permissionResolver("reviewer"),
         retainHistory: false,
       });
       this.reviewer = reviewer;

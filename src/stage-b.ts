@@ -30,6 +30,7 @@ import {
   validateExecutionEvidence,
 } from "./reports.js";
 import {
+  DEFAULT_MAX_REVIEW_ROUNDS,
   RUNTIME_DIRECTORY,
   type AcceptanceCommandRunner,
   type AcceptanceResult,
@@ -136,7 +137,7 @@ export class StageBController {
   constructor(options: StageBControllerOptions) {
     this.options = options;
     this.state = options.state;
-    this.maxReviewRounds = options.maxReviewRounds ?? options.package.manifest.max_review_rounds ?? 3;
+    this.maxReviewRounds = options.maxReviewRounds ?? options.state.review_round_limit ?? options.package.manifest.max_review_rounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
     this.acceptanceTimeoutMs = options.acceptanceTimeoutMs ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
   }
@@ -436,6 +437,10 @@ export class StageBController {
       promptSection("golden_manifest", JSON.stringify(this.options.package.manifest, null, 2), 12_000),
       `phase_id: ${phase.phase.id}`,
       `round: ${round}`,
+      `review_round_limit: ${this.maxReviewRounds}`,
+      `review_rounds_remaining_including_this_round: ${this.maxReviewRounds - round + 1}`,
+      `review_rounds_remaining_after_this_round: ${this.maxReviewRounds - round}`,
+      "Use the remaining review budget deliberately: finish the current phase, run all required self-tests, and address all known findings before returning.",
       `phase_base_commit: ${baseCommit}`,
       `allowed_paths: ${JSON.stringify(phase.acceptance.scope.allowed_paths)}`,
       promptSection("CURRENT PHASE SPEC", phase.spec, 20_000),
@@ -497,6 +502,10 @@ export class StageBController {
       promptSection("golden_manifest", JSON.stringify(this.options.package.manifest, null, 2), 12_000),
       `phase_id: ${phase.phase.id}`,
       `round: ${round}`,
+      `review_round_limit: ${this.maxReviewRounds}`,
+      `review_rounds_remaining_including_this_round: ${this.maxReviewRounds - round + 1}`,
+      `review_rounds_remaining_after_this_round: ${this.maxReviewRounds - round}`,
+      "Use the remaining review budget explicitly: identify every blocking issue now, avoid drip-feeding findings across rounds, and PASS only when this phase is actually acceptable.",
       `phase_base_commit: ${baseCommit}`,
       promptSection("CURRENT PHASE SPEC", phase.spec, 20_000),
       promptSection("CURRENT PHASE ACCEPTANCE CONTRACT", JSON.stringify(phase.acceptance, null, 2), 12_000),
@@ -591,7 +600,7 @@ export class StageBController {
     let history = await this.loadReviewHistory(phase);
     while (phaseState.review_rounds < this.maxReviewRounds) {
       if (this.options.signal?.aborted) {
-        return this.pause(phase, "Stage B was cancelled before phase completion.", "ABORTED");
+        return this.pause(phase, "Execution & Review was cancelled before phase completion.", "ABORTED");
       }
       const round = phaseState.review_rounds + 1;
       await this.assertPackageUnchanged();
@@ -636,7 +645,7 @@ export class StageBController {
         );
       } catch (error) {
         if (this.options.signal?.aborted) {
-          return this.pause(phase, "Stage B was cancelled during Executor execution.", "ABORTED");
+          return this.pause(phase, "Execution & Review was cancelled during Executor execution.", "ABORTED");
         }
         if (error instanceof WorkflowPauseError) throw error;
         throw new WorkflowPauseError(
@@ -705,7 +714,7 @@ export class StageBController {
         );
       } catch (error) {
         if (this.options.signal?.aborted) {
-          return this.pause(phase, "Stage B was cancelled during Reviewer execution.", "ABORTED");
+          return this.pause(phase, "Execution & Review was cancelled during Reviewer execution.", "ABORTED");
         }
         if (error instanceof WorkflowPauseError) throw error;
         throw new WorkflowPauseError(

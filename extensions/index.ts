@@ -56,6 +56,8 @@ import { ensureSetupRepository } from "../src/setup-repository.js";
 import { StageBController } from "../src/stage-b.js";
 import type {
   AcceptanceCommandRunner,
+  AgentPermissionMode,
+  DEFAULT_MAX_REVIEW_ROUNDS,
   FinalizeInput,
   Manifest,
   ReasoningEffort,
@@ -69,6 +71,7 @@ const STATE_ENTRY = "plan-execute-state";
 const ESCALATION_MESSAGE = "plan-execute-escalation";
 const DEFAULT_STAGE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120 * 1000;
+const REVIEW_ROUND_CHOICES = [3, 5, 8, 12, 20] as const;
 
 function validateControlledEnvironmentPaths(state: WorkflowState): void {
   const paths = state.controlled_environment_paths ?? [];
@@ -152,7 +155,7 @@ function stateLines(state: WorkflowState): string[] {
   const completed = state.phases.filter((phase) => phase.status === "completed").length;
   const current = state.phases.find((phase) => phase.status !== "completed");
   return [
-    `Stage B · ${state.status}`,
+    `Execution & Review · ${state.status}`,
     `Run ${state.run_id} · ${completed}/${state.phases.length} phases`,
     current ? `Current ${current.phase_id} · round ${current.review_rounds}` : "All phases complete",
     ...(state.branch_name ? [`Branch ${state.branch_name}`] : []),
@@ -197,13 +200,13 @@ async function chooseApproval(
   profile?: ProjectPluginProfile,
 ): Promise<"approve-start" | "cancel" | "pending"> {
   if (!ctx.hasUI) return "pending";
-  const summary = `${formatPackageSummary(pkg)}${profile ? `\nExecutor: ${profile.executorModel}\nReviewer: ${profile.reviewerModel}\nReasoning: ${profile.reasoningEffort ?? "backend default"}\nACP network: explicitly approved for this project` : ""}`;
+  const summary = `${formatPackageSummary(pkg)}${profile ? `\nExecutor: ${profile.executorModel}\nReviewer: ${profile.reviewerModel}\nReasoning: ${profile.reasoningEffort ?? "backend default"}\nReview loop limit: ${profile.reviewRoundLimit} round(s) per phase\nAgent permissions: ${profile.permissionMode === "autonomous" ? "Autonomous" : "Ask me"}\nAgent/tool network: normal CLI access` : ""}`;
   for (;;) {
-    const choice = await ctx.ui.select("Stage A Finalization", ["Review Package", "Approve & Start", "Cancel"]);
+    const choice = await ctx.ui.select("Plan Review & Approval", ["Review Plan Package", "Approve & Start", "Cancel"]);
     if (choice === "Approve & Start") return "approve-start";
     if (choice === "Cancel" || !choice) return "cancel";
     const review = await packageReviewText(pkg);
-    await ctx.ui.editor("Review Golden Document Package (read-only)", review);
+    await ctx.ui.editor("Review phased execution & acceptance plan (read-only)", review);
     notify(ctx, summary, "info");
   }
 }
@@ -282,6 +285,29 @@ export async function runSetupWizard(
   const effortChoice = await ctx.ui.select("ACP reasoning effort (shared by both selected models)", [...available, "backend default", "Cancel"]);
   if (!effortChoice || effortChoice === "Cancel") return undefined;
   const reasoningEffort = effortChoice === "backend default" ? undefined : selectStageBReasoningEffort(effortChoice);
+
+  notify(ctx,
+    "Review loop limit controls the maximum Executor → Reviewer cycles allowed for each phase. " +
+    "The remaining round budget is injected into both agents every round so they can converge instead of drip-feeding work or findings. " +
+    "If the limit is exhausted without PASS, execution pauses for you instead of looping indefinitely.",
+    "info");
+  const roundLabels = REVIEW_ROUND_CHOICES.map((value) =>
+    `${value} rounds${value === DEFAULT_MAX_REVIEW_ROUNDS ? " (recommended default)" : ""}`);
+  const roundChoice = await ctx.ui.select("Maximum review rounds per phase", [...roundLabels, "Cancel"]);
+  if (!roundChoice || roundChoice === "Cancel") return undefined;
+  const reviewRoundLimit = REVIEW_ROUND_CHOICES[roundLabels.indexOf(roundChoice)];
+  if (!reviewRoundLimit) return undefined;
+
+  notify(ctx,
+    "Agent permission handling does not remove tools. Autonomous mode automatically accepts one-time tool permission prompts so execution can continue unattended. " +
+    "Ask me mode keeps the same CLI capabilities but pauses on each ACP permission request and lets you choose one of that CLI's advertised options in Pi.",
+    "info");
+  const autonomousLabel = "Autonomous — automatically approve one-time agent tool permission requests";
+  const askLabel = "Ask me — pause and show each agent permission request in Pi";
+  const permissionChoice = await ctx.ui.select("Agent permission handling during Execution & Review", [autonomousLabel, askLabel, "Cancel"]);
+  if (!permissionChoice || permissionChoice === "Cancel") return undefined;
+  const permissionMode: AgentPermissionMode = permissionChoice === askLabel ? "ask" : "autonomous";
+
   const needsLiveCheck = [...new Set([executorModel, reviewerModel])].filter((route) =>
     supportedBackendForModel(route) === "claude" || supportedBackendForModel(route) === "pi");
   if (needsLiveCheck.length) {
@@ -296,12 +322,18 @@ export async function runSetupWizard(
   }
   const consent = await ctx.ui.confirm(
     "Enable ACP networking for this project?",
-    `Executor: ${executorModel}\nReviewer: ${reviewerModel}\nReasoning: ${reasoningEffort ?? "backend default"}\n\n` +
-    "ACP servers and tools share the host network namespace. A compromised model/tool can send project data to other network destinations. " +
-    "Only proceed for a non-sensitive repository. This is not network isolation and does not approve or start a phase.",
+    `Executor: ${executorModel}\nReviewer: ${reviewerModel}\nReasoning: ${reasoningEffort ?? "backend default"}\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\n\n` +
+    "The selected Agent CLIs and their tools keep normal network access, matching a normal standalone CLI session. " +
+    "The plugin still isolates the dedicated worktree and unrelated host files; this confirmation does not approve or start execution.",
   );
   if (!consent) return undefined;
-  return saveProjectPluginProfile(ctx.cwd, { executorModel, reviewerModel, ...(reasoningEffort ? { reasoningEffort } : {}) }, agentDir);
+  return saveProjectPluginProfile(ctx.cwd, {
+    executorModel,
+    reviewerModel,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    permissionMode,
+    reviewRoundLimit,
+  }, agentDir);
 }
 
 async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
@@ -314,13 +346,13 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     findBubblewrap();
     const saved = await runSetupWizard(ctx, discoverAcpClis);
     notify(ctx, saved
-      ? `Project configured: ${saved.executorModel} → ${saved.reviewerModel} (${saved.reasoningEffort ?? "backend default"}). Run /plan-execute after planning.`
+      ? `Project configured: ${saved.executorModel} → ${saved.reviewerModel}; reasoning ${saved.reasoningEffort ?? "backend default"}; review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
       : "Setup cancelled; no model selection or network consent was saved.", saved ? "info" : "warning");
     if (saved) {
       try {
         await execFile("git", ["check-ignore", "-q", ".pi-plan-execute-auto/config.json"], { cwd: ctx.cwd, timeout: 10_000 });
       } catch {
-        notify(ctx, "Before Approve & Start, ignore .pi-plan-execute-auto/ via a reviewed .gitignore commit; project config/runtime files must not dirty the source worktree.", "warning");
+        notify(ctx, "Before approving execution, ignore .pi-plan-execute-auto/ via a reviewed .gitignore commit; plugin config/runtime files must not dirty the source worktree.", "warning");
       }
     }
   } catch (error) {
@@ -332,7 +364,7 @@ async function commandConfig(ctx: ExtensionCommandContext): Promise<void> {
   try {
     const profile = await loadProjectPluginProfile(ctx.cwd);
     notify(ctx, profile
-      ? `Executor: ${profile.executorModel}\nReviewer: ${profile.reviewerModel}\nReasoning: ${profile.reasoningEffort ?? "backend default"}\nNetwork consent: ${profile.networkRiskApprovedAt}`
+      ? `Executor: ${profile.executorModel}\nReviewer: ${profile.reviewerModel}\nReasoning: ${profile.reasoningEffort ?? "backend default"}\nReview loop limit: ${profile.reviewRoundLimit}\nPermissions: ${profile.permissionMode}\nNetwork consent: ${profile.networkRiskApprovedAt}`
       : "No project configuration. Use /plan-execute setup.", profile ? "info" : "warning");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
@@ -381,6 +413,8 @@ export function frozenProfileMatches(
   return state.executor_model === profile.executorModel &&
     state.reviewer_model === profile.reviewerModel &&
     state.reasoning_effort === profile.reasoningEffort &&
+    state.permission_mode === profile.permissionMode &&
+    state.review_round_limit === profile.reviewRoundLimit &&
     (!executorOverride || executorOverride === profile.executorModel) &&
     (!reviewerOverride || reviewerOverride === profile.reviewerModel);
 }
@@ -397,8 +431,8 @@ function acceptanceTimeoutMs(): number {
 
 function linkedAbortSignal(external: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; controller: AbortController; dispose: () => void } {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`Stage B timeout after ${timeoutMs}ms.`)), timeoutMs);
-  const abort = () => controller.abort(external?.reason ?? new Error("Stage B cancelled."));
+  const timer = setTimeout(() => controller.abort(new Error(`Execution & Review timeout after ${timeoutMs}ms.`)), timeoutMs);
+  const abort = () => controller.abort(external?.reason ?? new Error("Execution & Review cancelled."));
   if (external) {
     if (external.aborted) abort();
     else external.addEventListener("abort", abort, { once: true });
@@ -501,7 +535,7 @@ async function persistAndEscalatePause(
       { deliverAs: "followUp", triggerTurn: true },
     );
   } catch (error) {
-    notify(ctx, `Stage B paused, but Main Pi escalation failed: ${String(error)}`, "error");
+    notify(ctx, `Execution & Review paused, but Main Pi escalation failed: ${String(error)}`, "error");
   }
   return { status: "paused", state, reason };
 }
@@ -694,7 +728,7 @@ async function startStageB(
     return persistAndEscalatePause(pi, ctx, pkg, state, restartPause(state));
   }
   if (state.status !== "frozen") {
-    return { status: "not_started", state, reason: `Run is ${state.status}; it must be frozen before Stage B.` };
+    return { status: "not_started", state, reason: `Run is ${state.status}; its plan must be approved before Execution & Review can start.` };
   }
 
   let profile: ProjectPluginProfile | undefined;
@@ -706,6 +740,8 @@ async function startStageB(
   let executorModel: string;
   let reviewerModel: string;
   let configuredReasoningEffort: ReasoningEffort | undefined;
+  let configuredPermissionMode: AgentPermissionMode;
+  let configuredReviewRoundLimit: number;
   if (profile) {
     if (!frozenProfileMatches(state, profile, options?.executorModel, options?.reviewerModel)) {
       return { status: "not_started", state, reason: "Frozen run settings differ from the human-approved project setup; use a new run or restore the approved setup." };
@@ -713,6 +749,8 @@ async function startStageB(
     executorModel = profile.executorModel;
     reviewerModel = profile.reviewerModel;
     configuredReasoningEffort = profile.reasoningEffort;
+    configuredPermissionMode = profile.permissionMode;
+    configuredReviewRoundLimit = profile.reviewRoundLimit;
   } else {
     if (ctx.hasUI) return { status: "not_started", state, reason: "Run /plan-execute setup to select and approve both ACP models for this project." };
     const envExecutor = process.env.PI_PLAN_EXECUTE_EXECUTOR_MODEL;
@@ -728,12 +766,26 @@ async function startStageB(
     reviewerModel = envReviewer;
     try {
       configuredReasoningEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_REASONING_EFFORT);
+      const permissionMode = process.env.PI_PLAN_EXECUTE_PERMISSION_MODE ?? "autonomous";
+      if (permissionMode !== "autonomous" && permissionMode !== "ask") {
+        throw new Error("PI_PLAN_EXECUTE_PERMISSION_MODE must be autonomous or ask.");
+      }
+      configuredPermissionMode = permissionMode;
+      const reviewLimit = Number(process.env.PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS ?? DEFAULT_MAX_REVIEW_ROUNDS);
+      if (!Number.isInteger(reviewLimit) || reviewLimit < 1 || reviewLimit > 100) {
+        throw new Error("PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS must be an integer from 1 to 100.");
+      }
+      configuredReviewRoundLimit = reviewLimit;
       requireAcpNetworkRiskAcknowledgement();
     } catch (error) {
       return { status: "not_started", state, reason: error instanceof Error ? error.message : String(error) };
     }
-    if (state.reasoning_effort !== configuredReasoningEffort) {
-      return { status: "not_started", state, reason: "Frozen run reasoning effort differs from the explicit headless setting." };
+    if (
+      state.reasoning_effort !== configuredReasoningEffort ||
+      state.permission_mode !== configuredPermissionMode ||
+      state.review_round_limit !== configuredReviewRoundLimit
+    ) {
+      return { status: "not_started", state, reason: "Frozen run execution settings differ from the explicit headless settings." };
     }
   }
   try {
@@ -746,6 +798,8 @@ async function startStageB(
   state.executor_model = executorModel;
   state.reviewer_model = reviewerModel;
   if (configuredReasoningEffort) state.reasoning_effort = configuredReasoningEffort;
+  state.permission_mode = configuredPermissionMode;
+  state.review_round_limit = configuredReviewRoundLimit;
 
   const linked = linkedAbortSignal(options?.signal ?? ctx.signal, stageTimeoutMs());
   const active: ActiveRun = { controller: new AbortController(), startedAt: new Date().toISOString() };
@@ -794,9 +848,25 @@ async function startStageB(
       reviewerModel,
       ...(configuredReasoningEffort ? { reasoningEffort: configuredReasoningEffort } : {}),
       ...(profile ? { networkRiskApproved: true } : {}),
-      ...(executorModel.startsWith("codex/") ? { executorMode: "agent" } : executorModel.startsWith("opencode/") ? { executorMode: "build" } : {}),
+      permissionMode: configuredPermissionMode,
+      onPermissionChoice: async (role, request) => {
+        if (!ctx.hasUI) return undefined;
+        const tool = request.toolCall.title ?? request.toolCall.name ?? request.toolCall.toolCallId;
+        const labels = request.options.map((option, index) => `${index + 1}. ${option.name} [${option.kind}]`);
+        notify(
+          ctx,
+          `${role === "executor" ? "Executor" : "Reviewer"} requests permission for ${tool}. Choose exactly one option advertised by the active CLI.`,
+          "warning",
+        );
+        const chosen = await ctx.ui.select(
+          `${role === "executor" ? "Executor" : "Reviewer"} permission · ${tool}`,
+          [...labels, "Cancel / deny"],
+        );
+        const index = labels.indexOf(chosen ?? "");
+        return index >= 0 ? request.options[index]?.optionId : undefined;
+      },
       onLiveEvent: (role, event) => {
-        showWidget(ctx, [`Stage B · ${runId}`, `${role} · ${event}`, `Branch ${dedicated.branchName}`]);
+        showWidget(ctx, [`Execution & Review · ${runId}`, `${role} · ${event}`, `Branch ${dedicated.branchName}`]);
       },
     });
     harness = sessionPair;
@@ -812,7 +882,7 @@ async function startStageB(
       saveState: (next) => writeWorkflowState(pkg.root, next),
       onStatus: (event) => {
         showWidget(ctx, [
-          `Stage B · ${event.phase_id} · round ${event.round}`,
+          `Execution & Review · ${event.phase_id} · round ${event.round}`,
           `Executor ${event.executor_status} · Reviewer ${event.reviewer_status}`,
           `Branch ${dedicated.branchName}`,
           event.message,
@@ -829,11 +899,11 @@ async function startStageB(
         ctx,
         pkg,
         state,
-        `[STAGE_B_UNHANDLED] ${error instanceof Error ? error.message : String(error)}`,
+        `[EXECUTION_UNHANDLED] ${error instanceof Error ? error.message : String(error)}`,
       );
     }
     if (result.status === "paused") {
-      return persistAndEscalatePause(pi, ctx, pkg, result.state, result.reason ?? result.state.pause_reason ?? "Stage B paused.");
+      return persistAndEscalatePause(pi, ctx, pkg, result.state, result.reason ?? result.state.pause_reason ?? "Execution & Review paused.");
     }
     showWidget(ctx, stateLines(result.state));
     pi.appendEntry(STATE_ENTRY, result.state);
@@ -849,13 +919,13 @@ async function startStageB(
   }
 }
 
-function packageInput(params: FinalizeParams): FinalizeInput {
+function packageInput(params: FinalizeParams, reviewRoundLimit?: number): FinalizeInput {
   const manifest: Manifest = {
     version: params.manifest.version as 1,
     documents: params.manifest.documents ?? [],
     phases: params.manifest.phases as Manifest["phases"],
   };
-  if (params.manifest.max_review_rounds !== undefined) manifest.max_review_rounds = params.manifest.max_review_rounds;
+  manifest.max_review_rounds = reviewRoundLimit ?? params.manifest.max_review_rounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
   return {
     ...(params.run_id ? { run_id: params.run_id } : {}),
     manifest,
@@ -882,7 +952,14 @@ export async function approvedSetup(
   hasUI: boolean,
   requested?: { executor_model?: string; reviewer_model?: string },
   agentDir?: string,
-): Promise<{ executorModel: string; reviewerModel: string; reasoningEffort?: ReasoningEffort; profile?: ProjectPluginProfile }> {
+): Promise<{
+  executorModel: string;
+  reviewerModel: string;
+  reasoningEffort?: ReasoningEffort;
+  permissionMode: AgentPermissionMode;
+  reviewRoundLimit: number;
+  profile?: ProjectPluginProfile;
+}> {
   const profile = await loadProjectPluginProfile(cwd, agentDir);
   if (profile) {
     if ((requested?.executor_model && requested.executor_model !== profile.executorModel) ||
@@ -893,6 +970,8 @@ export async function approvedSetup(
       executorModel: profile.executorModel,
       reviewerModel: profile.reviewerModel,
       ...(profile.reasoningEffort ? { reasoningEffort: profile.reasoningEffort } : {}),
+      permissionMode: profile.permissionMode,
+      reviewRoundLimit: profile.reviewRoundLimit,
       profile,
     };
   }
@@ -907,7 +986,21 @@ export async function approvedSetup(
   supportedBackendForModel(reviewerModel);
   requireAcpNetworkRiskAcknowledgement();
   const reasoningEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_REASONING_EFFORT);
-  return { executorModel, reviewerModel, ...(reasoningEffort ? { reasoningEffort } : {}) };
+  const permissionMode = process.env.PI_PLAN_EXECUTE_PERMISSION_MODE ?? "autonomous";
+  if (permissionMode !== "autonomous" && permissionMode !== "ask") {
+    throw new Error("PI_PLAN_EXECUTE_PERMISSION_MODE must be autonomous or ask.");
+  }
+  const reviewRoundLimit = Number(process.env.PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS ?? DEFAULT_MAX_REVIEW_ROUNDS);
+  if (!Number.isInteger(reviewRoundLimit) || reviewRoundLimit < 1 || reviewRoundLimit > 100) {
+    throw new Error("PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS must be an integer from 1 to 100.");
+  }
+  return {
+    executorModel,
+    reviewerModel,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    permissionMode,
+    reviewRoundLimit,
+  };
 }
 
 async function handleFinalize(
@@ -916,14 +1009,14 @@ async function handleFinalize(
   params: FinalizeParams,
 ): Promise<ReturnType<typeof textResult>> {
   if (params.approval === "cancel") return textResult("Finalization cancelled before writing a package.", { status: "cancelled" });
-  const input = packageInput(params);
-  const runId = input.run_id ?? `run-${Date.now().toString(36)}`;
   try {
     const selection = await approvedSetup(ctx.cwd, ctx.hasUI, params);
+    const input = packageInput(params, selection.reviewRoundLimit);
+    const runId = input.run_id ?? `run-${Date.now().toString(36)}`;
     const written = await writeValidatedPackage(ctx.cwd, input, runId);
     const draft = createDraftState(written.package, runId);
     await writeWorkflowState(written.package.root, draft);
-    showWidget(ctx, ["Stage A Finalization", "✓ Documents written", "✓ Manifest valid", `✓ ${written.package.phases.length} phases found`, "○ Human approval pending"]);
+    showWidget(ctx, ["Plan Review & Approval", "✓ Documents written", "✓ Manifest valid", `✓ ${written.package.phases.length} phases found`, `✓ Review limit ${selection.reviewRoundLimit} per phase`, "○ Human approval pending"]);
     const approval = await chooseApproval(ctx, written.package, selection.profile);
     if (approval === "pending") {
       return textResult(
@@ -933,7 +1026,7 @@ async function handleFinalize(
     }
     if (approval === "cancel") {
       const cancelled = await cancelRun(written.package, runId);
-      showWidget(ctx, ["Stage A Finalization", "Cancelled", `Run ${runId}`]);
+      showWidget(ctx, ["Plan Review & Approval", "Cancelled", `Run ${runId}`]);
       return textResult(`Package ${runId} was cancelled; it was not frozen.`, { status: cancelled.status, run_id: runId });
     }
     const frozen = await freezeRun(written.package, runId, {
@@ -941,6 +1034,8 @@ async function handleFinalize(
       executorModel: selection.executorModel,
       reviewerModel: selection.reviewerModel,
       ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+      permissionMode: selection.permissionMode,
+      reviewRoundLimit: selection.reviewRoundLimit,
     });
     showWidget(ctx, stateLines(frozen));
     // The human's Approve & Start choice is the sole authority; model parameters cannot suppress it.
@@ -949,9 +1044,9 @@ async function handleFinalize(
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     if (started.status === "not_started") {
-      return textResult(`Package frozen, but Stage B could not start: ${started.reason}`, { status: "paused", run_id: runId, state: started.state });
+      return textResult(`Plan approved, but Execution & Review could not start: ${started.reason}`, { status: "paused", run_id: runId, state: started.state });
     }
-    return textResult(`Package frozen. Stage B: ${started.status}.`, { status: started.status, run_id: runId, state: started.state });
+    return textResult(`Plan approved. Execution & Review: ${started.status}.`, { status: started.status, run_id: runId, state: started.state });
   } catch (error) {
     const details = errorDetails(error);
     notify(ctx, details.text, "error");
@@ -995,7 +1090,7 @@ async function commandApprove(
       return;
     }
     const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
-    const review = `${await packageReviewText(loaded.package)}\n\nExecutor: ${selection.executorModel}\nReviewer: ${selection.reviewerModel}\nReasoning: ${selection.reasoningEffort ?? "backend default"}`;
+    const review = `${await packageReviewText(loaded.package)}\n\nExecutor: ${selection.executorModel}\nReviewer: ${selection.reviewerModel}\nReasoning: ${selection.reasoningEffort ?? "backend default"}\nReview loop limit: ${selection.reviewRoundLimit}\nPermissions: ${selection.permissionMode}`;
     const ok = !ctx.hasUI || await ctx.ui.confirm("Freeze Golden Document Package", review);
     if (!ok) {
       notify(ctx, "Approval cancelled; package remains unfrozen.", "info");
@@ -1006,15 +1101,17 @@ async function commandApprove(
       executorModel: selection.executorModel,
       reviewerModel: selection.reviewerModel,
       ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+      permissionMode: selection.permissionMode,
+      reviewRoundLimit: selection.reviewRoundLimit,
     });
     pi.appendEntry(STATE_ENTRY, state);
     showWidget(ctx, stateLines(state));
     if (!start) {
-      notify(ctx, `Run ${runId} frozen. Stage B has not started.`, "info");
+      notify(ctx, `Run ${runId} plan approved. Execution & Review has not started.`, "info");
       return;
     }
     const result = await startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
-    notify(ctx, result.status === "not_started" ? result.reason : `Stage B ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
+    notify(ctx, result.status === "not_started" ? result.reason : `Execution & Review ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -1023,10 +1120,10 @@ async function commandApprove(
 async function commandStop(ctx: ExtensionCommandContext, runId: string): Promise<void> {
   const active = activeRuns.get(runId);
   if (!active) {
-    notify(ctx, `Run ${runId} has no active Stage B session.`, "warning");
+    notify(ctx, `Run ${runId} has no active Execution & Review session.`, "warning");
     return;
   }
-  active.controller.abort(new Error("Stage B stopped by human."));
+  active.controller.abort(new Error("Execution & Review stopped by human."));
   notify(ctx, `Stop requested for ${runId}; the workflow will pause without committing.`, "info");
 }
 
@@ -1063,7 +1160,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       if (action === "start" && tokens[1]) {
         try {
           const result = await startStageB(pi, ctx, tokens[1], { ...(ctx.signal ? { signal: ctx.signal } : {}) });
-          notify(ctx, result.status === "not_started" ? result.reason : `Stage B ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
+          notify(ctx, result.status === "not_started" ? result.reason : `Execution & Review ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
         } catch (error) {
           notify(ctx, error instanceof Error ? error.message : String(error), "error");
         }
@@ -1090,7 +1187,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
   });
 
   pi.registerMessageRenderer(ESCALATION_MESSAGE, (message, _options, theme) => {
-    const content = typeof message.content === "string" ? message.content : "Stage B escalation (see details).";
+    const content = typeof message.content === "string" ? message.content : "Execution & Review needs attention (see details).";
     return new Text(theme.fg("warning", content), 0, 0);
   });
 
