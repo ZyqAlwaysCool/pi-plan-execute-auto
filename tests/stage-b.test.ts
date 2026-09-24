@@ -204,6 +204,9 @@ test("prompt section limits retain rework feedback, previous findings, and outpu
     const feedback = "FEEDBACK-MUST-SURVIVE";
     const executorPrompt = privateController.executorPrompt(phase, base, 2, "D".repeat(160_000), feedback);
     assert.match(executorPrompt, new RegExp(feedback));
+    assert.match(executorPrompt, /review_round_limit: 5/);
+    assert.match(executorPrompt, /review_rounds_remaining_including_this_round: 4/);
+    assert.match(executorPrompt, /review_rounds_remaining_after_this_round: 3/);
     assert.match(executorPrompt, /structured execution report/);
     const reviewerPrompt = privateController.reviewerPrompt(
       phase,
@@ -217,6 +220,10 @@ test("prompt section limits retain rework feedback, previous findings, and outpu
       [{ ...review(base, "REWORK"), findings: [{ id: "HISTORY-001", severity: "blocking", summary: "history finding", evidence: "evidence", blocking: true }] }],
     );
     assert.match(reviewerPrompt, /HISTORY-001/);
+    assert.match(reviewerPrompt, /review_round_limit: 5/);
+    assert.match(reviewerPrompt, /review_rounds_remaining_including_this_round: 4/);
+    assert.match(reviewerPrompt, /review_rounds_remaining_after_this_round: 3/);
+    assert.match(reviewerPrompt, /avoid drip-feeding findings/);
     assert.match(reviewerPrompt, /structured review report/);
     const manyFindings = Array.from({ length: 200 }, (_, index) => ({
       id: `HISTORY-${String(index).padStart(3, "0")}`,

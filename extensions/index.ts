@@ -55,10 +55,10 @@ import { defaultIsolationProvider } from "../src/isolation-provider.js";
 import { supportedBackendForModel } from "../src/sandbox.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
 import { StageBController } from "../src/stage-b.js";
+import { DEFAULT_MAX_REVIEW_ROUNDS } from "../src/types.js";
 import type {
   AcceptanceCommandRunner,
   AgentPermissionMode,
-  DEFAULT_MAX_REVIEW_ROUNDS,
   FinalizeInput,
   Manifest,
   ReasoningEffort,

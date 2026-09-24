@@ -58,7 +58,13 @@ test("per-repository human setup stores no secrets and overrides model-supplied 
     await writeFile(cached, local.replace(saved.executorModel, "pi/openai-codex/gpt-5.5"));
     await assert.rejects(loadProjectPluginProfile(project, agentDir), /differs from the human-approved selection/);
     await writeFile(cached, local);
-    const frozen = { executor_model: saved.executorModel, reviewer_model: saved.reviewerModel, reasoning_effort: "high" } as WorkflowState;
+    const frozen = {
+      executor_model: saved.executorModel,
+      reviewer_model: saved.reviewerModel,
+      reasoning_effort: "high",
+      permission_mode: saved.permissionMode,
+      review_round_limit: saved.reviewRoundLimit,
+    } as WorkflowState;
     assert.equal(frozenProfileMatches(frozen, saved), true);
     assert.equal(frozenProfileMatches(frozen, saved, "opencode/opencode/big-pickle"), false);
     const missingEffort = { ...frozen };
@@ -96,13 +102,15 @@ test("interactive wizard records only a separate human network consent and confi
         if (title.startsWith("Executor:")) return choices[0];
         if (title.startsWith("Reviewer:")) return choices[1];
         if (title.startsWith("ACP reasoning effort")) return choices[2];
+        if (title.startsWith("Maximum review rounds")) return choices[1];
+        if (title.startsWith("Agent permission handling")) return choices[0];
         throw new Error(`Unexpected selection: ${title}`);
       },
       async input() { manualInputs += 1; return "gpt-6-luna"; },
       async confirm(title: string, message: string) {
         confirmations += 1;
         if (title.includes("discovery")) assert.match(message, /mounts no project files/);
-        else { assert.match(title, /ACP networking/); assert.match(message, /not network isolation/); }
+        else { assert.match(title, /ACP networking/); assert.match(message, /normal network access|normal standalone CLI session/); }
         return consent;
       },
     },
@@ -121,6 +129,8 @@ test("interactive wizard records only a separate human network consent and confi
     assert.equal(configured?.executorModel, "opencode/deepseek-local/deepseek-flash");
     assert.equal(configured?.reviewerModel, "codex/gpt-6-luna");
     assert.equal(configured?.reasoningEffort, "high");
+    assert.equal(configured?.reviewRoundLimit, 5);
+    assert.equal(configured?.permissionMode, "autonomous");
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), configured);
     const fallback = await runSetupWizard(ctx, clis, agentDir, async () => { throw new Error("ACP catalog unavailable"); }, discoverEfforts);
     assert.equal(fallback?.reviewerModel, "codex/gpt-6-luna");
@@ -148,6 +158,8 @@ test("all four backend routes share one wizard; reasoning is the intersection of
         if (title.includes("claude model")) { assert.deepEqual(choices.slice(0, 1), ["claude/sonnet"]); return choices[0]; }
         if (title.includes("pi model")) { assert.deepEqual(choices.slice(0, 1), ["pi/openai-codex/gpt-5.5"]); return choices[0]; }
         if (title.startsWith("ACP reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "backend default", "Cancel"]); return "high"; }
+        if (title.startsWith("Maximum review rounds")) return choices[1];
+        if (title.startsWith("Agent permission handling")) return choices[1];
         throw new Error(`Unexpected choice: ${title}`);
       },
       async input() { throw new Error("Model catalogs must be selectable without typing IDs"); },
@@ -165,6 +177,8 @@ test("all four backend routes share one wizard; reasoning is the intersection of
     assert.equal(profile?.executorModel, "claude/sonnet");
     assert.equal(profile?.reviewerModel, "pi/openai-codex/gpt-5.5");
     assert.equal(profile?.reasoningEffort, "high");
+    assert.equal(profile?.reviewRoundLimit, 5);
+    assert.equal(profile?.permissionMode, "ask");
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), profile);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -178,6 +192,8 @@ test("declined billable Claude/Pi provider preflight stores no project or consen
       async select(title: string, choices: string[]) {
         if (title.includes("model (candidates")) return choices[0];
         if (title.startsWith("ACP reasoning effort")) return "medium";
+        if (title.startsWith("Maximum review rounds")) return choices[0];
+        if (title.startsWith("Agent permission handling")) return choices[0];
         return choices[0];
       },
       async input() { throw new Error("Unexpected manual input"); },
@@ -247,7 +263,14 @@ test("the project cache cannot be redirected by a symlink or grant network conse
 
 test("headless fallback remains explicit, not a hidden default", async () => {
   const { root, project, agentDir } = await fixture();
-  const keys = ["PI_PLAN_EXECUTE_EXECUTOR_MODEL", "PI_PLAN_EXECUTE_REVIEWER_MODEL", "PI_PLAN_EXECUTE_REASONING_EFFORT", "PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK"] as const;
+  const keys = [
+    "PI_PLAN_EXECUTE_EXECUTOR_MODEL",
+    "PI_PLAN_EXECUTE_REVIEWER_MODEL",
+    "PI_PLAN_EXECUTE_REASONING_EFFORT",
+    "PI_PLAN_EXECUTE_PERMISSION_MODE",
+    "PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS",
+    "PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK",
+  ] as const;
   const before = keys.map((key) => process.env[key]);
   try {
     for (const key of keys) delete process.env[key];
@@ -258,7 +281,11 @@ test("headless fallback remains explicit, not a hidden default", async () => {
     await assert.rejects(approvedSetup(project, false, undefined, agentDir), /ACP tool network egress/);
     process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK = "1";
     assert.deepEqual(await approvedSetup(project, false, undefined, agentDir), {
-      executorModel: "opencode/deepseek-local/deepseek-flash", reviewerModel: "codex/gpt-6-luna", reasoningEffort: "high",
+      executorModel: "opencode/deepseek-local/deepseek-flash",
+      reviewerModel: "codex/gpt-6-luna",
+      reasoningEffort: "high",
+      permissionMode: "autonomous",
+      reviewRoundLimit: 5,
     });
   } finally {
     keys.forEach((key, index) => {

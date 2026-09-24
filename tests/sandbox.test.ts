@@ -146,7 +146,7 @@ test("ACP backend command uses minimal mounts and a scrubbed environment", {
   }
 });
 
-test("Pi ACP stages only the selected provider and unlinks auth before its first turn", {
+test("Pi ACP preserves native CLI auth state and bootstrap unlinks it before the first turn", {
   skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted bwrap is required for the Pi bootstrap",
 }, async () => {
   const root = await mkdtemp(join(dirname(process.cwd()), ".peac-pi-auth-fixture-"));
@@ -169,7 +169,7 @@ test("Pi ACP stages only the selected provider and unlinks auth before its first
     const target = join(sandbox.scratchPath, "run", "home", ".pi", "agent", "auth.json");
     const staged = await readFile(target, "utf8");
     assert.match(staged, /selected-test-token/);
-    assert.doesNotMatch(staged, /OTHER-SECRET|unrelated/);
+    assert.match(staged, /OTHER-SECRET|unrelated/);
     assert.ok(sandbox.config.args?.includes("/agent-runtime/pi-acp-bootstrap.mjs"));
     agent = new AcpAgent({ cwd, model: "pi/openai-codex/gpt-5.5", backends: { pi: sandbox.config }, permissions: { defaultOutcome: "deny" } });
     await agent.ready();
@@ -261,6 +261,7 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
         options: { baseURL: "http://127.0.0.1:8080/v1" },
         models: { "deepseek-flash": { variants: { high: {} } } },
       } },
+      plugin: ["fixture-native-plugin"],
     }));
     await writeFile(join(hostData, "opencode", "auth.json"), JSON.stringify({
       "deepseek-local": { type: "api", key: "selected-opencode-secret" },
@@ -280,16 +281,18 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
         ...common, role: "executor", model: "opencode/deepseek-local/deepseek-flash",
         includeProviderCredentials: true,
       });
-      const providerConfig = join(configured.scratchPath, "run", "config", "opencode", "opencode.json");
+      const providerConfig = join(configured.scratchPath, "run", "config", "opencode", "opencode.jsonc");
       const stagedAuth = join(configured.scratchPath, "run", "data", "opencode", "auth.json");
       const stagedProvider = await readFile(providerConfig, "utf8");
       const stagedCredential = await readFile(stagedAuth, "utf8");
       assert.doesNotMatch(stagedProvider, /selected-opencode-secret|OTHER-SECRET/);
+      assert.match(stagedProvider, /fixture-native-plugin/);
       assert.match(stagedCredential, /selected-opencode-secret/);
-      assert.doesNotMatch(stagedCredential, /OTHER-SECRET|unrelated-provider/);
+      assert.match(stagedCredential, /OTHER-SECRET|unrelated-provider/);
       await configured.scrubCredentials();
-      await assert.rejects(access(providerConfig));
-      await assert.rejects(access(stagedAuth));
+      // Native CLI state lives only in run-private scratch, but remains available
+      // for the full CLI session just as it would in a standalone OpenCode session.
+      await access(stagedAuth);
     } finally {
       await configured?.cleanup();
       for (const [key, value] of Object.entries(savedEnv)) {
@@ -330,7 +333,7 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
           command: `node -e 'const s=require("node:net").connect(${address.port},"127.0.0.1"); s.on("connect",()=>process.exit(73)); s.on("error",()=>process.exit(0)); setTimeout(()=>process.exit(74),2000)'`,
           timeout: 20_000,
         });
-        assert.equal(network.code, 0, `acceptance reached the host network or could not run node: ${network.stderr}`);
+        assert.equal(network.code, 73, `acceptance could not reach the normal host network: ${network.stderr}`);
       } finally {
         server.close();
       }
@@ -342,31 +345,32 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
   }
 });
 
-test("Claude sandbox uses only the host relay capability and locks unsafe Claude session features", {
+test("Claude isolated session preserves native CLI routing, auth and tools without host-home mounts", {
   skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
 }, async () => {
-  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-claude-relay-fixture-"));
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-claude-native-fixture-"));
   const worktree = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+  const claudeConfig = join(fixture, "claude-config");
+  await mkdir(claudeConfig);
+  await writeFile(join(claudeConfig, "settings.json"), JSON.stringify({
+    enabledPlugins: { "fixture-plugin@example": true },
+    env: { FIXTURE_SETTING: "preserved" },
+  }));
   const original = {
     token: process.env.ANTHROPIC_AUTH_TOKEN,
-    apiKey: process.env.ANTHROPIC_API_KEY,
     baseUrl: process.env.ANTHROPIC_BASE_URL,
     model: process.env.ANTHROPIC_MODEL,
     sonnet: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
-    modelConfig: process.env.CLAUDE_MODEL_CONFIG,
+    configDir: process.env.CLAUDE_CONFIG_DIR,
     httpsProxy: process.env.HTTPS_PROXY,
   };
   let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
   try {
-    process.env.ANTHROPIC_AUTH_TOKEN = "HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX";
-    delete process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:9";
+    process.env.CLAUDE_CONFIG_DIR = claudeConfig;
+    process.env.ANTHROPIC_AUTH_TOKEN = "HOST_CLAUDE_NATIVE_TOKEN";
+    process.env.ANTHROPIC_BASE_URL = "http://gateway.example.invalid:8080";
     process.env.ANTHROPIC_MODEL = "deepseek-flash[1m]";
     process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "deepseek-flash[1m]";
-    process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
-      modelOverrides: { "claude-opus-4-6": "gateway-opus" },
-      availableModels: ["sonnet", "opus"],
-    });
     process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
     sandbox = await createSandboxedBackend({
       role: "executor",
@@ -377,67 +381,30 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
       includeProviderCredentials: true,
     });
     const args = sandbox.config.args ?? [];
-    const serialized = JSON.stringify(args);
-    assert.doesNotMatch(serialized, /HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX/);
-    assert.doesNotMatch(serialized, /127\.0\.0\.1:7890/);
-    const baseIndex = args.findIndex((value, index) => value === "ANTHROPIC_BASE_URL" && args[index - 1] === "--setenv");
-    assert.ok(baseIndex >= 0);
-    assert.match(args[baseIndex + 1] ?? "", /^http:\/\/127\.0\.0\.1:\d+\/[A-Za-z0-9_-]{40,}$/u);
-    const authIndex = args.findIndex((value, index) => value === "ANTHROPIC_AUTH_TOKEN" && args[index - 1] === "--setenv");
-    const relayToken = args[authIndex + 1] ?? "";
-    assert.match(relayToken, /^[A-Za-z0-9_-]{40,}$/u);
-    assert.notEqual(relayToken, "HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX");
-    assert.notEqual(relayToken, "pi-plan-execute-relay");
     const routedEnv: Record<string, string> = {};
     for (let index = 0; index < args.length - 2; index += 1) {
       if (args[index] === "--setenv") routedEnv[args[index + 1] ?? ""] = args[index + 2] ?? "";
     }
+    assert.equal(routedEnv.ANTHROPIC_AUTH_TOKEN, "HOST_CLAUDE_NATIVE_TOKEN");
+    assert.equal(routedEnv.ANTHROPIC_BASE_URL, "http://gateway.example.invalid:8080");
     assert.equal(routedEnv.ANTHROPIC_MODEL, "deepseek-flash[1m]");
     assert.equal(routedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL, "deepseek-flash[1m]");
-    assert.deepEqual(JSON.parse(routedEnv.CLAUDE_MODEL_CONFIG ?? "{}"), {
-      modelOverrides: { "claude-opus-4-6": "gateway-opus" },
-      availableModels: ["sonnet", "opus"],
-    });
+    assert.equal(routedEnv.HTTPS_PROXY, "http://127.0.0.1:7890");
+    assert.equal(routedEnv.CLAUDE_CONFIG_DIR, "/tmp/run/home/.claude");
+    assert.notEqual(routedEnv.CLAUDE_CONFIG_DIR, claudeConfig);
     assert.equal(routedEnv.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1");
-    assert.equal(serialized.includes("HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX"), false);
-    for (const key of ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"]) {
-      const index = args.findIndex((value, offset) => value === key && args[offset - 1] === "--setenv");
-      assert.equal(args[index + 1], "1");
-    }
-    assert.deepEqual(sandbox.config.sessionMeta, {
-      claudeCode: {
-        options: {
-          settingSources: [],
-          allowDangerouslySkipPermissions: false,
-          disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
-          sandbox: {
-            enabled: true,
-            failIfUnavailable: true,
-            allowUnsandboxedCommands: false,
-            network: {
-              strictAllowlist: true,
-              allowedDomains: [],
-              deniedDomains: ["localhost", "127.0.0.1", "[::1]"],
-            },
-            credentials: {
-              envVars: [
-                { name: "ANTHROPIC_AUTH_TOKEN", mode: "deny" },
-                { name: "ANTHROPIC_API_KEY", mode: "deny" },
-                { name: "ANTHROPIC_BASE_URL", mode: "deny" },
-              ],
-            },
-          },
-        },
-      },
-    });
+    assert.equal(sandbox.config.sessionMeta, undefined);
+    const stagedSettings = await readFile(join(sandbox.scratchPath, "run", "home", ".claude", "settings.json"), "utf8");
+    assert.match(stagedSettings, /fixture-plugin@example/);
+    assert.match(stagedSettings, /FIXTURE_SETTING/);
+    assert.equal(args.includes("--unshare-net"), false);
   } finally {
     await sandbox?.cleanup();
     if (original.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = original.token;
-    if (original.apiKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = original.apiKey;
     if (original.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = original.baseUrl;
     if (original.model === undefined) delete process.env.ANTHROPIC_MODEL; else process.env.ANTHROPIC_MODEL = original.model;
     if (original.sonnet === undefined) delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL; else process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = original.sonnet;
-    if (original.modelConfig === undefined) delete process.env.CLAUDE_MODEL_CONFIG; else process.env.CLAUDE_MODEL_CONFIG = original.modelConfig;
+    if (original.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = original.configDir;
     if (original.httpsProxy === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = original.httpsProxy;
     await rm(fixture, { recursive: true, force: true });
   }

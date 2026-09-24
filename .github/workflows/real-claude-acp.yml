@@ -21,12 +21,11 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - name: Install trusted system sandbox tools
+      - name: Install trusted system sandbox tool
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap socat
+          sudo apt-get install -y bubblewrap
           test "$(stat -c %u /usr/bin/bwrap)" = 0
-          test "$(stat -c %u /usr/bin/socat)" = 0
           unshare -Ur true
       - run: npm ci
       - name: Require protected Claude host credential
