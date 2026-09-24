@@ -1,7 +1,7 @@
 /** Public data contracts for pi-plan-execute-auto. */
 
 export const WORKFLOW_VERSION = 1 as const;
-export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
+export const DEFAULT_MAX_REVIEW_ROUNDS = 5;
 export const RUNTIME_DIRECTORY = ".runtime";
 export const STATE_FILE = ".state.json";
 export const MANIFEST_FILE = "manifest.yaml";
@@ -195,6 +195,7 @@ export interface PhaseState {
 }
 
 export type ReasoningEffort = "low" | "medium" | "high" | "max";
+export type AgentPermissionMode = "autonomous" | "ask";
 
 export interface WorkflowState {
   version: 1;
@@ -209,6 +210,8 @@ export interface WorkflowState {
   executor_model?: string;
   reviewer_model?: string;
   reasoning_effort?: ReasoningEffort;
+  permission_mode?: AgentPermissionMode;
+  review_round_limit?: number;
   branch_name?: string;
   worktree_path?: string;
   /** Exact disposable dependency roots provisioned for this run; never a basename wildcard. */

@@ -67,6 +67,12 @@ export async function loadValidatedRun(
   if (state.reasoning_effort !== undefined && !["low", "medium", "high", "max"].includes(state.reasoning_effort)) {
     throw new Error(`Workflow ${runId} has an unsupported persisted reasoning effort.`);
   }
+  if (state.permission_mode !== undefined && state.permission_mode !== "autonomous" && state.permission_mode !== "ask") {
+    throw new Error(`Workflow ${runId} has an unsupported persisted agent permission mode.`);
+  }
+  if (state.review_round_limit !== undefined && (!Number.isInteger(state.review_round_limit) || state.review_round_limit < 1 || state.review_round_limit > 100)) {
+    throw new Error(`Workflow ${runId} has an invalid persisted review round limit.`);
+  }
   assertSafeRunId(state.run_id);
   const expectedPhaseIds = validation.package.phases.map((phase) => phase.phase.id);
   const actualPhaseIds = state.phases.map((phase) => phase.phase_id);
@@ -158,7 +164,14 @@ export async function loadValidatedRun(
 export async function freezeRun(
   pkg: ValidatedPackage,
   runId: string,
-  options?: { executorModel?: string; reviewerModel?: string; reasoningEffort?: WorkflowState["reasoning_effort"]; reviewedPackageHash?: string },
+  options?: {
+    executorModel?: string;
+    reviewerModel?: string;
+    reasoningEffort?: WorkflowState["reasoning_effort"];
+    permissionMode?: WorkflowState["permission_mode"];
+    reviewRoundLimit?: number;
+    reviewedPackageHash?: string;
+  },
 ): Promise<WorkflowState> {
   const root = pkg.root;
   const current = await readWorkflowState(root);
@@ -182,6 +195,8 @@ export async function freezeRun(
   if (options?.executorModel) state.executor_model = options.executorModel;
   if (options?.reviewerModel) state.reviewer_model = options.reviewerModel;
   if (options?.reasoningEffort) state.reasoning_effort = options.reasoningEffort;
+  if (options?.permissionMode) state.permission_mode = options.permissionMode;
+  if (options?.reviewRoundLimit !== undefined) state.review_round_limit = options.reviewRoundLimit;
   await writeWorkflowState(root, state);
   return state;
 }
