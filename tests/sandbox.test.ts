@@ -216,15 +216,16 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
       else process.env.PATH = originalPath;
     }
 
-    // Node-backed Claude/Pi must use the already-vetted credential-free proxy;
-    // Node's fetch otherwise ignores HTTP(S)_PROXY and live turns fail after ready().
+    // Native CLI sessions preserve the user's proxy semantics, including an
+    // authenticated proxy. Node-backed Claude/Pi additionally enable env-proxy handling.
     const priorHttpsProxy = process.env.HTTPS_PROXY;
     try {
-      process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+      process.env.HTTPS_PROXY = "http://fixture-user:fixture-pass@127.0.0.1:7890";
       for (const model of ["claude/sonnet", "pi/openai-codex/gpt-5.5", "codex/gpt-5.6-sol"]) {
         const sandbox = await createSandboxedBackend({ ...common, role: "reviewer", model });
         try {
           const args = sandbox.config.args ?? [];
+          assert.ok(args.includes("http://fixture-user:fixture-pass@127.0.0.1:7890"));
           const proxyFlag = args.findIndex((value, index) => value === "NODE_USE_ENV_PROXY" && args[index + 1] === "1");
           assert.equal(proxyFlag !== -1, model.startsWith("claude/") || model.startsWith("pi/"));
         } finally { await sandbox.cleanup(); }

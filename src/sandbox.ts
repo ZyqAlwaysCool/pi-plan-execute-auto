@@ -614,18 +614,18 @@ function safeProxyEnvironment(): Array<[string, string]> {
   for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] as const) {
     const value = process.env[key] ?? process.env[key.toLowerCase()];
     if (!value) continue;
+    if (value.includes("\0")) throw new Error(`Invalid NUL byte in ${key}; refusing to forward it into the Agent CLI sandbox.`);
     let parsed: URL;
     try {
       parsed = new URL(value);
     } catch {
-      throw new Error(`Invalid ${key} URL; refusing to forward it into the ACP sandbox.`);
+      throw new Error(`Invalid ${key} URL; refusing to forward it into the Agent CLI sandbox.`);
     }
-    if (
-      !["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol) ||
-      parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/"
-    ) {
-      throw new Error(`${key} must be a credential-free proxy URL without path/query data to enter the ACP sandbox.`);
+    if (!["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol)) {
+      throw new Error(`${key} uses an unsupported proxy protocol: ${parsed.protocol}`);
     }
+    // Full native sessions preserve the user's normal proxy semantics, including
+    // authenticated proxies. The value exists only in the isolated process env.
     result.push([key, value], [key.toLowerCase(), value]);
   }
   return result;
