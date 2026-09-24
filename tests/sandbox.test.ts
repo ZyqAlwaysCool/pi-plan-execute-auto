@@ -381,7 +381,7 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
         options: {
           settingSources: [],
           allowDangerouslySkipPermissions: false,
-          disallowedTools: ["Agent", "Task"],
+          disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
         },
       },
     });

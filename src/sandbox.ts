@@ -856,7 +856,7 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
             options: {
               settingSources: [],
               allowDangerouslySkipPermissions: false,
-              disallowedTools: ["Agent", "Task"],
+              disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
             },
           },
         },

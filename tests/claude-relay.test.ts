@@ -23,7 +23,7 @@ async function body(req: IncomingMessage): Promise<string> {
 }
 
 test("Claude credential relay injects host auth, pins model/path, and never reflects secrets", async () => {
-  const seen: Array<{ url?: string; authorization?: string; route?: string; body: string }> = [];
+  const seen: Array<{ url: string | undefined; authorization: string | undefined; route: string | undefined; body: string }> = [];
   const upstream = createServer(async (req, res) => {
     seen.push({
       url: req.url,

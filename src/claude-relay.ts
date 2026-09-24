@@ -201,7 +201,7 @@ class SecretScrubber extends Transform {
   }
 
   override _transform(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const data = Buffer.from(chunk);
     this.pending = this.pending.byteLength ? Buffer.concat([this.pending, data]) : data;
     this.drain(false);
     callback();
