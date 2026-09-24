@@ -6,6 +6,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   readFile,
   rm,
@@ -789,7 +790,7 @@ async function prepareCredentials(
 function assertTrustedExternalAgentBinary(
   source: string,
   roots: readonly string[],
-): void {
+): string {
   const real = realpathSync(source);
   const stat = statSync(real);
   if (!stat.isFile() || accessSync(real, fsConstants.X_OK) !== undefined || (stat.mode & 0o022) !== 0) {
@@ -830,6 +831,31 @@ function assertTrustedExternalAgentBinary(
     }
     cursor = dirname(cursor);
   }
+  return real;
+}
+
+async function stageTrustedExternalAgentBinary(source: string, scratchPath: string): Promise<string> {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const handle = await open(source, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || (stat.mode & 0o111) === 0 || (stat.mode & 0o022) !== 0 ||
+      (uid !== undefined && stat.uid !== 0 && stat.uid !== uid)) {
+      throw new Error("External agent binary changed after provenance validation; refusing to stage it.");
+    }
+    if (stat.size <= 0 || stat.size > 512 * 1024 * 1024) {
+      throw new Error("External agent binary has an invalid or excessive size.");
+    }
+    const target = join(scratchPath, "run", "external", "opencode");
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    const input = handle.createReadStream({ autoClose: false });
+    const output = createWriteStream(target, { flags: "wx", mode: 0o500 });
+    await pipeline(input, output);
+    await chmod(target, 0o500);
+    return target;
+  } finally {
+    await handle.close();
+  }
 }
 
 async function assertDedicatedWorktreePointer(cwd: string): Promise<void> {
@@ -851,18 +877,22 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
   assertAgentRoots({ ...options, cwd, sourceRoot, goldenRoot });
   const bwrap = findBubblewrap();
   await assertDedicatedWorktreePointer(cwd);
-  const runtime = backendRuntime(backendId);
+  let runtime = backendRuntime(backendId);
   if (backendId === "claude" && options.includeProviderCredentials) {
     requireClaudeSandboxTransport();
   }
-  if (backendId === "opencode" && runtime.extraBinary) {
-    assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot]);
-  }
+  const trustedOpenCodeBinary = backendId === "opencode" && runtime.extraBinary
+    ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
+    : undefined;
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
   const credentials: string[] = [];
   let claudeRelay: ClaudeCredentialRelay | undefined;
   try {
     await prepareScratchLayout(scratchPath, cwd, options.signal);
+    if (trustedOpenCodeBinary && runtime.extraBinary) {
+      const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
+      runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
+    }
     if (options.includeProviderCredentials) {
       if (backendId === "claude") {
         claudeRelay = await startClaudeCredentialRelay({ modelRoute: options.model });

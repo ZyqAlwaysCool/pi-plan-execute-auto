@@ -475,7 +475,19 @@ test("OpenCode runtime accepts a current-user-owned 0775 install tree outside pr
       goldenRoot: join(process.cwd(), "docs"),
     });
     assert.equal(sandbox.backendId, "opencode");
-    assert.ok((sandbox.config.args ?? []).includes(executable));
+    const args = sandbox.config.args ?? [];
+    const runtimeTarget = args.indexOf("/agent-runtime/opencode");
+    assert.ok(runtimeTarget > 0);
+    const stagedBinary = args[runtimeTarget - 1] ?? "";
+    assert.equal(stagedBinary, join(sandbox.scratchPath, "run", "external", "opencode"));
+    assert.equal(args.includes(executable), false);
+
+    // Once staged, later replacement of the original PATH binary cannot change
+    // what the run executes.
+    await writeFile(executable, "#!/bin/sh\nexit 99\n");
+    await chmod(executable, 0o755);
+    const executed = await execFile(sandbox.config.command, args, { cwd: worktree });
+    assert.equal(executed.stdout, "");
   } finally {
     await sandbox?.cleanup();
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
