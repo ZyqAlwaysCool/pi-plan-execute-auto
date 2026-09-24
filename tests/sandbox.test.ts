@@ -351,6 +351,9 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
     token: process.env.ANTHROPIC_AUTH_TOKEN,
     apiKey: process.env.ANTHROPIC_API_KEY,
     baseUrl: process.env.ANTHROPIC_BASE_URL,
+    model: process.env.ANTHROPIC_MODEL,
+    sonnet: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+    modelConfig: process.env.CLAUDE_MODEL_CONFIG,
     httpsProxy: process.env.HTTPS_PROXY,
   };
   let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
@@ -358,6 +361,12 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
     process.env.ANTHROPIC_AUTH_TOKEN = "HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX";
     delete process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:9";
+    process.env.ANTHROPIC_MODEL = "deepseek-flash[1m]";
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "deepseek-flash[1m]";
+    process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+      modelOverrides: { "claude-opus-4-6": "gateway-opus" },
+      availableModels: ["sonnet", "opus"],
+    });
     process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
     sandbox = await createSandboxedBackend({
       role: "executor",
@@ -379,6 +388,18 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
     assert.match(relayToken, /^[A-Za-z0-9_-]{40,}$/u);
     assert.notEqual(relayToken, "HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX");
     assert.notEqual(relayToken, "pi-plan-execute-relay");
+    const routedEnv: Record<string, string> = {};
+    for (let index = 0; index < args.length - 2; index += 1) {
+      if (args[index] === "--setenv") routedEnv[args[index + 1] ?? ""] = args[index + 2] ?? "";
+    }
+    assert.equal(routedEnv.ANTHROPIC_MODEL, "deepseek-flash[1m]");
+    assert.equal(routedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL, "deepseek-flash[1m]");
+    assert.deepEqual(JSON.parse(routedEnv.CLAUDE_MODEL_CONFIG ?? "{}"), {
+      modelOverrides: { "claude-opus-4-6": "gateway-opus" },
+      availableModels: ["sonnet", "opus"],
+    });
+    assert.equal(routedEnv.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1");
+    assert.equal(serialized.includes("HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX"), false);
     for (const key of ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"]) {
       const index = args.findIndex((value, offset) => value === key && args[offset - 1] === "--setenv");
       assert.equal(args[index + 1], "1");
@@ -387,7 +408,6 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
       claudeCode: {
         options: {
           settingSources: [],
-          settings: { availableModels: ["sonnet"] },
           allowDangerouslySkipPermissions: false,
           disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
           sandbox: {
@@ -415,6 +435,9 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
     if (original.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = original.token;
     if (original.apiKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = original.apiKey;
     if (original.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = original.baseUrl;
+    if (original.model === undefined) delete process.env.ANTHROPIC_MODEL; else process.env.ANTHROPIC_MODEL = original.model;
+    if (original.sonnet === undefined) delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL; else process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = original.sonnet;
+    if (original.modelConfig === undefined) delete process.env.CLAUDE_MODEL_CONFIG; else process.env.CLAUDE_MODEL_CONFIG = original.modelConfig;
     if (original.httpsProxy === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = original.httpsProxy;
     await rm(fixture, { recursive: true, force: true });
   }

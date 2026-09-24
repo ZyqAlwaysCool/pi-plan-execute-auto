@@ -25,9 +25,36 @@ const RESPONSE_HEADER_ALLOWLIST = new Set([
   "content-type", "cache-control", "retry-after", "request-id", "x-request-id",
 ]);
 
+const CLAUDE_MODEL_ROUTING_ENV_KEYS = [
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_CUSTOM_MODEL_OPTION",
+  "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+  "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+  "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
+] as const;
+const MAX_MODEL_ROUTING_ENV_BYTES = 16 * 1024;
+
 export interface ClaudeCredentialRelayOptions {
   modelRoute: string;
   env?: NodeJS.ProcessEnv;
+  modelRoutingEnv?: Readonly<Record<string, string>>;
   maxRequestBytes?: number;
   maxConcurrent?: number;
   upstreamTimeoutMs?: number;
@@ -115,12 +142,127 @@ function selectedClaudeModel(modelRoute: string): string {
   return model;
 }
 
-function modelAllowed(selected: string, requested: string): boolean {
+function safeModelRoutingValue(key: string, raw: string): string {
+  const value = raw.trim();
+  if (!value || Buffer.byteLength(value, "utf8") > MAX_MODEL_ROUTING_ENV_BYTES || /[\u0000\r\n]/u.test(value)) {
+    throw new Error(`Unsafe or oversized Claude model-routing environment value: ${key}.`);
+  }
+  return value;
+}
+
+function sanitizeClaudeModelConfig(raw: string): string {
+  const value = safeModelRoutingValue("CLAUDE_MODEL_CONFIG", raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("CLAUDE_MODEL_CONFIG must be valid JSON.");
+  }
+  if (!plainObject(parsed)) throw new Error("CLAUDE_MODEL_CONFIG must be a JSON object.");
+  const sanitized: { modelOverrides?: Record<string, string>; availableModels?: string[] } = {};
+  if ("modelOverrides" in parsed) {
+    if (!plainObject(parsed.modelOverrides)) throw new Error("CLAUDE_MODEL_CONFIG.modelOverrides must be an object.");
+    const overrides: Record<string, string> = {};
+    for (const [from, to] of Object.entries(parsed.modelOverrides)) {
+      if (typeof to !== "string") throw new Error("CLAUDE_MODEL_CONFIG.modelOverrides values must be strings.");
+      overrides[safeModelRoutingValue("CLAUDE_MODEL_CONFIG.modelOverrides key", from)] =
+        safeModelRoutingValue("CLAUDE_MODEL_CONFIG.modelOverrides value", to);
+    }
+    sanitized.modelOverrides = overrides;
+  }
+  if ("availableModels" in parsed) {
+    if (!Array.isArray(parsed.availableModels) || parsed.availableModels.some((item) => typeof item !== "string")) {
+      throw new Error("CLAUDE_MODEL_CONFIG.availableModels must be an array of strings.");
+    }
+    sanitized.availableModels = parsed.availableModels.map((item) =>
+      safeModelRoutingValue("CLAUDE_MODEL_CONFIG.availableModels", item as string));
+  }
+  return JSON.stringify(sanitized);
+}
+
+/**
+ * Copy only Claude Code's non-secret model-selection configuration from the trusted
+ * host environment. Credentials, base URLs, custom request headers, proxies and
+ * arbitrary environment variables are deliberately excluded.
+ */
+export function resolveClaudeModelRoutingEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const key of CLAUDE_MODEL_ROUTING_ENV_KEYS) {
+    const raw = env[key];
+    if (raw) result[key] = safeModelRoutingValue(key, raw);
+  }
+  if (env.CLAUDE_MODEL_CONFIG) {
+    result.CLAUDE_MODEL_CONFIG = sanitizeClaudeModelConfig(env.CLAUDE_MODEL_CONFIG);
+  }
+  return result;
+}
+
+function aliasBase(selected: string): string {
+  return selected.replace(/\[[^\]]+\]$/u, "");
+}
+
+function mappedAliasTargets(
+  selected: string,
+  routingEnv: Readonly<Record<string, string>>,
+): Set<string> {
+  const targets = new Set<string>();
+  const base = aliasBase(selected);
+  const suffix = selected.slice(base.length);
+  const aliasKeys: Record<string, string> = {
+    fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    opus: "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  };
+  const aliases = base === "opusplan" ? ["opus", "sonnet"] : base === "best" ? ["fable", "opus"] : [base];
+  for (const alias of aliases) {
+    const key = aliasKeys[alias];
+    const mapped = key ? routingEnv[key] : undefined;
+    if (!mapped) continue;
+    targets.add(mapped);
+    if (suffix && !mapped.endsWith(suffix)) targets.add(`${mapped}${suffix}`);
+  }
+
+  const rawConfig = routingEnv.CLAUDE_MODEL_CONFIG;
+  if (rawConfig) {
+    const parsed = JSON.parse(rawConfig) as { modelOverrides?: Record<string, string> };
+    for (const [from, to] of Object.entries(parsed.modelOverrides ?? {})) {
+      if (
+        from === selected ||
+        aliases.some((alias) => from.toLowerCase().includes(alias))
+      ) {
+        targets.add(to);
+      }
+    }
+  }
+  return targets;
+}
+
+function modelAllowed(
+  selected: string,
+  requested: string,
+  routingEnv: Readonly<Record<string, string>>,
+): boolean {
+  if (!requested || /[\u0000-\u001f\u007f]/u.test(requested)) return false;
   if (requested === selected) return true;
-  const base = selected.replace(/\[[^\]]+\]$/u, "");
+
+  const base = aliasBase(selected);
+  if (base === "default") {
+    // "default" deliberately delegates concrete identity to the trusted Claude
+    // CLI/provider configuration. The relay capability is unavailable to command
+    // tools, so the parent Claude process remains the authority for this choice.
+    return true;
+  }
+
+  if (mappedAliasTargets(selected, routingEnv).has(requested)) return true;
   if (base === "sonnet") return requested.startsWith("claude-sonnet-");
   if (base === "opus") return requested.startsWith("claude-opus-");
   if (base === "haiku") return requested.startsWith("claude-haiku-");
+  if (base === "fable") return requested.startsWith("claude-fable-");
+  if (base === "opusplan") return requested.startsWith("claude-opus-") || requested.startsWith("claude-sonnet-");
+  if (base === "best") return requested.startsWith("claude-fable-") || requested.startsWith("claude-opus-");
   return false;
 }
 
@@ -247,6 +389,7 @@ export async function startClaudeCredentialRelay(
   const credential = resolveCredential(env);
   const upstream = resolveUpstream(env);
   const selectedModel = selectedClaudeModel(options.modelRoute);
+  const modelRoutingEnv = options.modelRoutingEnv ?? resolveClaudeModelRoutingEnvironment(env);
   const custom = parseCustomHeaders(env);
   const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
   const maxConcurrent = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
@@ -309,7 +452,7 @@ export async function startClaudeCredentialRelay(
         return responseError(res, 400, "request body must be JSON");
       }
       const requestedModel = plainObject(parsed) && typeof parsed.model === "string" ? parsed.model : undefined;
-      if (!requestedModel || !modelAllowed(selectedModel, requestedModel)) {
+      if (!requestedModel || !modelAllowed(selectedModel, requestedModel, modelRoutingEnv)) {
         return responseError(res, 403, "requested model does not match the approved Claude route");
       }
 

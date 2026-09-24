@@ -1,5 +1,7 @@
 # 第九轮独立审查：`claude-safe-acp` 真实接入验收
 
+> **后续语义更正：** 本轮原始审查把 `claude/sonnet` 误解释为“底层必须是 Anthropic Sonnet family”。该判断已被后续复核推翻。这里的 `claude` 是 CLI/harness，`sonnet` 是 Claude Code 的逻辑模型选择器；可信宿主通过 `ANTHROPIC_DEFAULT_SONNET_MODEL` 等把该 alias 映射到第三方 gateway model（例如 `deepseek-flash[1m]`）属于 Claude Code 官方支持的配置语义。以下原始记录保留用于审计时间线，以文末“复核后的代码修复”为当前结论。
+
 基线：当前分支 `claude-safe-acp`，审查时 HEAD `0a843e0`，相对 `main` 为 `e6e107b`、`6ba84a7`、`162ca99`、`0a843e0` 四个提交。审查开始时工作区干净。此次修复在工作区、**尚未提交**：`src/claude-relay.ts`、`tests/claude-relay.test.ts`；既有第一至第八轮证据未改写。所有实时测试都在自动清理的合成 Git 仓库及可信 `/usr/bin/bwrap` 上进行，不输出认证变量、凭据或上游地址。
 
 ## 实现检查
@@ -27,8 +29,8 @@
 
 1. **确认的 Claude relay 安全漏洞**：任意上游响应头可以换名回显宿主 secret；非 loopback 明文 HTTP upstream 会接收真实宿主认证。这两项均为真实缺陷。响应头白名单/secret 内容过滤以及非 loopback HTTP 拒绝已经提交，且 required CI 通过。
 2. **确认的 OpenCode WSL 兼容回归**：把当前用户自有的 0775 父目录一律视为不可信，会误拒绝常见 umask 0002 安装。现在仍要求实际 executable 本身不可 group/world-write，并继续拒绝 project/worktree/Golden/temp、world-writable、foreign-owned 路径；仅允许由当前可信 OS 用户拥有的 group-writable 父目录。新增 0775 用户安装回归测试。
-3. **Claude `model_not_found` 不是可安全静默替换的问题**：宿主把 Sonnet alias 映射到另一个实际 model，但 Stage B 的冻结模型路由不能被宿主环境偷偷重写。现有 setup 已允许 **Enter another Claude model ID…**；Claude session 现在用 `settings.availableModels` 只暴露用户明确批准的 exact model，供自定义 gateway 显式选择/验证。仍不得把 `claude/sonnet` 自动改写成 `deepseek-flash[1m]`。
+3. **确认的 Claude CLI 模型映射兼容回归**：此前修复把 `claude/sonnet` 当成了“底层必须是 Sonnet”，并用 `settings.availableModels=["sonnet"]` 锁住 picker；这会按 Claude Code 自身规则阻止 `ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-flash[1m]` 这样的合法 alias mapping。现在撤销该错误限制，并只从可信宿主复制经过校验的非秘密模型路由变量（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL`、custom-model metadata，以及仅保留 `modelOverrides` / `availableModels` 的 `CLAUDE_MODEL_CONFIG`）。真实 credential、base URL、custom request headers、proxy 和其它环境变量仍不进入 sandbox。relay 的 model gate 同时接受逻辑 selector 的标准解析和宿主明确配置的 alias target，仍拒绝无关 model。
 
 复核还发现 relay capability 仅靠 URL path 不足：完整 Claude agent 需要 Bash，而命令工具若能直连 loopback relay，就可能绕过正常 ACP turn 发原始 provider 请求。因此 relay 现在额外要求每 run 随机 bearer capability；Claude session 同时强制 command sandbox `enabled + failIfUnavailable + allowUnsandboxedCommands=false`，严格空网络 allowlist，并从命令环境拒绝 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`。Claude 主进程仍是完整独立 ACP/CLI 会话并能访问 relay，限制只作用于其 shell/command 子进程。
 
-Linux/WSL 的 Claude command-network sandbox 依赖可信系统 `bubblewrap` 与 `socat`；缺少 `/usr/bin/socat` 时 Claude provider session 现在启动前 fail closed。真实 Claude 3/3 仍需在 **HTTPS 或 loopback upstream**、用户明确批准的 exact model、安装了 `bubblewrap + socat` 的环境重新执行后才能更新为通过。
+Linux/WSL 的 Claude command-network sandbox 依赖可信系统 `bubblewrap` 与 `socat`；缺少 `/usr/bin/socat` 时 Claude provider session 现在启动前 fail closed。真实 Claude 3/3 仍需在 **HTTPS 或 loopback upstream**、用户明确批准的 Claude CLI model selector（以及当时可信宿主的 model mapping）、安装了 `bubblewrap + socat` 的环境重新执行后才能更新为通过。

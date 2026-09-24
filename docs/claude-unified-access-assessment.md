@@ -25,13 +25,13 @@ Claude 不再要求把真实 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 或宿
 1. relay 在宿主读取 `ANTHROPIC_AUTH_TOKEN`（优先）或 `ANTHROPIC_API_KEY`，以及可选的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS`；
 2. sandbox 只得到不可用于上游认证的 dummy token 和随机高熵 capability URL；
 3. relay 只接受 loopback、该 capability、POST，以及 `/v1/messages` / `/v1/messages/count_tokens`；
-4. 请求 body 必须声明与用户批准的 `claude/<model>` route 匹配的 model；精确 model id 精确匹配，Claude 的 `sonnet` / `opus` / `haiku` CLI alias 只允许对应 family；
+4. `claude/<model>` 中的 model 是 **Claude CLI 的模型选择器**，不是对底层 provider 品牌的断言。relay 会校验请求 model 是否来自该选择器的合法解析：精确 custom model 仍精确匹配；`sonnet` / `opus` / `haiku` 等 alias 既允许 Claude Code 标准 family 解析，也允许可信宿主通过 `ANTHROPIC_DEFAULT_*_MODEL` / sanitized `CLAUDE_MODEL_CONFIG` 配置的 gateway target（例如 `sonnet -> deepseek-flash[1m]`）。未被当前选择器或宿主映射解释的其它 model 仍拒绝；
 5. sandbox 传入的 `Authorization` / `x-api-key` / Host 等敏感或 hop-by-hop headers 被丢弃，真实认证只由宿主 relay 注入；
 6. upstream redirect 不会自动跟随；带 credential/query/fragment 的 upstream URL 或非 loopback 的明文 HTTP upstream 被拒绝；
 7. 响应头采用协议必需字段白名单，含凭据原文的头会被移除；流式 body 使用跨 chunk secret scrubber 防止上游意外回显宿主 secret。此为针对真实凭据原文字节的防护，不对恶意上游转换编码后的回显做绝对保密保证；
 8. request size、并发数、header/request/upstream timeout 都有硬上限；relay 生命周期绑定到 `SandboxedBackend.cleanup()`。
 
-Claude sandbox 使用 `--clearenv`，不继承宿主 provider secret，也不继承宿主 HTTP(S) proxy；provider 请求只指向本地 relay。额外关闭 telemetry、error reporting、auto updater 和 Claude 非必要流量。
+Claude sandbox 使用 `--clearenv`，不继承宿主 provider secret，也不继承宿主 HTTP(S) proxy；provider 请求只指向本地 relay。为了保留 Claude CLI 作为通用 harness 的既有行为，只复制经过语法/大小校验的非秘密模型路由配置（如 `ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL`、custom-model metadata、仅含 `modelOverrides` / `availableModels` 的 `CLAUDE_MODEL_CONFIG`）。`ANTHROPIC_BASE_URL`、真实 auth、custom request headers、proxy 和任意其它环境变量仍不会进入 sandbox。额外关闭 telemetry、error reporting、auto updater 和 Claude 非必要流量，并启用 subprocess env scrub。
 
 ## Claude session 强制策略
 
@@ -80,7 +80,7 @@ npm run test:acp:claude:required
 
 它包含三项 billable gate：真实 sandboxed Executor、真实 sandboxed Reviewer、完整单阶段 Stage B（包括 acceptance 与插件-owned phase commit）。完整 workflow 还断言 Executor/Reviewer session id 不同。
 
-仓库增加了手工 `workflow_dispatch` 的 Claude ACP integration workflow；它只从 GitHub protected secrets 读取宿主 Claude credential，不会把 secret 写入 repo 或 sandbox。本轮本机使用真实认证环境运行三项 Claude 测试结果 **0/3**：`claude/sonnet` 收到 `model_not_found`；当前自定义上游为非 loopback HTTP，新增安全修复会在启动前拒绝。代码修复仍未提交，详细证据在 [`review-round-09.md`](../review-round-09.md)，不能称作四端验收通过。
+仓库增加了手工 `workflow_dispatch` 的 Claude ACP integration workflow；它只从 GitHub protected secrets 读取宿主 Claude credential，不会把 secret 写入 repo 或 sandbox。此前 WSL 三项 Claude 测试 **0/3** 的 `model_not_found` 已确认有一部分来自插件错误清除了宿主 Claude CLI 的 model mapping，并错误把 `claude/sonnet` 当成“必须调用 Anthropic Sonnet”。该语义已修正；不过同一环境的自定义 upstream 是非 loopback 明文 HTTP，安全策略仍会在发送真实 credential 前拒绝。因此还必须在 HTTPS 或 loopback gateway 上重跑 3/3，不能把本次代码修复等同于 live provider 验收通过。历史与纠正在 [`review-round-09.md`](../review-round-09.md)。
 
 ## 尚未消除的边界
 

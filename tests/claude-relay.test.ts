@@ -1,7 +1,10 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startClaudeCredentialRelay } from "../src/claude-relay.js";
+import {
+  resolveClaudeModelRoutingEnvironment,
+  startClaudeCredentialRelay,
+} from "../src/claude-relay.js";
 
 async function listen(server: ReturnType<typeof createServer>): Promise<string> {
   await new Promise<void>((resolve, reject) => {
@@ -49,6 +52,8 @@ test("Claude credential relay injects host auth, pins model/path, and never refl
       ANTHROPIC_AUTH_TOKEN: "TOP_SECRET_RELAY_TOKEN",
       ANTHROPIC_BASE_URL: upstreamUrl,
       ANTHROPIC_CUSTOM_HEADERS: "X-Tenant-Route: tenant-secret-value",
+      ANTHROPIC_MODEL: "deepseek-flash[1m]",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-flash[1m]",
     },
   });
   try {
@@ -62,7 +67,7 @@ test("Claude credential relay injects host auth, pins model/path, and never refl
         authorization: `Bearer ${relay.dummyAuthToken}`,
         "x-tenant-route": "sandbox-attacker-route",
       },
-      body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "OK" }] }),
+      body: JSON.stringify({ model: "deepseek-flash[1m]", max_tokens: 8, messages: [{ role: "user", content: "OK" }] }),
     });
     assert.equal(response.status, 200);
     const text = await response.text();
@@ -77,13 +82,60 @@ test("Claude credential relay injects host auth, pins model/path, and never refl
     assert.equal(seen[0]?.url, "/v1/messages");
     assert.equal(seen[0]?.authorization, "Bearer TOP_SECRET_RELAY_TOKEN");
     assert.equal(seen[0]?.route, "tenant-secret-value");
-    assert.match(seen[0]?.body ?? "", /"model":"claude-sonnet-5"/);
+    assert.match(seen[0]?.body ?? "", /"model":"deepseek-flash\[1m\]"/);
     assert.doesNotMatch(seen[0]?.authorization ?? "", /sandbox-attacker/);
+
+    const unrelated = await fetch(`${relay.baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.dummyAuthToken}`,
+      },
+      body: JSON.stringify({ model: "unapproved-gateway-model", messages: [] }),
+    });
+    assert.equal(unrelated.status, 403);
+    assert.equal(seen.length, 1);
   } finally {
     await relay.close();
     await relay.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
+});
+
+test("Claude model-routing environment preserves trusted CLI mappings without forwarding secrets", () => {
+  const routed = resolveClaudeModelRoutingEnvironment({
+    ANTHROPIC_MODEL: "deepseek-flash[1m]",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-flash[1m]",
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "DeepSeek Flash",
+    CLAUDE_MODEL_CONFIG: JSON.stringify({
+      modelOverrides: { "claude-opus-4-6": "gateway-opus" },
+      availableModels: ["sonnet", "opus"],
+      ignored: "must-not-survive",
+    }),
+    ANTHROPIC_AUTH_TOKEN: "HOST_SECRET",
+    ANTHROPIC_API_KEY: "HOST_KEY",
+    ANTHROPIC_BASE_URL: "https://gateway.example.invalid",
+    ANTHROPIC_CUSTOM_HEADERS: "X-Secret: value",
+    HTTPS_PROXY: "http://proxy.example.invalid",
+    UNRELATED_SECRET: "NOPE",
+  });
+  assert.equal(routed.ANTHROPIC_MODEL, "deepseek-flash[1m]");
+  assert.equal(routed.ANTHROPIC_DEFAULT_SONNET_MODEL, "deepseek-flash[1m]");
+  assert.equal(routed.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, "DeepSeek Flash");
+  assert.deepEqual(JSON.parse(routed.CLAUDE_MODEL_CONFIG ?? "{}"), {
+    modelOverrides: { "claude-opus-4-6": "gateway-opus" },
+    availableModels: ["sonnet", "opus"],
+  });
+  for (const forbidden of [
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS", "HTTPS_PROXY", "UNRELATED_SECRET",
+  ]) {
+    assert.equal(forbidden in routed, false);
+  }
+  assert.throws(
+    () => resolveClaudeModelRoutingEnvironment({ CLAUDE_MODEL_CONFIG: '{"modelOverrides":{"a":1}}' }),
+    /modelOverrides values must be strings/,
+  );
 });
 
 test("Claude credential relay rejects unapproved endpoints and models before upstream", async () => {

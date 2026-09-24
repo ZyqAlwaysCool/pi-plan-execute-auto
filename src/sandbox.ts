@@ -30,7 +30,11 @@ import { pipeline } from "node:stream/promises";
 import type { CustomBackendConfig } from "@automatalabs/workflows";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import type { GitCommandResult } from "./types.js";
-import { startClaudeCredentialRelay, type ClaudeCredentialRelay } from "./claude-relay.js";
+import {
+  resolveClaudeModelRoutingEnvironment,
+  startClaudeCredentialRelay,
+  type ClaudeCredentialRelay,
+} from "./claude-relay.js";
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
@@ -440,6 +444,7 @@ function addMinimalFilesystem(
   scratchPath: string,
   runtime: BackendRuntime,
   claudeRelay?: ClaudeCredentialRelay,
+  claudeModelRoutingEnv: Readonly<Record<string, string>> = {},
 ): void {
   const created = new Set<string>();
   const cwd = resolve(options.cwd);
@@ -560,6 +565,8 @@ function addMinimalFilesystem(
     ...(claudeRelay ? [
       "--setenv", "ANTHROPIC_BASE_URL", claudeRelay.baseUrl,
       "--setenv", "ANTHROPIC_AUTH_TOKEN", claudeRelay.dummyAuthToken,
+      ...Object.entries(claudeModelRoutingEnv).flatMap(([key, value]) => ["--setenv", key, value]),
+      "--setenv", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1",
       "--setenv", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1",
       "--setenv", "DISABLE_TELEMETRY", "1",
       "--setenv", "DISABLE_ERROR_REPORTING", "1",
@@ -884,6 +891,9 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
   const trustedOpenCodeBinary = backendId === "opencode" && runtime.extraBinary
     ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
     : undefined;
+  const claudeModelRoutingEnv = backendId === "claude"
+    ? resolveClaudeModelRoutingEnvironment(process.env)
+    : {};
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
   const credentials: string[] = [];
   let claudeRelay: ClaudeCredentialRelay | undefined;
@@ -895,7 +905,10 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
     }
     if (options.includeProviderCredentials) {
       if (backendId === "claude") {
-        claudeRelay = await startClaudeCredentialRelay({ modelRoute: options.model });
+        claudeRelay = await startClaudeCredentialRelay({
+          modelRoute: options.model,
+          modelRoutingEnv: claudeModelRoutingEnv,
+        });
       } else if (backendId === "pi") {
         credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
       } else if (backendId === "opencode") {
@@ -913,8 +926,14 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
       }
     }
     const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
-    addMinimalFilesystem(commandArgs, { ...options, cwd, sourceRoot, goldenRoot }, scratchPath, runtime, claudeRelay);
-    const claudeModelSpec = backendId === "claude" ? options.model.slice("claude/".length) : undefined;
+    addMinimalFilesystem(
+      commandArgs,
+      { ...options, cwd, sourceRoot, goldenRoot },
+      scratchPath,
+      runtime,
+      claudeRelay,
+      claudeModelRoutingEnv,
+    );
     const config: CustomBackendConfig = {
       command: bwrap,
       args: [...commandArgs, "--", runtime.command, ...runtime.args],
@@ -923,9 +942,6 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
           claudeCode: {
             options: {
               settingSources: [],
-              ...(claudeModelSpec && claudeModelSpec !== "catalog"
-                ? { settings: { availableModels: [claudeModelSpec] } }
-                : {}),
               allowDangerouslySkipPermissions: false,
               disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
               // Keep the full Claude agent session, but make command-tool
