@@ -29,6 +29,7 @@ import { pipeline } from "node:stream/promises";
 import type { CustomBackendConfig } from "@automatalabs/workflows";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import type { GitCommandResult } from "./types.js";
+import { startClaudeCredentialRelay, type ClaudeCredentialRelay } from "./claude-relay.js";
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
@@ -379,7 +380,7 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
         target: `${RUNTIME_ROOT}/pi-acp-bootstrap.mjs`,
       } } : {}),
       credentialSources: backend === "claude"
-        ? [{ source: join(homedir(), ".claude", ".credentials.json"), relativeTarget: "home/.claude/.credentials.json" }]
+        ? []
         : [{ source: join(resolve(process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent")), "auth.json"), relativeTarget: "home/.pi/agent/auth.json" }],
     };
   }
@@ -417,14 +418,22 @@ function tryRealpath(path: string): string | undefined {
   }
 }
 
-function addMinimalFilesystem(args: string[], options: SandboxOptions, scratchPath: string, runtime: BackendRuntime): void {
+function addMinimalFilesystem(
+  args: string[],
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  claudeRelay?: ClaudeCredentialRelay,
+): void {
   const created = new Set<string>();
   const cwd = resolve(options.cwd);
   const goldenRoot = resolve(options.goldenRoot);
   const nodeBinary = realpathSync(process.execPath);
   const nodeBinDir = dirname(nodeBinary);
   const pluginNodeModules = runtime.nodeModulesRoot;
-  const proxies = safeProxyEnvironment();
+  // Claude talks only to the trusted host relay. Never route the capability URL through
+  // an inherited HTTP(S) proxy; Pi may still need the already-vetted credential-free proxy.
+  const proxies = claudeRelay ? [] : safeProxyEnvironment();
   const hasNodeHttpProxy = proxies.some(([key, value]) =>
     ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].includes(key) && /^https?:\/\//i.test(value),
   );
@@ -532,6 +541,10 @@ function addMinimalFilesystem(args: string[], options: SandboxOptions, scratchPa
     "--setenv", "TEMP", "/tmp",
     "--setenv", "CODEX_HOME", `${runtimeHome}/codex-home`,
     "--setenv", "CLAUDE_CONFIG_DIR", `${runtimeHome}/home/.claude`,
+    ...(claudeRelay ? [
+      "--setenv", "ANTHROPIC_BASE_URL", claudeRelay.baseUrl,
+      "--setenv", "ANTHROPIC_AUTH_TOKEN", claudeRelay.dummyAuthToken,
+    ] : []),
     "--setenv", "PI_CODING_AGENT_DIR", `${runtimeHome}/home/.pi/agent`,
     "--setenv", "PI_OFFLINE", "1",
     "--setenv", "XDG_DATA_HOME", `${runtimeHome}/data`,
@@ -612,8 +625,7 @@ async function existingFile(path: string): Promise<string | undefined> {
   }
 }
 
-/** Stage just the selected OpenCode provider, never the whole host user config. */
-export async function stageSelectedOpenCodeProviderConfig(model: string, scratchPath: string, configRoot: string): Promise<string | undefined> {
+function selectedOpenCodeRoute(model: string): { providerId: string; modelId: string } | undefined {
   const modelSpec = model.slice(model.indexOf("/") + 1);
   const separator = modelSpec.indexOf("/");
   if (separator < 1 || separator === modelSpec.length - 1) return undefined;
@@ -622,6 +634,39 @@ export async function stageSelectedOpenCodeProviderConfig(model: string, scratch
   if (!/^[\w.-]+$/u.test(providerId) || !/^[\w.-]+$/u.test(modelId)) {
     throw new Error("OpenCode model/provider ID contains an unsupported character for isolated config staging.");
   }
+  return { providerId, modelId };
+}
+
+/** Stage only the selected OpenCode credential entry, never the multi-provider host auth file. */
+export async function stageSelectedOpenCodeCredential(
+  model: string,
+  scratchPath: string,
+  dataRoot: string,
+): Promise<string | undefined> {
+  const selected = selectedOpenCodeRoute(model);
+  if (!selected) return undefined;
+  const source = await existingFile(join(dataRoot, "opencode", "auth.json"));
+  if (!source) return undefined;
+  const sourceStat = await lstat(source);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.size > 1024 * 1024) {
+    throw new Error("Refusing non-regular or oversized OpenCode auth store.");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(source, "utf8")); } catch {
+    throw new Error("OpenCode auth store is not valid JSON.");
+  }
+  if (!plainRecord(parsed) || !(selected.providerId in parsed)) return undefined;
+  const target = join(scratchPath, "run", "data", "opencode", "auth.json");
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  await writeFile(target, `${JSON.stringify({ [selected.providerId]: parsed[selected.providerId] })}\n`, { flag: "wx", mode: 0o600 });
+  return target;
+}
+
+/** Stage just the selected OpenCode provider definition, never the whole host user config. */
+export async function stageSelectedOpenCodeProviderConfig(model: string, scratchPath: string, configRoot: string): Promise<string | undefined> {
+  const selected = selectedOpenCodeRoute(model);
+  if (!selected) return undefined;
+  const { providerId, modelId } = selected;
   const directory = join(configRoot, "opencode");
   const source = (await existingFile(join(directory, "opencode.jsonc")))
     ?? (await existingFile(join(directory, "opencode.json")));
@@ -643,8 +688,9 @@ export async function stageSelectedOpenCodeProviderConfig(model: string, scratch
     throw new Error(`OpenCode config has no definition for model ${providerId}/${modelId}.`);
   }
   if (typeof provider.npm !== "string" || !plainRecord(provider.options) ||
-    typeof provider.options.baseURL !== "string" || typeof provider.options.apiKey !== "string") {
-    throw new Error("Selected OpenCode provider requires explicit npm, baseURL, and saved apiKey fields.");
+    typeof provider.options.baseURL !== "string" ||
+    ("apiKey" in provider.options && typeof provider.options.apiKey !== "string")) {
+    throw new Error("Selected OpenCode provider requires explicit npm/baseURL fields and an optional string apiKey.");
   }
   let baseURL: URL;
   try {
@@ -658,7 +704,10 @@ export async function stageSelectedOpenCodeProviderConfig(model: string, scratch
   const selectedProvider = {
     npm: provider.npm,
     ...(typeof provider.name === "string" ? { name: provider.name } : {}),
-    options: { baseURL: provider.options.baseURL, apiKey: provider.options.apiKey },
+    options: {
+      baseURL: provider.options.baseURL,
+      ...(typeof provider.options.apiKey === "string" ? { apiKey: provider.options.apiKey } : {}),
+    },
     models: { [modelId]: provider.models[modelId] },
   };
   const target = join(scratchPath, "run", "config", "opencode", "opencode.json");
@@ -718,6 +767,37 @@ async function prepareCredentials(
   return staged;
 }
 
+function assertTrustedExternalAgentBinary(
+  source: string,
+  roots: readonly string[],
+): void {
+  const real = realpathSync(source);
+  const stat = statSync(real);
+  if (!stat.isFile() || accessSync(real, fsConstants.X_OK) !== undefined || (stat.mode & 0o022) !== 0) {
+    throw new Error(`Refusing mutable or non-executable external agent binary: ${source}`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && stat.uid !== 0 && stat.uid !== uid) {
+    throw new Error(`Refusing external agent binary owned by another user: ${source}`);
+  }
+  for (const root of roots) {
+    if (isWithin(root, real)) {
+      throw new Error(`External agent binary may not come from the project/worktree/Golden roots: ${real}`);
+    }
+  }
+  if (isWithin("/tmp", real) || isWithin("/var/tmp", real)) {
+    throw new Error(`External agent binary may not come from a temporary directory: ${real}`);
+  }
+  let cursor = dirname(real);
+  while (cursor !== dirname(cursor)) {
+    const parent = statSync(cursor);
+    if ((parent.mode & 0o022) !== 0) {
+      throw new Error(`External agent binary has a group/world-writable parent directory: ${cursor}`);
+    }
+    cursor = dirname(cursor);
+  }
+}
+
 async function assertDedicatedWorktreePointer(cwd: string): Promise<void> {
   const path = join(cwd, ".git");
   const pointer = await lstat(path);
@@ -738,26 +818,52 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
   const bwrap = findBubblewrap();
   await assertDedicatedWorktreePointer(cwd);
   const runtime = backendRuntime(backendId);
+  if (backendId === "opencode" && runtime.extraBinary) {
+    assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot]);
+  }
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
   const credentials: string[] = [];
+  let claudeRelay: ClaudeCredentialRelay | undefined;
   try {
     await prepareScratchLayout(scratchPath, cwd, options.signal);
     if (options.includeProviderCredentials) {
-      if (backendId === "pi") credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
-      else credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
-      if (backendId === "opencode") {
+      if (backendId === "claude") {
+        claudeRelay = await startClaudeCredentialRelay({ modelRoute: options.model });
+      } else if (backendId === "pi") {
+        credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
+      } else if (backendId === "opencode") {
+        const dataRoot = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
         const configRoot = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
+        const selectedAuth = await stageSelectedOpenCodeCredential(options.model, scratchPath, dataRoot);
+        if (selectedAuth) credentials.push(selectedAuth);
         const selectedConfig = await stageSelectedOpenCodeProviderConfig(options.model, scratchPath, configRoot);
         if (selectedConfig) credentials.push(selectedConfig);
+        if (!selectedAuth && !selectedConfig) {
+          throw new Error("No isolated saved credential/config was found for the selected OpenCode provider.");
+        }
+      } else {
+        credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
       }
     }
     const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
-    addMinimalFilesystem(commandArgs, { ...options, cwd, sourceRoot, goldenRoot }, scratchPath, runtime);
+    addMinimalFilesystem(commandArgs, { ...options, cwd, sourceRoot, goldenRoot }, scratchPath, runtime, claudeRelay);
     const config: CustomBackendConfig = {
       command: bwrap,
       args: [...commandArgs, "--", runtime.command, ...runtime.args],
+      ...(backendId === "claude" ? {
+        sessionMeta: {
+          claudeCode: {
+            options: {
+              settingSources: [],
+              allowDangerouslySkipPermissions: false,
+              disallowedTools: ["Agent", "Task"],
+            },
+          },
+        },
+      } : {}),
       fork: { disposition: backendId === "claude" ? "id-only" : "live", cwd: "source-only" },
     };
+    let cleaned = false;
     return {
       backendId,
       config,
@@ -767,11 +873,21 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
         credentials.length = 0;
       },
       async cleanup() {
-        await rm(scratchPath, { recursive: true, force: true });
+        if (cleaned) return;
+        cleaned = true;
+        try {
+          await claudeRelay?.close();
+        } finally {
+          await rm(scratchPath, { recursive: true, force: true });
+        }
       },
     };
   } catch (error) {
-    await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      await claudeRelay?.close();
+    } finally {
+      await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
+    }
     throw error;
   }
 }

@@ -258,11 +258,14 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
     await writeFile(join(hostConfig, "opencode", "opencode.jsonc"), JSON.stringify({
       provider: { "deepseek-local": {
         npm: "@ai-sdk/openai-compatible",
-        options: { baseURL: "http://127.0.0.1:8080/v1", apiKey: "temporary-provider-key" },
+        options: { baseURL: "http://127.0.0.1:8080/v1" },
         models: { "deepseek-flash": { variants: { high: {} } } },
       } },
     }));
-    await writeFile(join(hostData, "opencode", "auth.json"), "{}\n");
+    await writeFile(join(hostData, "opencode", "auth.json"), JSON.stringify({
+      "deepseek-local": { type: "api", key: "selected-opencode-secret" },
+      "unrelated-provider": { type: "api", key: "OTHER-SECRET" },
+    }));
     const savedEnv = {
       PATH: process.env.PATH,
       XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
@@ -279,8 +282,11 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
       });
       const providerConfig = join(configured.scratchPath, "run", "config", "opencode", "opencode.json");
       const stagedAuth = join(configured.scratchPath, "run", "data", "opencode", "auth.json");
-      assert.match(await readFile(providerConfig, "utf8"), /temporary-provider-key/);
-      await access(stagedAuth);
+      const stagedProvider = await readFile(providerConfig, "utf8");
+      const stagedCredential = await readFile(stagedAuth, "utf8");
+      assert.doesNotMatch(stagedProvider, /selected-opencode-secret|OTHER-SECRET/);
+      assert.match(stagedCredential, /selected-opencode-secret/);
+      assert.doesNotMatch(stagedCredential, /OTHER-SECRET|unrelated-provider/);
       await configured.scrubCredentials();
       await assert.rejects(access(providerConfig));
       await assert.rejects(access(stagedAuth));
@@ -333,6 +339,89 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
     }
   } finally {
     await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Claude sandbox uses only the host relay capability and locks unsafe Claude session features", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-claude-relay-fixture-"));
+  const worktree = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+  const original = {
+    token: process.env.ANTHROPIC_AUTH_TOKEN,
+    apiKey: process.env.ANTHROPIC_API_KEY,
+    baseUrl: process.env.ANTHROPIC_BASE_URL,
+    httpsProxy: process.env.HTTPS_PROXY,
+  };
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    process.env.ANTHROPIC_AUTH_TOKEN = "HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX";
+    delete process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:9";
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+    sandbox = await createSandboxedBackend({
+      role: "executor",
+      model: "claude/sonnet",
+      cwd: worktree,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+      includeProviderCredentials: true,
+    });
+    const args = sandbox.config.args ?? [];
+    const serialized = JSON.stringify(args);
+    assert.doesNotMatch(serialized, /HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX/);
+    assert.doesNotMatch(serialized, /127\.0\.0\.1:7890/);
+    const baseIndex = args.findIndex((value, index) => value === "ANTHROPIC_BASE_URL" && args[index - 1] === "--setenv");
+    assert.ok(baseIndex >= 0);
+    assert.match(args[baseIndex + 1] ?? "", /^http:\/\/127\.0\.0\.1:\d+\/[A-Za-z0-9_-]{40,}$/u);
+    const authIndex = args.findIndex((value, index) => value === "ANTHROPIC_AUTH_TOKEN" && args[index - 1] === "--setenv");
+    assert.equal(args[authIndex + 1], "pi-plan-execute-relay");
+    assert.deepEqual(sandbox.config.sessionMeta, {
+      claudeCode: {
+        options: {
+          settingSources: [],
+          allowDangerouslySkipPermissions: false,
+          disallowedTools: ["Agent", "Task"],
+        },
+      },
+    });
+  } finally {
+    await sandbox?.cleanup();
+    if (original.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = original.token;
+    if (original.apiKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = original.apiKey;
+    if (original.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = original.baseUrl;
+    if (original.httpsProxy === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = original.httpsProxy;
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode runtime rejects a PATH binary sourced from the project tree", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-opencode-provenance-"));
+  const source = join(fixture, "source");
+  const worktree = await makeGitWorktree(fixture, { "bin/opencode": "#!/bin/sh\nexit 0\n" });
+  const sourceBin = join(process.cwd(), ".peac-untrusted-opencode");
+  const previousPath = process.env.PATH;
+  try {
+    await writeFile(sourceBin, "#!/bin/sh\nexit 0\n");
+    await chmod(sourceBin, 0o755);
+    process.env.PATH = `${process.cwd()}:${previousPath ?? "/usr/bin:/bin"}`;
+    await assert.rejects(
+      createSandboxedBackend({
+        role: "executor",
+        model: "opencode/opencode/big-pickle",
+        cwd: worktree,
+        sourceRoot: process.cwd(),
+        goldenRoot: join(process.cwd(), "docs"),
+      }),
+      /External agent binary may not come from the project\/worktree\/Golden roots/,
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    await rm(sourceBin, { force: true });
+    await rm(fixture, { recursive: true, force: true });
+    void source;
   }
 });
 

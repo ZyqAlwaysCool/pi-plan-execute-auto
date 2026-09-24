@@ -20,6 +20,8 @@
     "test:sandbox:required": "PI_PLAN_EXECUTE_REQUIRE_BWRAP_TESTS=1 tsx --test tests/sandbox.test.ts",
     "test:acp:required": "tsx --test tests/real-acp.integration.ts",
     "test:acp:builtins:required": "tsx --test tests/real-acp.builtins.integration.ts",
+    "test:acp:claude:required": "PI_PLAN_EXECUTE_ACP_TEST_BUILTINS=claude tsx --test tests/real-acp.builtins.integration.ts",
+    "test:acp:pi:required": "PI_PLAN_EXECUTE_ACP_TEST_BUILTINS=pi tsx --test tests/real-acp.builtins.integration.ts",
     "format:check": "tsc -p tsconfig.json --noEmit"
   },
   "pi": {
