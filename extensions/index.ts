@@ -40,6 +40,7 @@ import { completionRecordRelativePath, validatePhaseCompletionRecord } from "../
 import { AgentPrismSessionPair, requireAcpNetworkRiskAcknowledgement } from "../src/agent-prism.js";
 import {
   discoverAcpClis,
+  inspectClaudeNativeSandbox,
   loadProjectPluginProfile,
   normalizeSelectedModel,
   probeAcpConfiguration,
@@ -257,6 +258,7 @@ export async function runSetupWizard(
   discoverEfforts: (projectRoot: string, backend: AcpBackend, model: string) => Promise<ReasoningEffort[]> = async (root, backend, model) =>
     (await probeAcpConfiguration(root, backend, model)).efforts,
   verifyConnectivity: (projectRoot: string, model: string, effort?: ReasoningEffort) => Promise<void> = verifyAcpModelCall,
+  inspectClaudeSandbox: typeof inspectClaudeNativeSandbox = inspectClaudeNativeSandbox,
 ): Promise<ProjectPluginProfile | undefined> {
   if (!ctx.hasUI) throw new Error("Setup requires Pi's interactive UI (or RPC dialogs).");
   const preConsent = await ctx.ui.confirm(
@@ -283,6 +285,24 @@ export async function runSetupWizard(
   if (!executorModel) return undefined;
   const reviewerModel = await chooseConfiguredModel(ctx, "Reviewer", detected, catalog);
   if (!reviewerModel) return undefined;
+  if ([executorModel, reviewerModel].some((model) => model.startsWith("claude/"))) {
+    const claudeSandbox = await inspectClaudeSandbox(ctx.cwd);
+    if (claudeSandbox.enabled && !claudeSandbox.socat) {
+      throw new Error(
+        "Claude Code's native Bash sandbox is enabled by your own Claude configuration, but socat was not found on PATH. " +
+        "On Ubuntu/WSL install it with: sudo apt-get install -y socat. " +
+        "This is a Claude Code dependency for its native sandbox, not a pi-plan-execute-auto requirement. " +
+        "Detected from: " + (claudeSandbox.sources.join("; ") || "Claude native configuration"),
+      );
+    }
+    notify(
+      ctx,
+      claudeSandbox.enabled
+        ? `Claude native Bash sandbox: enabled by your Claude configuration\n✓ socat: ${claudeSandbox.socat}\nThe plugin preserves this native Claude behavior; socat is required by Claude Code in this configuration.`
+        : "Claude native Bash sandbox: not enabled by the detected Claude configuration. pi-plan-execute-auto does not force it, so socat is not required by the plugin.",
+      "info",
+    );
+  }
   const executorEffortsPromise = discoverEfforts(ctx.cwd, supportedBackendForModel(executorModel), executorModel);
   const reviewerEffortsPromise = executorModel === reviewerModel ? executorEffortsPromise
     : discoverEfforts(ctx.cwd, supportedBackendForModel(reviewerModel), reviewerModel);
@@ -350,7 +370,7 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     const isolation = await defaultIsolationProvider.preflight();
     notify(
       ctx,
-      `Environment preflight\n✓ Isolation: ${isolation.provider}\n✓ bubblewrap: ${isolation.bubblewrap}\n✓ Linux user namespaces available\n✓ Agent/tool network: normal host networking\n✓ Extra socat dependency: not required`,
+      `Environment preflight\n✓ Isolation: ${isolation.provider}\n✓ bubblewrap: ${isolation.bubblewrap}\n✓ Linux user namespaces available\n✓ Agent/tool network: normal host networking\n✓ Plugin-level socat dependency: none (Claude Code may require socat only if your own Claude native Bash sandbox is enabled)`,
       "info",
     );
     const saved = await runSetupWizard(ctx, discoverAcpClis);

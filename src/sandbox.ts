@@ -566,7 +566,6 @@ function addMinimalFilesystem(
     "--setenv", "TEMP", "/tmp",
     "--setenv", "CODEX_HOME", `${runtimeHome}/codex-home`,
     "--setenv", "CLAUDE_CONFIG_DIR", `${runtimeHome}/home/.claude`,
-    ...(backendId === "claude" ? ["--setenv", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1"] : []),
     "--setenv", "PI_CODING_AGENT_DIR", `${runtimeHome}/home/.pi/agent`,
     "--setenv", "XDG_DATA_HOME", `${runtimeHome}/data`,
     "--setenv", "XDG_STATE_HOME", `${runtimeHome}/state`,

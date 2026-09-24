@@ -364,6 +364,7 @@ test("Claude isolated session preserves native CLI routing, auth and tools witho
     sonnet: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
     configDir: process.env.CLAUDE_CONFIG_DIR,
     httpsProxy: process.env.HTTPS_PROXY,
+    subprocessScrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB,
   };
   let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
   try {
@@ -373,6 +374,7 @@ test("Claude isolated session preserves native CLI routing, auth and tools witho
     process.env.ANTHROPIC_MODEL = "deepseek-flash[1m]";
     process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "deepseek-flash[1m]";
     process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+    delete process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB;
     sandbox = await createSandboxedBackend({
       role: "executor",
       model: "claude/sonnet",
@@ -393,7 +395,7 @@ test("Claude isolated session preserves native CLI routing, auth and tools witho
     assert.equal(routedEnv.HTTPS_PROXY, "http://127.0.0.1:7890");
     assert.equal(routedEnv.CLAUDE_CONFIG_DIR, "/tmp/run/home/.claude");
     assert.notEqual(routedEnv.CLAUDE_CONFIG_DIR, claudeConfig);
-    assert.equal(routedEnv.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1");
+    assert.equal(routedEnv.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, undefined);
     assert.equal(sandbox.config.sessionMeta, undefined);
     const stagedSettings = await readFile(join(sandbox.scratchPath, "run", "home", ".claude", "settings.json"), "utf8");
     assert.match(stagedSettings, /fixture-plugin@example/);
@@ -407,6 +409,7 @@ test("Claude isolated session preserves native CLI routing, auth and tools witho
     if (original.sonnet === undefined) delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL; else process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = original.sonnet;
     if (original.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = original.configDir;
     if (original.httpsProxy === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = original.httpsProxy;
+    if (original.subprocessScrub === undefined) delete process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB; else process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = original.subprocessScrub;
     await rm(fixture, { recursive: true, force: true });
   }
 });

@@ -42,7 +42,7 @@ Executor and Reviewer are real independent ACP/CLI processes, not Main Pi subage
 
 For example, `claude/sonnet` means “use the Claude CLI and select its `sonnet` slot”. If the user's Claude configuration maps that slot to another gateway model, that native mapping remains valid.
 
-The plugin does **not** disable Claude Agent/Task/WebSearch/WebFetch, does not force a command no-network sandbox, and does not require `socat`.
+The plugin does **not** disable Claude Agent/Task/WebSearch/WebFetch and does not force Claude Code's native Bash sandbox. It therefore does **not** require `socat` by itself. If your own Claude Code configuration enables its native Bash sandbox (for example `sandbox.enabled: true` or `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`), Claude Code may require `socat` on Linux/WSL; setup detects this condition and explains that it is a Claude Code dependency rather than a plugin dependency.
 
 ## Setup UX
 
@@ -60,6 +60,7 @@ Setup performs an environment preflight before saving configuration:
 - Executor and Reviewer routes are selected explicitly;
 - a reasoning level supported by both selected routes is chosen;
 - a live connectivity check is offered for each selected route and is clearly marked as potentially billable;
+- if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;
 - the final networking behavior is shown before consent is saved.
 
@@ -119,7 +120,15 @@ which bwrap
 unshare -Ur true
 ```
 
-No extra `socat`, firewall, proxy, or provider-specific daemon is required by this plugin.
+No extra firewall, proxy, provider-specific daemon, or `socat` is required by this plugin itself.
+
+Claude-specific exception: if **your own Claude Code settings** enable Claude's native Bash sandbox, Linux/WSL Claude Code may require `socat`. In that case setup reports the exact reason and you can install it with:
+
+```bash
+sudo apt-get install -y socat
+```
+
+Installing `socat` in that case preserves your chosen native Claude behavior; the plugin does not enable that sandbox on your behalf.
 
 ## Development validation
 
@@ -161,8 +170,8 @@ Interactive setup remains the normal workflow.
 
 ## Validation status
 
-- **Pi:** the previously validated sandboxed Pi route passed Executor, Reviewer, and a complete one-phase workflow.
-- **Codex/OpenCode:** the WSL OpenCode 0775 install-tree regression is fixed; a fresh real 3/3 rerun is still required on the current native-session architecture.
-- **Claude:** prior relay-based results are obsolete for the current architecture. Claude now uses the user's normal CLI/gateway configuration inside the isolated native session and needs a fresh real 3/3 run before live validation is claimed.
+- **Codex/OpenCode:** real WSL validation on head `4768b81` passed Executor, Reviewer, and a complete one-phase workflow (**3/3**).
+- **Pi:** real WSL validation on head `4768b81` passed Executor, Reviewer, and a complete one-phase workflow (**3/3**).
+- **Claude:** the same pre-fix run reached **2/3**. The complete workflow failed when the plugin still forced `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, which made Claude Code require `socat` for Bash self-tests. That plugin-forced setting has now been removed. Claude must be rerun on the new head before **3/3** live validation is claimed; `socat` is only expected when the user's own Claude native sandbox configuration requires it.
 
 Non-billable CI is necessary but does not replace a real provider-call test for the selected CLI/model/gateway.

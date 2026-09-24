@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { approvedSetup, frozenProfileMatches, runSetupWizard } from "../extensions/index.js";
 import type { WorkflowState } from "../src/types.js";
-import { loadProjectPluginProfile, normalizeSelectedModel, parseOpenCodeModels, parsePiModels, saveProjectPluginProfile } from "../src/plugin-config.js";
+import { inspectClaudeNativeSandbox, loadProjectPluginProfile, normalizeSelectedModel, parseOpenCodeModels, parsePiModels, saveProjectPluginProfile } from "../src/plugin-config.js";
 
 const execFile = promisify(callback);
 async function fixture(): Promise<{ root: string; project: string; agentDir: string }> {
@@ -34,6 +34,32 @@ test("CLI catalog candidates remain explicit and are not silently substituted", 
   assert.throws(() => normalizeSelectedModel("codex", "gpt-6-luna; touch escape"), /Invalid/);
 });
 
+test("Claude native sandbox preflight only requires socat when the user's own Claude configuration enables it", async () => {
+  const { root, project } = await fixture();
+  const config = join(root, "claude-config");
+  const projectClaude = join(project, ".claude");
+  try {
+    await mkdir(config);
+    await writeFile(join(config, "settings.json"), JSON.stringify({ sandbox: { enabled: true } }));
+    const enabled = await inspectClaudeNativeSandbox(project, { CLAUDE_CONFIG_DIR: config, PATH: "" });
+    assert.equal(enabled.enabled, true);
+    assert.equal(enabled.socat, undefined);
+    assert.match(enabled.sources.join("\n"), /sandbox\.enabled=true/);
+
+    await mkdir(projectClaude);
+    await writeFile(join(projectClaude, "settings.local.json"), JSON.stringify({ sandbox: { enabled: false } }));
+    const disabledByProject = await inspectClaudeNativeSandbox(project, { CLAUDE_CONFIG_DIR: config, PATH: "" });
+    assert.equal(disabledByProject.enabled, false);
+
+    const forcedByUserEnv = await inspectClaudeNativeSandbox(project, {
+      CLAUDE_CONFIG_DIR: config, PATH: "", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
+    });
+    assert.equal(forcedByUserEnv.enabled, true);
+    assert.match(forcedByUserEnv.sources.join("\n"), /SUBPROCESS_ENV_SCRUB/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test("per-repository human setup stores no secrets and overrides model-supplied routes", async () => {
   const { root, project, agentDir } = await fixture();
   try {
@@ -188,7 +214,8 @@ test("all four backend routes share one wizard; reasoning is the intersection of
       { backend: "pi", version: "0.87.1", executable: "/bin/pi", models: ["pi/openai-codex/gpt-5.5", "pi/openai-codex/gpt-6-luna"] },
     ], agentDir, async (_, backend) => backend === "pi" ? ["pi/openai-codex/gpt-5.5"] : ["claude/sonnet"],
     async (_, backend) => backend === "pi" ? ["low", "medium", "high"] : ["low", "medium", "high", "max"],
-    async (_root, _model, effort) => { checkedModels += 1; assert.equal(effort, "high"); });
+    async (_root, _model, effort) => { checkedModels += 1; assert.equal(effort, "high"); },
+    async () => ({ enabled: false, sources: [] }));
     assert.equal(smokeApprovals, 1);
     assert.equal(checkedModels, 2);
     assert.equal(profile?.executorModel, "claude/sonnet");

@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { constants as fsConstants, realpathSync, statSync, accessSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { AcpAgent } from "@automatalabs/workflows";
 import { createSandboxedBackend, supportedBackendForModel, verifySandboxBoundary } from "./sandbox.js";
@@ -35,6 +37,14 @@ export interface DetectedCli {
   models: string[];
 }
 
+export interface ClaudeNativeSandboxPreflight {
+  enabled: boolean;
+  socat?: string;
+  sources: string[];
+}
+
+const MAX_CLAUDE_SETTINGS_BYTES = 512 * 1024;
+
 function regularObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -64,8 +74,8 @@ export function parseOpenCodeModels(text: string): string[] {
   return [...models].sort();
 }
 
-function onPath(name: string): string | undefined {
-  for (const dir of (process.env.PATH ?? "").split(":")) {
+function onPath(name: string, pathValue = process.env.PATH ?? ""): string | undefined {
+  for (const dir of pathValue.split(":")) {
     if (!dir) continue;
     try {
       const executable = realpathSync(join(dir, name));
@@ -76,6 +86,64 @@ function onPath(name: string): string | undefined {
     }
   }
   return undefined;
+}
+
+async function claudeSandboxSetting(path: string): Promise<boolean | undefined> {
+  let stat;
+  try {
+    stat = await lstat(path);
+  } catch (error) {
+    if (regularObject(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_CLAUDE_SETTINGS_BYTES) {
+    throw new Error(`Refusing unsafe Claude settings file while checking native sandbox requirements: ${path}`);
+  }
+  const raw = await readFile(path, "utf8");
+  const errors: ParseError[] = [];
+  const parsed = parseJsonc(raw, errors, { allowTrailingComma: true });
+  if (errors.length || !regularObject(parsed)) {
+    throw new Error(`Claude settings file is not valid JSON/JSONC: ${path}`);
+  }
+  const sandbox = parsed.sandbox;
+  if (!regularObject(sandbox) || typeof sandbox.enabled !== "boolean") return undefined;
+  return sandbox.enabled;
+}
+
+/**
+ * Inspect only the user's own Claude Code sandbox configuration. The plugin does
+ * not enable Claude's inner Bash sandbox. If the user enables it natively, Linux/
+ * WSL Claude Code may need socat and setup should explain that dependency.
+ */
+export async function inspectClaudeNativeSandbox(
+  projectRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ClaudeNativeSandboxPreflight> {
+  const configRoot = resolve(env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude"));
+  const candidates = [
+    join(configRoot, "settings.json"),
+    join(resolve(projectRoot), ".claude", "settings.json"),
+    join(resolve(projectRoot), ".claude", "settings.local.json"),
+  ];
+  let configured: boolean | undefined;
+  const sources: string[] = [];
+  for (const path of candidates) {
+    const value = await claudeSandboxSetting(path);
+    if (value === undefined) continue;
+    configured = value;
+    sources.push(`${path}: sandbox.enabled=${String(value)}`);
+  }
+  const scrub = env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB?.trim().toLowerCase();
+  if (scrub === "1" || scrub === "true") {
+    configured = true;
+    sources.push("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is enabled in the host environment");
+  }
+  const socat = onPath("socat", env.PATH ?? "");
+  return {
+    enabled: configured === true,
+    ...(socat ? { socat } : {}),
+    sources,
+  };
 }
 
 /** Listing candidates is not verification: the selected model is still checked by live sandboxed ACP. */
