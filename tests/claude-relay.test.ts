@@ -52,11 +52,14 @@ test("Claude credential relay injects host auth, pins model/path, and never refl
     },
   });
   try {
+    assert.match(relay.dummyAuthToken, /^[A-Za-z0-9_-]{40,}$/u);
+    assert.notEqual(relay.dummyAuthToken, "TOP_SECRET_RELAY_TOKEN");
+    assert.notEqual(relay.dummyAuthToken, "pi-plan-execute-relay");
     const response = await fetch(`${relay.baseUrl}/v1/messages`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: "Bearer sandbox-attacker-value",
+        authorization: `Bearer ${relay.dummyAuthToken}`,
         "x-tenant-route": "sandbox-attacker-route",
       },
       body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "OK" }] }),
@@ -96,23 +99,41 @@ test("Claude credential relay rejects unapproved endpoints and models before ups
     env: { ANTHROPIC_API_KEY: "host-api-key-secret", ANTHROPIC_BASE_URL: upstreamUrl },
   });
   try {
-    const wrongPath = await fetch(`${relay.baseUrl}/v1/complete`, {
+    const missingAuth = await fetch(`${relay.baseUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-5" }),
+    });
+    assert.equal(missingAuth.status, 401);
+
+    const wrongAuth = await fetch(`${relay.baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer attacker-known-value" },
+      body: JSON.stringify({ model: "claude-sonnet-5" }),
+    });
+    assert.equal(wrongAuth.status, 401);
+
+    const authorizedHeaders = {
+      "content-type": "application/json",
+      authorization: `Bearer ${relay.dummyAuthToken}`,
+    };
+    const wrongPath = await fetch(`${relay.baseUrl}/v1/complete`, {
+      method: "POST",
+      headers: authorizedHeaders,
       body: JSON.stringify({ model: "claude-sonnet-5" }),
     });
     assert.equal(wrongPath.status, 404);
 
     const wrongModel = await fetch(`${relay.baseUrl}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authorizedHeaders,
       body: JSON.stringify({ model: "claude-opus-5" }),
     });
     assert.equal(wrongModel.status, 403);
 
     const query = await fetch(`${relay.baseUrl}/v1/messages?target=https://example.invalid`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authorizedHeaders,
       body: JSON.stringify({ model: "claude-sonnet-5" }),
     });
     assert.equal(query.status, 404);

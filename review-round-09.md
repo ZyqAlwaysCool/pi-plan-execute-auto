@@ -19,3 +19,16 @@
 ## 结论与剩余动作
 
 **Claude 四端整体验收 FAIL。** 当前实现的沙箱/relay 可启动并返回真实 provider 错误，但 `claude/sonnet` 在现用自定义 gateway 上 `model_not_found`；凭据中转的原实现还存在已复现的响应头泄露及非 loopback HTTP 明文传输风险，两项已在工作区修复但未提交。不得静默把 Sonnet 换成 `deepseek-flash[1m]` 或降低 `high`。后续需由用户明确批准实际 gateway + 模型的精确路由，配置安全上游传输，再以安全修复后的代码重跑 Claude Executor、Reviewer、完整阶段 **3/3**；OpenCode 默认安装路径的权限/信任问题也需单独解决。ACP 任意网络出口仍未受供应商专用 OS 限制，不适用于敏感仓库。
+
+
+## 复核后的代码修复
+
+后续复核确认并区分了三类问题：
+
+1. **确认的 Claude relay 安全漏洞**：任意上游响应头可以换名回显宿主 secret；非 loopback 明文 HTTP upstream 会接收真实宿主认证。这两项均为真实缺陷。响应头白名单/secret 内容过滤以及非 loopback HTTP 拒绝已经提交，且 required CI 通过。
+2. **确认的 OpenCode WSL 兼容回归**：把当前用户自有的 0775 父目录一律视为不可信，会误拒绝常见 umask 0002 安装。现在仍要求实际 executable 本身不可 group/world-write，并继续拒绝 project/worktree/Golden/temp、world-writable、foreign-owned 路径；仅允许由当前可信 OS 用户拥有的 group-writable 父目录。新增 0775 用户安装回归测试。
+3. **Claude `model_not_found` 不是可安全静默替换的问题**：宿主把 Sonnet alias 映射到另一个实际 model，但 Stage B 的冻结模型路由不能被宿主环境偷偷重写。现有 setup 已允许 **Enter another Claude model ID…**；Claude session 现在用 `settings.availableModels` 只暴露用户明确批准的 exact model，供自定义 gateway 显式选择/验证。仍不得把 `claude/sonnet` 自动改写成 `deepseek-flash[1m]`。
+
+复核还发现 relay capability 仅靠 URL path 不足：完整 Claude agent 需要 Bash，而命令工具若能直连 loopback relay，就可能绕过正常 ACP turn 发原始 provider 请求。因此 relay 现在额外要求每 run 随机 bearer capability；Claude session 同时强制 command sandbox `enabled + failIfUnavailable + allowUnsandboxedCommands=false`，严格空网络 allowlist，并从命令环境拒绝 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`。Claude 主进程仍是完整独立 ACP/CLI 会话并能访问 relay，限制只作用于其 shell/command 子进程。
+
+Linux/WSL 的 Claude command-network sandbox 依赖可信系统 `bubblewrap` 与 `socat`；缺少 `/usr/bin/socat` 时 Claude provider session 现在启动前 fail closed。真实 Claude 3/3 仍需在 **HTTPS 或 loopback upstream**、用户明确批准的 exact model、安装了 `bubblewrap + socat` 的环境重新执行后才能更新为通过。

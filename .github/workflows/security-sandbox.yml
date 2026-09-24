@@ -13,11 +13,12 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - name: Install trusted system bubblewrap
+      - name: Install trusted system sandbox tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap socat
           test "$(stat -c %u /usr/bin/bwrap)" = 0
+          test "$(stat -c %u /usr/bin/socat)" = 0
           unshare -Ur true
       - run: npm ci
       - run: npm run check

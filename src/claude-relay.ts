@@ -7,7 +7,6 @@ import { URL } from "node:url";
 const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT = 4;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
-const DUMMY_AUTH_TOKEN = "pi-plan-execute-relay";
 const ALLOWED_API_PATHS = new Set(["/v1/messages", "/v1/messages/count_tokens"]);
 const HOP_BY_HOP_HEADERS = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -257,6 +256,7 @@ export async function startClaudeCredentialRelay(
   if (!Number.isSafeInteger(upstreamTimeoutMs) || upstreamTimeoutMs < 1_000) throw new Error("Invalid Claude relay timeout.");
 
   const capability = randomBytes(32).toString("base64url");
+  const relayAuthToken = randomBytes(32).toString("base64url");
   const prefix = `/${capability}`;
   const injectedHeaders: Record<string, string> = {
     ...custom.headers,
@@ -278,6 +278,9 @@ export async function startClaudeCredentialRelay(
         return responseError(res, 403, "loopback only");
       }
       if (active >= maxConcurrent) return responseError(res, 429, "relay concurrency limit");
+      if (req.headers.authorization !== `Bearer ${relayAuthToken}`) {
+        return responseError(res, 401, "relay capability authentication required");
+      }
       if (req.method !== "POST") return responseError(res, 405, "method not allowed");
       const incoming = new URL(req.url ?? "/", "http://relay.invalid");
       if (incoming.search || incoming.hash || !incoming.pathname.startsWith(`${prefix}/`)) {
@@ -392,7 +395,7 @@ export async function startClaudeCredentialRelay(
   let closed = false;
   return {
     baseUrl: `http://127.0.0.1:${address.port}${prefix}`,
-    dummyAuthToken: DUMMY_AUTH_TOKEN,
+    dummyAuthToken: relayAuthToken,
     async close() {
       if (closed) return;
       closed = true;

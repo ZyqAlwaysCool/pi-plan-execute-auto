@@ -166,6 +166,21 @@ export function findBubblewrap(): string {
   throw new Error("A root-owned system bubblewrap (bwrap) is required; refusing to start ACP without it.");
 }
 
+function requireClaudeSandboxTransport(): void {
+  const candidate = "/usr/bin/socat";
+  let real: string;
+  try {
+    real = realpathSync(candidate);
+  } catch {
+    throw new Error("Claude secure command sandbox requires the system socat package at /usr/bin/socat.");
+  }
+  const stat = statSync(real);
+  if (real !== candidate || !stat.isFile() || stat.uid !== 0 || (stat.mode & 0o022) !== 0 ||
+    accessSync(real, fsConstants.X_OK) !== undefined) {
+    throw new Error("Refusing untrusted socat; Claude secure command sandbox requires root-owned /usr/bin/socat.");
+  }
+}
+
 function findExecutable(name: string): string {
   for (const directory of (process.env.PATH ?? "").split(":")) {
     if (!directory) continue;
@@ -837,6 +852,9 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
   const bwrap = findBubblewrap();
   await assertDedicatedWorktreePointer(cwd);
   const runtime = backendRuntime(backendId);
+  if (backendId === "claude" && options.includeProviderCredentials) {
+    requireClaudeSandboxTransport();
+  }
   if (backendId === "opencode" && runtime.extraBinary) {
     assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot]);
   }
@@ -866,6 +884,7 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
     }
     const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
     addMinimalFilesystem(commandArgs, { ...options, cwd, sourceRoot, goldenRoot }, scratchPath, runtime, claudeRelay);
+    const claudeModelSpec = backendId === "claude" ? options.model.slice("claude/".length) : undefined;
     const config: CustomBackendConfig = {
       command: bwrap,
       args: [...commandArgs, "--", runtime.command, ...runtime.args],
@@ -874,8 +893,32 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
           claudeCode: {
             options: {
               settingSources: [],
+              ...(claudeModelSpec && claudeModelSpec !== "catalog"
+                ? { settings: { availableModels: [claudeModelSpec] } }
+                : {}),
               allowDangerouslySkipPermissions: false,
               disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
+              // Keep the full Claude agent session, but make command-tool
+              // subprocesses fail closed with no network access. The parent
+              // Claude process can reach the host credential relay; Bash,
+              // PowerShell and Monitor cannot call it or retry unsandboxed.
+              sandbox: {
+                enabled: true,
+                failIfUnavailable: true,
+                allowUnsandboxedCommands: false,
+                network: {
+                  strictAllowlist: true,
+                  allowedDomains: [],
+                  deniedDomains: ["localhost", "127.0.0.1", "[::1]"],
+                },
+                credentials: {
+                  envVars: [
+                    { name: "ANTHROPIC_AUTH_TOKEN", mode: "deny" },
+                    { name: "ANTHROPIC_API_KEY", mode: "deny" },
+                    { name: "ANTHROPIC_BASE_URL", mode: "deny" },
+                  ],
+                },
+              },
             },
           },
         },

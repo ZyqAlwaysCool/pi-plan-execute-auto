@@ -375,7 +375,10 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
     assert.ok(baseIndex >= 0);
     assert.match(args[baseIndex + 1] ?? "", /^http:\/\/127\.0\.0\.1:\d+\/[A-Za-z0-9_-]{40,}$/u);
     const authIndex = args.findIndex((value, index) => value === "ANTHROPIC_AUTH_TOKEN" && args[index - 1] === "--setenv");
-    assert.equal(args[authIndex + 1], "pi-plan-execute-relay");
+    const relayToken = args[authIndex + 1] ?? "";
+    assert.match(relayToken, /^[A-Za-z0-9_-]{40,}$/u);
+    assert.notEqual(relayToken, "HOST_CLAUDE_SECRET_MUST_NOT_ENTER_SANDBOX");
+    assert.notEqual(relayToken, "pi-plan-execute-relay");
     for (const key of ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"]) {
       const index = args.findIndex((value, offset) => value === key && args[offset - 1] === "--setenv");
       assert.equal(args[index + 1], "1");
@@ -384,8 +387,26 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
       claudeCode: {
         options: {
           settingSources: [],
+          settings: { availableModels: ["sonnet"] },
           allowDangerouslySkipPermissions: false,
           disallowedTools: ["Agent", "Task", "WebSearch", "WebFetch"],
+          sandbox: {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+            network: {
+              strictAllowlist: true,
+              allowedDomains: [],
+              deniedDomains: ["localhost", "127.0.0.1", "[::1]"],
+            },
+            credentials: {
+              envVars: [
+                { name: "ANTHROPIC_AUTH_TOKEN", mode: "deny" },
+                { name: "ANTHROPIC_API_KEY", mode: "deny" },
+                { name: "ANTHROPIC_BASE_URL", mode: "deny" },
+              ],
+            },
+          },
         },
       },
     });
