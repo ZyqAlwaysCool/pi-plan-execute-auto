@@ -544,6 +544,10 @@ function addMinimalFilesystem(
     ...(claudeRelay ? [
       "--setenv", "ANTHROPIC_BASE_URL", claudeRelay.baseUrl,
       "--setenv", "ANTHROPIC_AUTH_TOKEN", claudeRelay.dummyAuthToken,
+      "--setenv", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1",
+      "--setenv", "DISABLE_TELEMETRY", "1",
+      "--setenv", "DISABLE_ERROR_REPORTING", "1",
+      "--setenv", "DISABLE_AUTOUPDATER", "1",
     ] : []),
     "--setenv", "PI_CODING_AGENT_DIR", `${runtimeHome}/home/.pi/agent`,
     "--setenv", "PI_OFFLINE", "1",

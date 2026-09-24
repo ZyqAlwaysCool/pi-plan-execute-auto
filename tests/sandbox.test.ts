@@ -376,6 +376,10 @@ test("Claude sandbox uses only the host relay capability and locks unsafe Claude
     assert.match(args[baseIndex + 1] ?? "", /^http:\/\/127\.0\.0\.1:\d+\/[A-Za-z0-9_-]{40,}$/u);
     const authIndex = args.findIndex((value, index) => value === "ANTHROPIC_AUTH_TOKEN" && args[index - 1] === "--setenv");
     assert.equal(args[authIndex + 1], "pi-plan-execute-relay");
+    for (const key of ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"]) {
+      const index = args.findIndex((value, offset) => value === key && args[offset - 1] === "--setenv");
+      assert.equal(args[index + 1], "1");
+    }
     assert.deepEqual(sandbox.config.sessionMeta, {
       claudeCode: {
         options: {
@@ -399,14 +403,15 @@ test("OpenCode runtime rejects a PATH binary sourced from the project tree", {
   skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
 }, async () => {
   const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-opencode-provenance-"));
-  const source = join(fixture, "source");
   const worktree = await makeGitWorktree(fixture, { "bin/opencode": "#!/bin/sh\nexit 0\n" });
-  const sourceBin = join(process.cwd(), ".peac-untrusted-opencode");
+  const untrustedDir = join(process.cwd(), ".peac-untrusted-opencode-bin");
+  const sourceBin = join(untrustedDir, "opencode");
   const previousPath = process.env.PATH;
   try {
+    await mkdir(untrustedDir);
     await writeFile(sourceBin, "#!/bin/sh\nexit 0\n");
     await chmod(sourceBin, 0o755);
-    process.env.PATH = `${process.cwd()}:${previousPath ?? "/usr/bin:/bin"}`;
+    process.env.PATH = `${untrustedDir}:${previousPath ?? "/usr/bin:/bin"}`;
     await assert.rejects(
       createSandboxedBackend({
         role: "executor",
@@ -419,9 +424,8 @@ test("OpenCode runtime rejects a PATH binary sourced from the project tree", {
     );
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
-    await rm(sourceBin, { force: true });
+    await rm(untrustedDir, { recursive: true, force: true });
     await rm(fixture, { recursive: true, force: true });
-    void source;
   }
 });
 
