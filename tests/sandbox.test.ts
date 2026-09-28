@@ -146,6 +146,36 @@ test("ACP backend command uses minimal mounts and a scrubbed environment", {
   }
 });
 
+test("Codex catalog staging preserves config but skips live IPC sockets", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const root = await mkdtemp(join(dirname(process.cwd()), ".peac-codex-socket-"));
+  const previous = process.env.CODEX_HOME;
+  const server = createServer();
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    const home = join(root, "codex-home");
+    await mkdir(join(home, "ipc"), { recursive: true });
+    await writeFile(join(home, "config.toml"), "model = 'fixture'\n");
+    const socket = join(home, "ipc", "ipc.sock");
+    await new Promise<void>((resolve, reject) => server.listen(socket, resolve).once("error", reject));
+    process.env.CODEX_HOME = home;
+    const cwd = await makeGitWorktree(root);
+    const sourceRoot = join(root, "source");
+    const goldenRoot = join(sourceRoot, ".pi-plan-execute-auto", "fixture");
+    await mkdir(goldenRoot, { recursive: true });
+    sandbox = await createSandboxedBackend({ role: "reviewer", model: "codex/gpt-5.6-sol", cwd, sourceRoot, goldenRoot });
+    assert.equal(await readFile(join(sandbox.scratchPath, "run", "codex-home", "config.toml"), "utf8"), "model = 'fixture'\n");
+    await assert.rejects(access(join(sandbox.scratchPath, "run", "codex-home", "ipc", "ipc.sock")));
+  } finally {
+    await sandbox?.cleanup();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi ACP preserves native CLI auth state and bootstrap unlinks it before the first turn", {
   skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted bwrap is required for the Pi bootstrap",
 }, async () => {

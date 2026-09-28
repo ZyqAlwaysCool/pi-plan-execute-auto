@@ -22,7 +22,10 @@ export interface ProjectPluginProfile {
   gitEntry: string;
   executorModel: string;
   reviewerModel: string;
+  /** Legacy shared effort for previously approved configurations. */
   reasoningEffort?: ReasoningEffort;
+  executorReasoningEffort?: ReasoningEffort;
+  reviewerReasoningEffort?: ReasoningEffort;
   permissionMode: AgentPermissionMode;
   reviewRoundLimit: number;
   /** Digest of the project-local, untrusted preference cache approved by the human. */
@@ -302,6 +305,9 @@ function validateProfile(value: unknown, identity: { projectRoot: string; gitEnt
     typeof value.networkRiskApprovedAt !== "string" || !Number.isFinite(Date.parse(value.networkRiskApprovedAt)) ||
     typeof value.configSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.configSha256) ||
     (value.reasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reasoningEffort as string)) ||
+    (value.executorReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.executorReasoningEffort as string)) ||
+    (value.reviewerReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reviewerReasoningEffort as string)) ||
+    (value.reasoningEffort !== undefined && (value.executorReasoningEffort !== undefined || value.reviewerReasoningEffort !== undefined)) ||
     (value.permissionMode !== "autonomous" && value.permissionMode !== "ask") ||
     !Number.isInteger(value.reviewRoundLimit) || (value.reviewRoundLimit as number) < 1 || (value.reviewRoundLimit as number) > 100) {
     throw new Error("Saved plan-execute configuration is invalid or belongs to a different Git repository. Run /plan-execute setup again.");
@@ -324,6 +330,8 @@ function approvedCache(profile: ProjectPluginProfile): Record<string, unknown> {
     version: 1, projectRoot: profile.projectRoot, gitEntry: profile.gitEntry,
     executorModel: profile.executorModel, reviewerModel: profile.reviewerModel,
     ...(profile.reasoningEffort ? { reasoningEffort: profile.reasoningEffort } : {}),
+    ...(profile.executorReasoningEffort ? { executorReasoningEffort: profile.executorReasoningEffort } : {}),
+    ...(profile.reviewerReasoningEffort ? { reviewerReasoningEffort: profile.reviewerReasoningEffort } : {}),
     permissionMode: profile.permissionMode,
     reviewRoundLimit: profile.reviewRoundLimit,
   };
@@ -386,8 +394,8 @@ export async function loadProjectPluginProfile(cwd: string, agentDir = getAgentD
 /** Project cache is model-editable; only the protected user-owned digest and network consent authorize it. */
 export async function saveProjectPluginProfile(
   cwd: string,
-  selected: Pick<ProjectPluginProfile, "executorModel" | "reviewerModel" | "reasoningEffort"> &
-    Partial<Pick<ProjectPluginProfile, "permissionMode" | "reviewRoundLimit">>,
+  selected: Pick<ProjectPluginProfile, "executorModel" | "reviewerModel"> &
+    Partial<Pick<ProjectPluginProfile, "reasoningEffort" | "executorReasoningEffort" | "reviewerReasoningEffort" | "permissionMode" | "reviewRoundLimit">>,
   agentDir = getAgentDir(),
 ): Promise<ProjectPluginProfile> {
   const identity = await projectIdentity(cwd);
@@ -396,6 +404,8 @@ export async function saveProjectPluginProfile(
     executorModel: selected.executorModel,
     reviewerModel: selected.reviewerModel,
     ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}),
+    ...(selected.executorReasoningEffort ? { executorReasoningEffort: selected.executorReasoningEffort } : {}),
+    ...(selected.reviewerReasoningEffort ? { reviewerReasoningEffort: selected.reviewerReasoningEffort } : {}),
     permissionMode: selected.permissionMode ?? "autonomous",
     reviewRoundLimit: selected.reviewRoundLimit ?? DEFAULT_MAX_REVIEW_ROUNDS,
   };

@@ -899,6 +899,15 @@ async function copyNativeStateSource(source: string, target: string): Promise<bo
         force: true,
         preserveTimestamps: true,
         verbatimSymlinks: true,
+        // Native CLI state can contain live IPC sockets, FIFOs, or devices.
+        // They cannot be copied to a new session; keep ordinary files and links.
+        filter: async (path) => {
+          const item = await lstat(path).catch((error: unknown) => {
+            if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
+            throw error;
+          });
+          return !!item && (item.isFile() || item.isDirectory() || item.isSymbolicLink());
+        },
       });
     }
     return true;

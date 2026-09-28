@@ -116,6 +116,7 @@ test("interactive wizard records only a separate human network consent and confi
   let manualInputs = 0;
   let connectivityChecks = 0;
   const warnings: string[] = [];
+  const progress: Array<string | undefined> = [];
   const discoverCodex = async () => { codexProbes += 1; return ["codex/gpt-6-luna"]; };
   const discoverClis = async () => { cliProbes += 1; return clis; };
   const discoverEfforts = async () => ["low", "medium", "high"] as Array<"low" | "medium" | "high" | "max">;
@@ -124,11 +125,12 @@ test("interactive wizard records only a separate human network consent and confi
     hasUI: true,
     ui: {
       notify(message: string, level: string) { if (level === "warning") warnings.push(message); },
+      setStatus(_key: string, value: string | undefined) { progress.push(value); },
       async select(title: string, choices: string[]) {
         if (title.includes("model (candidates")) return choices[0];
+        if (title.includes(": reasoning effort")) return choices[2];
         if (title.startsWith("Executor:")) return choices[0];
         if (title.startsWith("Reviewer:")) return choices[1];
-        if (title.startsWith("Reasoning effort")) return choices[2];
         if (title.startsWith("Maximum review rounds")) return choices[1];
         if (title.startsWith("Agent permission handling")) return choices[0];
         throw new Error(`Unexpected selection: ${title}`);
@@ -162,9 +164,13 @@ test("interactive wizard records only a separate human network consent and confi
     assert.equal(codexProbes, 1);
     assert.equal(manualInputs, 0);
     assert.equal(connectivityChecks, 2);
+    assert.ok(progress.some((message) => message?.includes("loading codex ACP models")));
+    assert.ok(progress.some((message) => message?.includes("Checking codex/gpt-6-luna")));
+    assert.equal(progress.at(-1), undefined);
     assert.equal(configured?.executorModel, "opencode/deepseek-local/deepseek-flash");
     assert.equal(configured?.reviewerModel, "codex/gpt-6-luna");
-    assert.equal(configured?.reasoningEffort, "high");
+    assert.equal(configured?.executorReasoningEffort, "high");
+    assert.equal(configured?.reviewerReasoningEffort, "high");
     assert.equal(configured?.reviewRoundLimit, 5);
     assert.equal(configured?.permissionMode, "autonomous");
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), configured);
@@ -184,7 +190,7 @@ test("interactive wizard records only a separate human network consent and confi
   }
 });
 
-test("all four backend routes share one wizard; reasoning is the intersection of advertised levels", async () => {
+test("all four backend routes share one wizard; reasoning is chosen independently per role", async () => {
   const { root, project, agentDir } = await fixture();
   let smokeApprovals = 0;
   let checkedModels = 0;
@@ -200,7 +206,8 @@ test("all four backend routes share one wizard; reasoning is the intersection of
         if (title.startsWith("Reviewer: choose")) return choices[1];
         if (title.includes("claude model")) { assert.deepEqual(choices.slice(0, 1), ["claude/sonnet"]); return choices[0]; }
         if (title.includes("pi model")) { assert.deepEqual(choices.slice(0, 1), ["pi/openai-codex/gpt-5.5"]); return choices[0]; }
-        if (title.startsWith("Reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "backend default", "Cancel"]); return "high"; }
+        if (title.startsWith("Executor: reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "max", "backend default", "Cancel"]); return "max"; }
+        if (title.startsWith("Reviewer: reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "backend default", "Cancel"]); return "medium"; }
         if (title.startsWith("Maximum review rounds")) return choices[1];
         if (title.startsWith("Agent permission handling")) return choices[1];
         throw new Error(`Unexpected choice: ${title}`);
@@ -214,16 +221,58 @@ test("all four backend routes share one wizard; reasoning is the intersection of
       { backend: "pi", version: "0.87.1", executable: "/bin/pi", models: ["pi/openai-codex/gpt-5.5", "pi/openai-codex/gpt-6-luna"] },
     ], agentDir, async (_, backend) => backend === "pi" ? ["pi/openai-codex/gpt-5.5"] : ["claude/sonnet"],
     async (_, backend) => backend === "pi" ? ["low", "medium", "high"] : ["low", "medium", "high", "max"],
-    async (_root, _model, effort) => { checkedModels += 1; assert.equal(effort, "high"); },
+    async (_root, model, effort) => { checkedModels += 1; assert.equal(effort, model === "claude/sonnet" ? "max" : "medium"); },
     async () => ({ enabled: false, sources: [] }));
     assert.equal(smokeApprovals, 1);
     assert.equal(checkedModels, 2);
     assert.equal(profile?.executorModel, "claude/sonnet");
     assert.equal(profile?.reviewerModel, "pi/openai-codex/gpt-5.5");
-    assert.equal(profile?.reasoningEffort, "high");
+    assert.equal(profile?.executorReasoningEffort, "max");
+    assert.equal(profile?.reviewerReasoningEffort, "medium");
+    assert.equal(profile?.reasoningEffort, undefined);
     assert.equal(profile?.reviewRoundLimit, 5);
     assert.equal(profile?.permissionMode, "ask");
+    assert.equal(JSON.parse(await readFile(join(project, ".pi-plan-execute-auto", "config.json"), "utf8")).reviewerReasoningEffort, "medium");
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), profile);
+    const frozen = {
+      executor_model: profile?.executorModel, reviewer_model: profile?.reviewerModel,
+      executor_reasoning_effort: "max", reviewer_reasoning_effort: "medium",
+      permission_mode: "ask", review_round_limit: 5,
+    } as WorkflowState;
+    assert.equal(frozenProfileMatches(frozen, profile!), true);
+    assert.equal(frozenProfileMatches({ ...frozen, reviewer_reasoning_effort: "high" }, profile!), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("setup shows a live progress indicator during ACP catalog discovery and clears it on failure", async () => {
+  const { root, project, agentDir } = await fixture();
+  const statuses: Array<string | undefined> = [];
+  let release!: (models: string[]) => void;
+  const catalog = new Promise<string[]>((resolve) => { release = resolve; });
+  const ctx = {
+    cwd: project, hasUI: true, mode: "tui", ui: {
+      setStatus(_key: string, value: string | undefined) { statuses.push(value); },
+      notify() {},
+      async confirm() { return true; },
+      async select(title: string, options: string[]) {
+        if (title === "Executor: choose local coding CLI") return options[0];
+        if (title.includes("model (candidates")) return options[0];
+        throw new Error(`Unexpected selection ${title}`);
+      },
+    },
+  } as unknown as Parameters<typeof runSetupWizard>[0];
+  try {
+    const task = runSetupWizard(ctx, [
+      { backend: "codex", executable: "/bin/codex", version: "fixture", models: [] },
+    ], agentDir, async () => catalog, async () => { throw new Error("effort discovery failed"); });
+    await new Promise((resolve) => setTimeout(resolve, 280));
+    assert.ok(statuses.length >= 2, "spinner should update while catalog is pending");
+    assert.match(statuses[0] ?? "", /loading codex ACP models/);
+    assert.notEqual(statuses[0], statuses[1]);
+    release(["codex/gpt-6-luna"]);
+    await assert.rejects(task, /effort discovery failed/);
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(await loadProjectPluginProfile(project, agentDir), undefined);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -235,7 +284,7 @@ test("declined live Agent CLI connectivity preflight stores no project or consen
       async confirm(title: string) { return !title.includes("live Agent CLI connectivity"); },
       async select(title: string, choices: string[]) {
         if (title.includes("model (candidates")) return choices[0];
-        if (title.startsWith("Reasoning effort")) return "medium";
+        if (title.includes(": reasoning effort")) return "medium";
         if (title.startsWith("Maximum review rounds")) return choices[0];
         if (title.startsWith("Agent permission handling")) return choices[0];
         return choices[0];
@@ -311,6 +360,8 @@ test("headless fallback remains explicit, not a hidden default", async () => {
     "PI_PLAN_EXECUTE_EXECUTOR_MODEL",
     "PI_PLAN_EXECUTE_REVIEWER_MODEL",
     "PI_PLAN_EXECUTE_REASONING_EFFORT",
+    "PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT",
+    "PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT",
     "PI_PLAN_EXECUTE_PERMISSION_MODE",
     "PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS",
     "PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK",
@@ -331,6 +382,18 @@ test("headless fallback remains explicit, not a hidden default", async () => {
       permissionMode: "autonomous",
       reviewRoundLimit: 5,
     });
+    delete process.env.PI_PLAN_EXECUTE_REASONING_EFFORT;
+    process.env.PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT = "medium";
+    process.env.PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT = "high";
+    assert.deepEqual(await approvedSetup(project, false, undefined, agentDir), {
+      executorModel: "opencode/deepseek-local/deepseek-flash",
+      reviewerModel: "codex/gpt-6-luna",
+      executorReasoningEffort: "medium",
+      reviewerReasoningEffort: "high",
+      permissionMode: "autonomous", reviewRoundLimit: 5,
+    });
+    process.env.PI_PLAN_EXECUTE_REASONING_EFFORT = "high";
+    await assert.rejects(approvedSetup(project, false, undefined, agentDir), /either the legacy shared variable or the per-role variables/);
   } finally {
     keys.forEach((key, index) => {
       if (before[index] === undefined) delete process.env[key];

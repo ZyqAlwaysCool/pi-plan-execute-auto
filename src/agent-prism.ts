@@ -145,7 +145,10 @@ export interface AgentPrismSessionPairOptions {
   executorMode?: string;
   reviewerMode?: string;
   schemaRetries?: number;
+  /** Legacy shared effort for callers not using per-role configuration. */
   reasoningEffort?: ReasoningEffort;
+  executorReasoningEffort?: ReasoningEffort;
+  reviewerReasoningEffort?: ReasoningEffort;
   /** Verified user-owned project profile consent; headless runs may use the explicit env fallback. */
   networkRiskApproved?: boolean;
   permissionMode?: AgentPermissionMode;
@@ -227,7 +230,8 @@ export class AgentPrismSessionPair implements HarnessPair {
           retainHistory: true,
         });
         await agent.ready();
-        if (this.options.reasoningEffort) await requireReasoningEffort(agent, this.options.reasoningEffort);
+        const effort = this.options.executorReasoningEffort ?? this.options.reasoningEffort;
+        if (effort) await requireReasoningEffort(agent, effort);
         if (this.options.executorMode && agent.modes?.currentModeId !== this.options.executorMode) {
           throw new Error(`Executor backend ${agent.backendId} did not enter the required ${this.options.executorMode} mode.`);
         }
@@ -340,7 +344,8 @@ export class AgentPrismSessionPair implements HarnessPair {
       });
       this.reviewer = reviewer;
       await reviewer.ready();
-      if (this.options.reasoningEffort) await requireReasoningEffort(reviewer, this.options.reasoningEffort);
+      const effort = this.options.reviewerReasoningEffort ?? this.options.reasoningEffort;
+      if (effort) await requireReasoningEffort(reviewer, effort);
       if (reviewerMode && reviewer.modes?.currentModeId !== reviewerMode) {
         throw new Error(`Reviewer backend ${reviewer.backendId} did not enter the configured ${reviewerMode} mode.`);
       }

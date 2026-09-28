@@ -209,7 +209,10 @@ export interface WorkflowState {
   completed_at?: string;
   executor_model?: string;
   reviewer_model?: string;
+  /** Legacy shared effort for runs frozen before per-role selection. */
   reasoning_effort?: ReasoningEffort;
+  executor_reasoning_effort?: ReasoningEffort;
+  reviewer_reasoning_effort?: ReasoningEffort;
   permission_mode?: AgentPermissionMode;
   review_round_limit?: number;
   branch_name?: string;

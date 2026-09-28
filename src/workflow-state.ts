@@ -64,8 +64,13 @@ export async function loadValidatedRun(
   if (state.package_hash !== validation.package.package_hash) {
     throw new Error(`Workflow ${runId} package hash does not match its frozen state.`);
   }
-  if (state.reasoning_effort !== undefined && !["low", "medium", "high", "max"].includes(state.reasoning_effort)) {
-    throw new Error(`Workflow ${runId} has an unsupported persisted reasoning effort.`);
+  for (const effort of [state.reasoning_effort, state.executor_reasoning_effort, state.reviewer_reasoning_effort]) {
+    if (effort !== undefined && !["low", "medium", "high", "max"].includes(effort)) {
+      throw new Error(`Workflow ${runId} has an unsupported persisted reasoning effort.`);
+    }
+  }
+  if (state.reasoning_effort !== undefined && (state.executor_reasoning_effort !== undefined || state.reviewer_reasoning_effort !== undefined)) {
+    throw new Error(`Workflow ${runId} mixes shared and role-specific reasoning effort.`);
   }
   if (state.permission_mode !== undefined && state.permission_mode !== "autonomous" && state.permission_mode !== "ask") {
     throw new Error(`Workflow ${runId} has an unsupported persisted agent permission mode.`);
@@ -168,6 +173,8 @@ export async function freezeRun(
     executorModel?: string;
     reviewerModel?: string;
     reasoningEffort?: WorkflowState["reasoning_effort"];
+    executorReasoningEffort?: WorkflowState["executor_reasoning_effort"];
+    reviewerReasoningEffort?: WorkflowState["reviewer_reasoning_effort"];
     permissionMode?: WorkflowState["permission_mode"];
     reviewRoundLimit?: number;
     reviewedPackageHash?: string;
@@ -194,7 +201,12 @@ export async function freezeRun(
   state.approved_at = new Date().toISOString();
   if (options?.executorModel) state.executor_model = options.executorModel;
   if (options?.reviewerModel) state.reviewer_model = options.reviewerModel;
+  if (options?.reasoningEffort && (options.executorReasoningEffort || options.reviewerReasoningEffort)) {
+    throw new Error("Human freeze cannot mix shared and role-specific reasoning efforts.");
+  }
   if (options?.reasoningEffort) state.reasoning_effort = options.reasoningEffort;
+  if (options?.executorReasoningEffort) state.executor_reasoning_effort = options.executorReasoningEffort;
+  if (options?.reviewerReasoningEffort) state.reviewer_reasoning_effort = options.reviewerReasoningEffort;
   if (options?.permissionMode) state.permission_mode = options.permissionMode;
   if (options?.reviewRoundLimit !== undefined) state.review_round_limit = options.reviewRoundLimit;
   await writeWorkflowState(root, state);

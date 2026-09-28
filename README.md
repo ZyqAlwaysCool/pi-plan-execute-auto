@@ -54,12 +54,12 @@ Run:
 
 Setup performs an environment preflight before saving configuration:
 
+- Git initialization is offered only if the directory is not already a repository (it still requires explicit consent); once at the repository root, setup creates or appends `.pi-plan-execute-auto/` in `.gitignore` when that directory is not already ignored. Existing ignore rules are preserved. Setup never stages or commits `.gitignore`: review and commit it yourself before **Approve & Start**, and keep generated package/config files out of Git;
 - trusted Linux `bubblewrap` is available;
 - unprivileged user namespaces work;
-- installed Agent CLIs and their versions are shown;
-- Executor and Reviewer routes are selected explicitly;
-- a reasoning level supported by both selected routes is chosen;
-- a live connectivity check is offered for each selected route and is clearly marked as potentially billable;
+- installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi (cleared on success or failure);
+- Executor model and its advertised reasoning level are selected together, then Reviewer model and its own advertised reasoning level are selected (for example Executor `medium`, Reviewer `high`); each selection is rechecked at Stage B start;
+- a live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable;
 - if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;
 - the final networking behavior is shown before consent is saved.
@@ -162,7 +162,7 @@ npm run test:acp:pi:required
 
 Headless execution can additionally set:
 
-- `PI_PLAN_EXECUTE_REASONING_EFFORT=low|medium|high|max`
+- `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=low|medium|high|max` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=low|medium|high|max` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides
 - `PI_PLAN_EXECUTE_PERMISSION_MODE=autonomous|ask`
 - `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`
 

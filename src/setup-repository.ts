@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, open, realpath, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -33,7 +34,38 @@ async function gitEntryExists(root: string): Promise<boolean> {
   }
 }
 
-/** Mutates no user files. Git init and an optional empty commit require distinct UI approvals. */
+async function ensurePluginIgnored(root: string, ui: SetupRepositoryUI): Promise<void> {
+  // Honor existing local, global, or repository-local ignore rules when they already
+  // cover the entire runtime directory. A tracked runtime directory still needs
+  // manual remediation: ignore rules never untrack files.
+  const ignored = await git(root, ["check-ignore", "-q", "--no-index", "--", ".pi-plan-execute-auto/"])
+    .then(() => true, () => false);
+  if (ignored) return;
+
+  const path = join(root, ".gitignore");
+  const rule = ".pi-plan-execute-auto/";
+  let entry;
+  try { entry = await lstat(path); } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+  }
+  if (!entry) {
+    await writeFile(path, `${rule}\n`, { flag: "wx", mode: 0o644 });
+  } else {
+    if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("Refusing to modify a non-regular or symlinked .gitignore; add .pi-plan-execute-auto/ manually.");
+    const handle = await open(path, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > 128 * 1024) throw new Error("Refusing to modify an oversized or non-regular .gitignore; add .pi-plan-execute-auto/ manually.");
+      const content = await handle.readFile("utf8");
+      if (content.includes("\0")) throw new Error("Refusing to modify a binary .gitignore; add .pi-plan-execute-auto/ manually.");
+      const newline = content.includes("\r\n") ? "\r\n" : "\n";
+      await handle.writeFile(`${content && !content.endsWith("\n") ? newline : ""}${rule}${newline}`);
+    } finally { await handle.close(); }
+  }
+  ui.notify("Added .pi-plan-execute-auto/ to .gitignore without staging or committing it. Review and commit .gitignore before Approve & Start; do not commit the generated runtime files.", "warning");
+}
+
+/** Git init and an optional empty commit require distinct UI approvals; user files are never staged. */
 export async function ensureSetupRepository(cwd: string, ui: SetupRepositoryUI): Promise<boolean> {
   const root = await realpath(cwd);
   if (root === "/" || root === homedir()) {
@@ -64,6 +96,7 @@ export async function ensureSetupRepository(cwd: string, ui: SetupRepositoryUI):
     }
     ui.notify("Initialized Git here. No project files were staged or committed.", "info");
   }
+  await ensurePluginIgnored(root, ui);
   let hasHead = false;
   try { await git(root, ["rev-parse", "--verify", "HEAD"]); hasHead = true; } catch { /* An unborn repository needs a baseline commit. */ }
   if (hasHead) return true;

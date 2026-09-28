@@ -202,7 +202,7 @@ async function chooseApproval(
   profile?: ProjectPluginProfile,
 ): Promise<"approve-start" | "cancel" | "pending"> {
   if (!ctx.hasUI) return "pending";
-  const summary = `${formatPackageSummary(pkg)}${profile ? `\nExecutor: ${profile.executorModel}\nReviewer: ${profile.reviewerModel}\nReasoning: ${profile.reasoningEffort ?? "backend default"}\nReview loop limit: ${profile.reviewRoundLimit} round(s) per phase\nAgent permissions: ${profile.permissionMode === "autonomous" ? "Autonomous" : "Ask me"}\nAgent/tool network: normal CLI access` : ""}`;
+  const summary = `${formatPackageSummary(pkg)}${profile ? `\nExecutor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReview loop limit: ${profile.reviewRoundLimit} round(s) per phase\nAgent permissions: ${profile.permissionMode === "autonomous" ? "Autonomous" : "Ask me"}\nAgent/tool network: normal CLI access` : ""}`;
   for (;;) {
     const choice = await ctx.ui.select("Plan Review & Approval", ["Review Plan Package", "Approve & Start", "Cancel"]);
     if (choice === "Approve & Start") return "approve-start";
@@ -210,6 +210,25 @@ async function chooseApproval(
     const review = await packageReviewText(pkg);
     await ctx.ui.editor("Review phased execution & acceptance plan (read-only)", review);
     notify(ctx, summary, "info");
+  }
+}
+
+const SETUP_STATUS_KEY = "plan-execute-setup";
+
+async function withSetupProgress<T>(ctx: ExtensionCommandContext, label: string, work: () => Promise<T>): Promise<T> {
+  if (typeof ctx.ui.setStatus !== "function") return work();
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const started = Date.now();
+  let frame = 0;
+  const render = () => ctx.ui.setStatus(SETUP_STATUS_KEY, `${frames[frame++ % frames.length]} ${label} (${Math.floor((Date.now() - started) / 1000)}s)`);
+  // RPC has status updates but no terminal animation. Avoid a running timer in
+  // non-TUI clients; always clear status even when discovery fails.
+  render();
+  const timer = ctx.mode === "tui" ? setInterval(render, 120) : undefined;
+  try { return await work(); }
+  finally {
+    if (timer) clearInterval(timer);
+    ctx.ui.setStatus(SETUP_STATUS_KEY, undefined);
   }
 }
 
@@ -224,7 +243,7 @@ async function chooseConfiguredModel(
   let candidates = selected.models;
   if (selected.backend === "pi") {
     try {
-      const liveCatalog = await acpCatalog("pi");
+      const liveCatalog = await withSetupProgress(ctx, `${role}: loading Pi ACP models`, () => acpCatalog("pi"));
       candidates = candidates.filter((candidate) => liveCatalog.includes(candidate));
       if (candidates.length === 0) candidates = liveCatalog;
     } catch (error) {
@@ -233,7 +252,7 @@ async function chooseConfiguredModel(
     }
   }
   if (candidates.length === 0 && selected.backend !== "pi") {
-    try { candidates = await acpCatalog(selected.backend); }
+    try { candidates = await withSetupProgress(ctx, `${role}: loading ${selected.backend} ACP models`, () => acpCatalog(selected.backend)); }
     catch (error) {
       notify(ctx, `Isolated ${selected.backend} ACP model discovery failed: ${error instanceof Error ? error.message : String(error)}. Enter an exact model ID manually; ACP still verifies it at start.`, "warning");
     }
@@ -248,6 +267,17 @@ async function chooseConfiguredModel(
   }
   if (!model?.trim()) return undefined;
   return normalizeSelectedModel(selected.backend as AcpBackend, model);
+}
+
+async function chooseRoleEffort(
+  ctx: ExtensionCommandContext, role: "Executor" | "Reviewer", model: string,
+  discover: () => Promise<ReasoningEffort[]>,
+): Promise<ReasoningEffort | "default" | undefined> {
+  const efforts = await withSetupProgress(ctx, `${role}: loading reasoning levels for ${model}`, discover);
+  const choices = (["low", "medium", "high", "max"] as const).filter((effort) => efforts.includes(effort));
+  const chosen = await ctx.ui.select(`${role}: reasoning effort for ${model}`, [...choices, "backend default", "Cancel"]);
+  if (!chosen || chosen === "Cancel") return undefined;
+  return chosen === "backend default" ? "default" : selectStageBReasoningEffort(chosen);
 }
 
 export async function runSetupWizard(
@@ -268,7 +298,7 @@ export async function runSetupWizard(
     "Catalog discovery mounts no project files and submits no model turn. Selecting a backend without completed live tests will require a separate billable connectivity confirmation.",
   );
   if (!preConsent) return undefined;
-  const detected = typeof clis === "function" ? await clis() : clis;
+  const detected = typeof clis === "function" ? await withSetupProgress(ctx, "Detecting local Agent CLIs", clis) : clis;
   if (detected.length === 0) throw new Error("No working Claude, Codex, OpenCode or Pi CLI was found on PATH. Install and authenticate a supported Agent CLI before setup.");
   notify(
     ctx,
@@ -281,10 +311,25 @@ export async function runSetupWizard(
     if (!pending) { pending = discoverModels(ctx.cwd, backend); catalogs.set(backend, pending); }
     return pending;
   };
+  const efforts = new Map<string, Promise<ReasoningEffort[]>>();
+  const effortCatalog = (model: string) => {
+    let pending = efforts.get(model);
+    if (!pending) {
+      pending = discoverEfforts(ctx.cwd, supportedBackendForModel(model), model);
+      efforts.set(model, pending);
+    }
+    return pending;
+  };
   const executorModel = await chooseConfiguredModel(ctx, "Executor", detected, catalog);
   if (!executorModel) return undefined;
+  const executorChoice = await chooseRoleEffort(ctx, "Executor", executorModel, () => effortCatalog(executorModel));
+  if (!executorChoice) return undefined;
   const reviewerModel = await chooseConfiguredModel(ctx, "Reviewer", detected, catalog);
   if (!reviewerModel) return undefined;
+  const reviewerChoice = await chooseRoleEffort(ctx, "Reviewer", reviewerModel, () => effortCatalog(reviewerModel));
+  if (!reviewerChoice) return undefined;
+  const executorReasoningEffort = executorChoice === "default" ? undefined : executorChoice;
+  const reviewerReasoningEffort = reviewerChoice === "default" ? undefined : reviewerChoice;
   if ([executorModel, reviewerModel].some((model) => model.startsWith("claude/"))) {
     const claudeSandbox = await inspectClaudeSandbox(ctx.cwd);
     if (claudeSandbox.enabled && !claudeSandbox.socat) {
@@ -303,15 +348,6 @@ export async function runSetupWizard(
       "info",
     );
   }
-  const executorEffortsPromise = discoverEfforts(ctx.cwd, supportedBackendForModel(executorModel), executorModel);
-  const reviewerEffortsPromise = executorModel === reviewerModel ? executorEffortsPromise
-    : discoverEfforts(ctx.cwd, supportedBackendForModel(reviewerModel), reviewerModel);
-  const [executorEfforts, reviewerEfforts] = await Promise.all([executorEffortsPromise, reviewerEffortsPromise]);
-  const available = (["low", "medium", "high", "max"] as const).filter((effort) => executorEfforts.includes(effort) && reviewerEfforts.includes(effort));
-  const effortChoice = await ctx.ui.select("Reasoning effort (shared by both selected models)", [...available, "backend default", "Cancel"]);
-  if (!effortChoice || effortChoice === "Cancel") return undefined;
-  const reasoningEffort = effortChoice === "backend default" ? undefined : selectStageBReasoningEffort(effortChoice);
-
   notify(ctx,
     "Review loop limit controls the maximum Executor → Reviewer cycles allowed for each phase. " +
     "The remaining round budget is injected into both agents every round so they can converge instead of drip-feeding work or findings. " +
@@ -334,7 +370,8 @@ export async function runSetupWizard(
   if (!permissionChoice || permissionChoice === "Cancel") return undefined;
   const permissionMode: AgentPermissionMode = permissionChoice === askLabel ? "ask" : "autonomous";
 
-  const needsLiveCheck = [...new Set([executorModel, reviewerModel])];
+  const selectedChecks = [[executorModel, executorReasoningEffort], [reviewerModel, reviewerReasoningEffort]] as const;
+  const needsLiveCheck = [...new Set(selectedChecks.map(([route, effort]) => `${route} (${effort ?? "backend default"})`))];
   if (needsLiveCheck.length) {
     const allowCalls = await ctx.ui.confirm(
       "Run live Agent CLI connectivity checks?",
@@ -342,11 +379,14 @@ export async function runSetupWizard(
       "This uses your normal CLI/provider configuration and may incur provider charges. A failed check stops setup; the plugin never substitutes another model. No project files are mounted.",
     );
     if (!allowCalls) return undefined;
-    for (const route of needsLiveCheck) await verifyConnectivity(ctx.cwd, route, reasoningEffort);
+    for (const [route, effort] of selectedChecks.filter(([model, level], index) =>
+      selectedChecks.findIndex(([otherModel, otherLevel]) => model === otherModel && level === otherLevel) === index)) {
+      await withSetupProgress(ctx, `Checking ${route} (${effort ?? "backend default"})`, () => verifyConnectivity(ctx.cwd, route, effort));
+    }
   }
   const consent = await ctx.ui.confirm(
     "Confirm normal Agent CLI network access?",
-    `Executor: ${executorModel}\nReviewer: ${reviewerModel}\nReasoning: ${reasoningEffort ?? "backend default"}\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\n\n` +
+    `Executor: ${executorModel} (${executorReasoningEffort ?? "backend default"})\nReviewer: ${reviewerModel} (${reviewerReasoningEffort ?? "backend default"})\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\n\n` +
     "The selected Agent CLIs and their tools keep normal network access, matching a normal standalone CLI session. " +
     "The plugin still isolates the dedicated worktree and unrelated host files; this confirmation does not approve or start execution.",
   );
@@ -354,7 +394,8 @@ export async function runSetupWizard(
   return saveProjectPluginProfile(ctx.cwd, {
     executorModel,
     reviewerModel,
-    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(executorReasoningEffort ? { executorReasoningEffort } : {}),
+    ...(reviewerReasoningEffort ? { reviewerReasoningEffort } : {}),
     permissionMode,
     reviewRoundLimit,
   }, agentDir);
@@ -375,7 +416,7 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     );
     const saved = await runSetupWizard(ctx, discoverAcpClis);
     notify(ctx, saved
-      ? `Project configured: ${saved.executorModel} → ${saved.reviewerModel}; reasoning ${saved.reasoningEffort ?? "backend default"}; review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
+      ? `Project configured: Executor ${saved.executorModel} (${saved.executorReasoningEffort ?? saved.reasoningEffort ?? "backend default"}) → Reviewer ${saved.reviewerModel} (${saved.reviewerReasoningEffort ?? saved.reasoningEffort ?? "backend default"}); review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
       : "Setup cancelled; no model selection or network consent was saved.", saved ? "info" : "warning");
     if (saved) {
       try {
@@ -393,7 +434,7 @@ async function commandConfig(ctx: ExtensionCommandContext): Promise<void> {
   try {
     const profile = await loadProjectPluginProfile(ctx.cwd);
     notify(ctx, profile
-      ? `Executor: ${profile.executorModel}\nReviewer: ${profile.reviewerModel}\nReasoning: ${profile.reasoningEffort ?? "backend default"}\nReview loop limit: ${profile.reviewRoundLimit}\nPermissions: ${profile.permissionMode}\nNetwork consent: ${profile.networkRiskApprovedAt}`
+      ? `Executor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReview loop limit: ${profile.reviewRoundLimit}\nPermissions: ${profile.permissionMode}\nNetwork consent: ${profile.networkRiskApprovedAt}`
       : "No project configuration. Use /plan-execute setup.", profile ? "info" : "warning");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
@@ -442,6 +483,8 @@ export function frozenProfileMatches(
   return state.executor_model === profile.executorModel &&
     state.reviewer_model === profile.reviewerModel &&
     state.reasoning_effort === profile.reasoningEffort &&
+    state.executor_reasoning_effort === profile.executorReasoningEffort &&
+    state.reviewer_reasoning_effort === profile.reviewerReasoningEffort &&
     state.permission_mode === profile.permissionMode &&
     state.review_round_limit === profile.reviewRoundLimit &&
     (!executorOverride || executorOverride === profile.executorModel) &&
@@ -769,6 +812,8 @@ async function startStageB(
   let executorModel: string;
   let reviewerModel: string;
   let configuredReasoningEffort: ReasoningEffort | undefined;
+  let configuredExecutorEffort: ReasoningEffort | undefined;
+  let configuredReviewerEffort: ReasoningEffort | undefined;
   let configuredPermissionMode: AgentPermissionMode;
   let configuredReviewRoundLimit: number;
   if (profile) {
@@ -778,6 +823,8 @@ async function startStageB(
     executorModel = profile.executorModel;
     reviewerModel = profile.reviewerModel;
     configuredReasoningEffort = profile.reasoningEffort;
+    configuredExecutorEffort = profile.executorReasoningEffort;
+    configuredReviewerEffort = profile.reviewerReasoningEffort;
     configuredPermissionMode = profile.permissionMode;
     configuredReviewRoundLimit = profile.reviewRoundLimit;
   } else {
@@ -795,6 +842,11 @@ async function startStageB(
     reviewerModel = envReviewer;
     try {
       configuredReasoningEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_REASONING_EFFORT);
+      configuredExecutorEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT);
+      configuredReviewerEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT);
+      if (configuredReasoningEffort && (configuredExecutorEffort || configuredReviewerEffort)) {
+        throw new Error("Headless reasoning effort must use either the legacy shared variable or the per-role variables, not both.");
+      }
       const permissionMode = process.env.PI_PLAN_EXECUTE_PERMISSION_MODE ?? "autonomous";
       if (permissionMode !== "autonomous" && permissionMode !== "ask") {
         throw new Error("PI_PLAN_EXECUTE_PERMISSION_MODE must be autonomous or ask.");
@@ -811,6 +863,8 @@ async function startStageB(
     }
     if (
       state.reasoning_effort !== configuredReasoningEffort ||
+      state.executor_reasoning_effort !== configuredExecutorEffort ||
+      state.reviewer_reasoning_effort !== configuredReviewerEffort ||
       state.permission_mode !== configuredPermissionMode ||
       state.review_round_limit !== configuredReviewRoundLimit
     ) {
@@ -827,6 +881,8 @@ async function startStageB(
   state.executor_model = executorModel;
   state.reviewer_model = reviewerModel;
   if (configuredReasoningEffort) state.reasoning_effort = configuredReasoningEffort;
+  if (configuredExecutorEffort) state.executor_reasoning_effort = configuredExecutorEffort;
+  if (configuredReviewerEffort) state.reviewer_reasoning_effort = configuredReviewerEffort;
   state.permission_mode = configuredPermissionMode;
   state.review_round_limit = configuredReviewRoundLimit;
 
@@ -876,6 +932,8 @@ async function startStageB(
       executorModel,
       reviewerModel,
       ...(configuredReasoningEffort ? { reasoningEffort: configuredReasoningEffort } : {}),
+      ...(configuredExecutorEffort ? { executorReasoningEffort: configuredExecutorEffort } : {}),
+      ...(configuredReviewerEffort ? { reviewerReasoningEffort: configuredReviewerEffort } : {}),
       ...(profile ? { networkRiskApproved: true } : {}),
       ...(executorModel.startsWith("codex/")
         ? { executorMode: "agent" }
@@ -990,6 +1048,8 @@ export async function approvedSetup(
   executorModel: string;
   reviewerModel: string;
   reasoningEffort?: ReasoningEffort;
+  executorReasoningEffort?: ReasoningEffort;
+  reviewerReasoningEffort?: ReasoningEffort;
   permissionMode: AgentPermissionMode;
   reviewRoundLimit: number;
   profile?: ProjectPluginProfile;
@@ -1004,6 +1064,8 @@ export async function approvedSetup(
       executorModel: profile.executorModel,
       reviewerModel: profile.reviewerModel,
       ...(profile.reasoningEffort ? { reasoningEffort: profile.reasoningEffort } : {}),
+      ...(profile.executorReasoningEffort ? { executorReasoningEffort: profile.executorReasoningEffort } : {}),
+      ...(profile.reviewerReasoningEffort ? { reviewerReasoningEffort: profile.reviewerReasoningEffort } : {}),
       permissionMode: profile.permissionMode,
       reviewRoundLimit: profile.reviewRoundLimit,
       profile,
@@ -1020,6 +1082,11 @@ export async function approvedSetup(
   supportedBackendForModel(reviewerModel);
   requireAcpNetworkRiskAcknowledgement();
   const reasoningEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_REASONING_EFFORT);
+  const executorReasoningEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT);
+  const reviewerReasoningEffort = selectStageBReasoningEffort(process.env.PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT);
+  if (reasoningEffort && (executorReasoningEffort || reviewerReasoningEffort)) {
+    throw new Error("Headless reasoning effort must use either the legacy shared variable or the per-role variables, not both.");
+  }
   const permissionMode = process.env.PI_PLAN_EXECUTE_PERMISSION_MODE ?? "autonomous";
   if (permissionMode !== "autonomous" && permissionMode !== "ask") {
     throw new Error("PI_PLAN_EXECUTE_PERMISSION_MODE must be autonomous or ask.");
@@ -1032,6 +1099,8 @@ export async function approvedSetup(
     executorModel,
     reviewerModel,
     ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(executorReasoningEffort ? { executorReasoningEffort } : {}),
+    ...(reviewerReasoningEffort ? { reviewerReasoningEffort } : {}),
     permissionMode,
     reviewRoundLimit,
   };
@@ -1068,6 +1137,8 @@ async function handleFinalize(
       executorModel: selection.executorModel,
       reviewerModel: selection.reviewerModel,
       ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+      ...(selection.executorReasoningEffort ? { executorReasoningEffort: selection.executorReasoningEffort } : {}),
+      ...(selection.reviewerReasoningEffort ? { reviewerReasoningEffort: selection.reviewerReasoningEffort } : {}),
       permissionMode: selection.permissionMode,
       reviewRoundLimit: selection.reviewRoundLimit,
     });
@@ -1124,7 +1195,7 @@ async function commandApprove(
       return;
     }
     const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
-    const review = `${await packageReviewText(loaded.package)}\n\nExecutor: ${selection.executorModel}\nReviewer: ${selection.reviewerModel}\nReasoning: ${selection.reasoningEffort ?? "backend default"}\nReview loop limit: ${selection.reviewRoundLimit}\nPermissions: ${selection.permissionMode}`;
+    const review = `${await packageReviewText(loaded.package)}\n\nExecutor: ${selection.executorModel} (${selection.executorReasoningEffort ?? selection.reasoningEffort ?? "backend default"})\nReviewer: ${selection.reviewerModel} (${selection.reviewerReasoningEffort ?? selection.reasoningEffort ?? "backend default"})\nReview loop limit: ${selection.reviewRoundLimit}\nPermissions: ${selection.permissionMode}`;
     const ok = !ctx.hasUI || await ctx.ui.confirm("Freeze Golden Document Package", review);
     if (!ok) {
       notify(ctx, "Approval cancelled; package remains unfrozen.", "info");
@@ -1135,6 +1206,8 @@ async function commandApprove(
       executorModel: selection.executorModel,
       reviewerModel: selection.reviewerModel,
       ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+      ...(selection.executorReasoningEffort ? { executorReasoningEffort: selection.executorReasoningEffort } : {}),
+      ...(selection.reviewerReasoningEffort ? { reviewerReasoningEffort: selection.reviewerReasoningEffort } : {}),
       permissionMode: selection.permissionMode,
       reviewRoundLimit: selection.reviewRoundLimit,
     });

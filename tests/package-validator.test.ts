@@ -214,6 +214,24 @@ test("low, medium and max ACP effort survive freeze and state reload without sil
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
+test("per-role efforts remain bound to the frozen run after persistence", async () => {
+  const cwd = await tempDir();
+  try {
+    const written = await writeValidatedPackage(cwd, validInput(), "role-efforts");
+    await writeWorkflowState(written.package.root, createDraftState(written.package, "role-efforts"));
+    const frozen = await freezeRun(written.package, "role-efforts", {
+      reviewedPackageHash: written.package.package_hash,
+      executorReasoningEffort: "medium", reviewerReasoningEffort: "high",
+    });
+    assert.equal(frozen.executor_reasoning_effort, "medium");
+    assert.equal(frozen.reviewer_reasoning_effort, "high");
+    assert.equal(frozen.reasoning_effort, undefined);
+    const persisted = await readWorkflowState(written.package.root);
+    assert.equal(persisted?.executor_reasoning_effort, "medium");
+    assert.equal(persisted?.reviewer_reasoning_effort, "high");
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
 test("runtime state and reports do not change the Golden Docs hash", async () => {
   const cwd = await tempDir();
   try {
