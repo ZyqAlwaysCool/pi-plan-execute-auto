@@ -21,6 +21,7 @@ import {
 } from "./reports.js";
 import { defaultIsolationProvider } from "./isolation-provider.js";
 import type { SandboxedBackend } from "./sandbox.js";
+import { appendRunEvent } from "./run-log.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -88,13 +89,17 @@ function invalidStructuredTurn(role: "executor" | "reviewer", turn: AcpAgentTurn
   return new Error(`${role} ACP turn did not yield a structured report (stop=${turn.stopReason}, attempts=${turn.structuredAttempts ?? 0}, text_bytes=${Buffer.byteLength(turn.text)}, structured_error=${turn.structuredError?.slice(0, 300) ?? "none"}).`);
 }
 
-function selectedPermission(request: RequestPermissionRequest, allow: boolean): ReturnType<typeof selectPermissionOption> {
-  const wanted = allow
+function selectedPermissionOptionId(request: RequestPermissionRequest, allow: boolean): string | undefined {
+  return (allow
     ? request.options.find((option) => option.kind === "allow_once")
       ?? request.options.find((option) => option.kind === "allow_always")
     : request.options.find((option) => option.kind === "reject_once")
-      ?? request.options.find((option) => option.kind === "reject_always");
-  return wanted ? selectPermissionOption(request, wanted.optionId) : { outcome: { outcome: "cancelled" } };
+      ?? request.options.find((option) => option.kind === "reject_always"))?.optionId;
+}
+
+function selectedPermission(request: RequestPermissionRequest, allow: boolean): ReturnType<typeof selectPermissionOption> {
+  const optionId = selectedPermissionOptionId(request, allow);
+  return optionId ? selectPermissionOption(request, optionId) : { outcome: { outcome: "cancelled" } };
 }
 
 function reviewerPermission(request: RequestPermissionRequest): ReturnType<typeof selectPermissionOption> {
@@ -152,6 +157,8 @@ export interface AgentPrismSessionPairOptions {
   /** Verified user-owned project profile consent; headless runs may use the explicit env fallback. */
   networkRiskApproved?: boolean;
   permissionMode?: AgentPermissionMode;
+  /** Run root for local diagnostic transcripts; no provider credential material is intentionally recorded. */
+  runRoot?: string;
   onPermissionChoice?: (
     role: "executor" | "reviewer",
     request: RequestPermissionRequest,
@@ -175,12 +182,20 @@ export class AgentPrismSessionPair implements HarnessPair {
     this.options = options;
   }
 
+  private async audit(type: string, details: Record<string, unknown>): Promise<void> {
+    if (!this.options.runRoot) return;
+    await appendRunEvent(this.options.runRoot, type, details).catch(() => undefined);
+  }
+
   private async closeExecutorSession(): Promise<void> {
     const agent = this.executor;
     const sandbox = this.executorSandbox;
     this.executor = undefined;
     this.executorSandbox = undefined;
     this.executorBaseCommit = undefined;
+    if (agent) await this.audit("agent_session_closed", {
+      role: "executor", session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+    });
     try {
       await agent?.close({ keep: true });
     } finally {
@@ -190,10 +205,20 @@ export class AgentPrismSessionPair implements HarnessPair {
 
   private permissionResolver(role: "executor" | "reviewer") {
     return async (request: RequestPermissionRequest) => {
+      const tool = request.toolCall.title ?? request.toolCall.name ?? request.toolCall.toolCallId;
       if ((this.options.permissionMode ?? "autonomous") === "autonomous") {
+        const optionId = selectedPermissionOptionId(request, true);
+        await this.audit("agent_permission", {
+          role, mode: "autonomous", tool, selected_option_id: optionId ?? null,
+          options: request.options.map((option) => ({ option_id: option.optionId, name: option.name, kind: option.kind })),
+        });
         return role === "executor" ? executorPermission(request) : reviewerPermission(request);
       }
       const optionId = await this.options.onPermissionChoice?.(role, request);
+      await this.audit("agent_permission", {
+        role, mode: "ask", tool, selected_option_id: optionId ?? null,
+        options: request.options.map((option) => ({ option_id: option.optionId, name: option.name, kind: option.kind })),
+      });
       return optionId ? selectPermissionOption(request, optionId) : { outcome: { outcome: "cancelled" as const } };
     };
   }
@@ -236,6 +261,10 @@ export class AgentPrismSessionPair implements HarnessPair {
           throw new Error(`Executor backend ${agent.backendId} did not enter the required ${this.options.executorMode} mode.`);
         }
         await sandbox.scrubCredentials();
+        await this.audit("agent_session_started", {
+          role: "executor", session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+          phase_base_commit: phaseBaseCommit,
+        });
         this.executor = agent;
         this.executorSandbox = sandbox;
         this.executorBaseCommit = phaseBaseCommit;
@@ -254,8 +283,13 @@ export class AgentPrismSessionPair implements HarnessPair {
     prompt: string,
     options?: { signal?: AbortSignal },
   ): Promise<AcpAgentTurn> {
+    await this.audit("agent_prompt", {
+      role, session_id: agent.sessionId, backend: agent.backendId, model: agent.model, prompt,
+    });
     let turn: AcpAgentTurn | undefined;
+    const eventCounts: Record<string, number> = {};
     for await (const event of agent.stream(prompt, options)) {
+      eventCounts[event.type] = (eventCounts[event.type] ?? 0) + 1;
       try {
         this.options.onLiveEvent?.(role, event.type);
       } catch {
@@ -264,6 +298,18 @@ export class AgentPrismSessionPair implements HarnessPair {
       if (event.type === "turn") turn = event.turn;
     }
     if (!turn) throw new Error(`${role} ACP stream ended without a terminal turn.`);
+    await this.audit("agent_turn", {
+      role,
+      session_id: agent.sessionId,
+      backend: agent.backendId,
+      model: agent.model,
+      stop_reason: turn.stopReason,
+      structured_attempts: turn.structuredAttempts,
+      structured_error: turn.structuredError,
+      event_counts: eventCounts,
+      text: turn.text,
+      structured: turn.structured,
+    });
     return turn;
   }
 
@@ -350,6 +396,9 @@ export class AgentPrismSessionPair implements HarnessPair {
         throw new Error(`Reviewer backend ${reviewer.backendId} did not enter the configured ${reviewerMode} mode.`);
       }
       await sandbox.scrubCredentials();
+      await this.audit("agent_session_started", {
+        role: "reviewer", session_id: reviewer.sessionId, backend: reviewer.backendId, model: reviewer.model,
+      });
       const turn = await this.streamPrompt(reviewer, "reviewer", prompt, options);
       const value = parseTurn(turn);
       if (value === undefined) throw invalidStructuredTurn("reviewer", turn);
@@ -362,6 +411,9 @@ export class AgentPrismSessionPair implements HarnessPair {
       return value as ReviewReport;
     } finally {
       this.reviewer = undefined;
+      if (reviewer) await this.audit("agent_session_closed", {
+        role: "reviewer", session_id: reviewer.sessionId, backend: reviewer.backendId, model: reviewer.model,
+      });
       try {
         await reviewer?.close({ keep: true });
       } finally {

@@ -204,6 +204,8 @@ export interface WorkflowState {
   package_dir: string;
   status: WorkflowStatus;
   created_at: string;
+  /** Human-visible draft revision number; starts at 1 and increments on every accepted plan rewrite. */
+  plan_revision?: number;
   approved_at?: string;
   started_at?: string;
   completed_at?: string;

@@ -15,6 +15,7 @@ import {
   PackageInputError,
   PackageValidationError,
   readWorkflowState,
+  replaceValidatedDraftPackage,
   validatePackageDirectory,
   writeValidatedPackage,
   writeWorkflowState,
@@ -55,6 +56,7 @@ import {
 import { defaultIsolationProvider } from "../src/isolation-provider.js";
 import { supportedBackendForModel } from "../src/sandbox.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
+import { appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 import { StageBController } from "../src/stage-b.js";
 import { DEFAULT_MAX_REVIEW_ROUNDS } from "../src/types.js";
 import type {
@@ -70,7 +72,6 @@ import type {
 const execFile = promisify(execFileCallback);
 const WIDGET_KEY = "pi-plan-execute-auto";
 const STATE_ENTRY = "plan-execute-state";
-const ESCALATION_MESSAGE = "plan-execute-escalation";
 const DEFAULT_STAGE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120 * 1000;
 const REVIEW_ROUND_CHOICES = [3, 5, 8, 12, 20] as const;
@@ -83,10 +84,10 @@ function validateControlledEnvironmentPaths(state: WorkflowState): void {
 }
 
 const FINALIZE_PROMPT = [
-  "The user explicitly invoked /plan-execute finalize.",
+  "The user explicitly invoked /plan-execute.",
   "Use the complete current conversation and repository investigation context to call plan_execute_finalize.",
   "Create a Golden Document Package with at least one ordered phase. Every phase needs its own spec, acceptance YAML contract, and required completion commit.",
-  "Do not implement code or approve/freeze the package on the user's behalf. The plugin will validate the package and ask the human for approval.",
+  "Do not implement code or approve/freeze the package on the user's behalf. The plugin will validate the draft, let the human request revisions repeatedly, and ask for approval.",
   "Do not supply executor_model or reviewer_model: only the human's /plan-execute setup selection owns the ACP routing.",
 ].join("\n");
 
@@ -131,6 +132,15 @@ const FINALIZE_SCHEMA = Type.Object({
 
 type FinalizeParams = Static<typeof FINALIZE_SCHEMA>;
 
+const REVISE_SCHEMA = Type.Object({
+  run_id: Type.String({ minLength: 1, maxLength: 64 }),
+  previous_package_hash: Type.String({ minLength: 64, maxLength: 64 }),
+  manifest: MANIFEST_SCHEMA,
+  files: Type.Array(FILE_SCHEMA),
+});
+
+type ReviseParams = Static<typeof REVISE_SCHEMA>;
+
 interface ActiveRun {
   controller: AbortController;
   startedAt: string;
@@ -160,9 +170,7 @@ function stateLines(state: WorkflowState): string[] {
     `Execution & Review · ${state.status}`,
     `Run ${state.run_id} · ${completed}/${state.phases.length} phases`,
     current ? `Current ${current.phase_id} · round ${current.review_rounds}` : "All phases complete",
-    ...(state.branch_name ? [`Branch ${state.branch_name}`] : []),
-    ...(state.worktree_path ? [`Worktree ${state.worktree_path}`] : []),
-    ...(state.pause_reason ? [state.pause_reason] : []),
+    ...(state.status === "paused" ? ["Needs attention · details saved in the run .runtime directory"] : []),
   ];
 }
 
@@ -175,11 +183,14 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
   if (ctx.hasUI) ctx.ui.notify(message, type);
 }
 
-async function packageReviewText(pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"]): Promise<string> {
+async function packageReviewText(
+  pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
+  revision?: number,
+): Promise<string> {
   const chunks = [
-    "# Frozen Golden Document Package Review",
-    `Root: ${pkg.root}`,
-    `Golden hash: ${pkg.package_hash}`,
+    "# Draft Plan Review",
+    ...(revision ? [`Revision: ${revision}`] : []),
+    `Golden hash candidate: ${pkg.package_hash}`,
     "",
     "## Manifest",
     JSON.stringify(pkg.manifest, null, 2),
@@ -196,21 +207,140 @@ export function approvalStartsStageB(approval: "approve-start" | "cancel" | "pen
   return approval === "approve-start";
 }
 
+type ApprovalDecision =
+  | { kind: "approve-start" }
+  | { kind: "cancel" }
+  | { kind: "pending" }
+  | { kind: "request-changes"; feedback: string };
+
 async function chooseApproval(
   ctx: ExtensionContext,
   pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
   profile?: ProjectPluginProfile,
-): Promise<"approve-start" | "cancel" | "pending"> {
-  if (!ctx.hasUI) return "pending";
-  const summary = `${formatPackageSummary(pkg)}${profile ? `\nExecutor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReview loop limit: ${profile.reviewRoundLimit} round(s) per phase\nAgent permissions: ${profile.permissionMode === "autonomous" ? "Autonomous" : "Ask me"}\nAgent/tool network: normal CLI access` : ""}`;
+  revision?: number,
+  readiness?: () => Promise<void>,
+): Promise<ApprovalDecision> {
+  if (!ctx.hasUI) return { kind: "pending" };
   for (;;) {
-    const choice = await ctx.ui.select("Plan Review & Approval", ["Review Plan Package", "Approve & Start", "Cancel"]);
-    if (choice === "Approve & Start") return "approve-start";
-    if (choice === "Cancel" || !choice) return "cancel";
-    const review = await packageReviewText(pkg);
-    await ctx.ui.editor("Review phased execution & acceptance plan (read-only)", review);
-    notify(ctx, summary, "info");
+    const choice = await ctx.ui.select("Plan Review & Approval", ["Review Plan", "Request Changes", "Approve & Start", "Cancel"]);
+    if (choice === "Cancel" || !choice) return { kind: "cancel" };
+    if (choice === "Review Plan") {
+      const review = await packageReviewText(pkg, revision);
+      await ctx.ui.confirm(
+        "Draft plan preview",
+        `${review}\n\nExecutor: ${profile?.executorModel ?? "headless"} (${profile?.executorReasoningEffort ?? profile?.reasoningEffort ?? "backend default"})\nReviewer: ${profile?.reviewerModel ?? "headless"} (${profile?.reviewerReasoningEffort ?? profile?.reasoningEffort ?? "backend default"})\nReview limit: ${profile?.reviewRoundLimit ?? pkg.manifest.max_review_rounds ?? DEFAULT_MAX_REVIEW_ROUNDS} round(s) per phase`,
+      );
+      continue;
+    }
+    if (choice === "Request Changes") {
+      const feedback = (await ctx.ui.editor(
+        "Describe the plan changes for Main Pi",
+        "Describe what should be added, removed, clarified, reordered, or changed in acceptance. Submit to ask Main Pi to regenerate the complete draft plan.",
+      ))?.trim();
+      if (feedback) return { kind: "request-changes", feedback };
+      continue;
+    }
+    try {
+      await readiness?.();
+      return { kind: "approve-start" };
+    } catch (error) {
+      notify(ctx, `Execution is not ready yet: ${error instanceof Error ? error.message : String(error)}\nFix the prerequisite, then choose Approve & Start again. The plan is still an editable draft.`, "warning");
+    }
   }
+}
+
+
+async function captureCurrentMainPiSession(ctx: ExtensionContext, runRoot: string): Promise<void> {
+  try {
+    await captureMainPiSession(runRoot, ctx.sessionManager.getBranch());
+  } catch (error) {
+    await appendRunEvent(runRoot, "main_pi_session_capture_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined);
+  }
+}
+
+async function executionReadinessPreflight(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runId: string,
+  executorModel: string,
+  reviewerModel: string,
+): Promise<void> {
+  supportedBackendForModel(executorModel);
+  supportedBackendForModel(reviewerModel);
+  await defaultIsolationProvider.preflight();
+
+  const source = new GitWorkspace(createPiGitOperations(pi, ctx.cwd), {
+    cwd: ctx.cwd,
+    runtimeRoot: `.pi-plan-execute-auto/${runId}`,
+  });
+  try {
+    await source.head();
+  } catch {
+    throw new Error("Git has no usable baseline commit. Create the baseline commit before starting execution.");
+  }
+  try {
+    await source.assertNoCachedChanges();
+  } catch {
+    throw new Error("The main worktree has staged changes. Commit or unstage them before starting; the execution worktree is created from HEAD.");
+  }
+  const dirty = await source.changedPaths();
+  if (dirty.length > 0) {
+    throw new Error(
+      `The main worktree has uncommitted changes: ${dirty.join(", ")}. Commit, discard, or intentionally ignore them before starting; the execution worktree is created from HEAD.`,
+    );
+  }
+  const targetPath = resolve(dirname(ctx.cwd), ".pi-plan-execute-auto-worktrees", runId);
+  try {
+    await access(targetPath);
+    throw new Error(`The dedicated execution worktree path already exists: ${targetPath}. Remove the stale path or use a new run id.`);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("The dedicated execution worktree path already exists:")) throw error;
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  await appendRunEvent(packageRoot(ctx.cwd, runId), "start_preflight_pass", {
+    executor_model: executorModel,
+    reviewer_model: reviewerModel,
+  }).catch(() => undefined);
+}
+
+async function requestPlanRevision(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
+  feedback: string,
+): Promise<void> {
+  await appendRunEvent(pkg.root, "plan_revision_requested", {
+    package_hash: pkg.package_hash,
+    feedback,
+  });
+  await captureCurrentMainPiSession(ctx, pkg.root);
+  const prompt = [
+    "The human requested changes to the draft plan. Do not implement project code.",
+    `Run id: ${basenameForPrompt(pkg.root)}`,
+    `Current package hash: ${pkg.package_hash}`,
+    "Use the complete current conversation, repository context, existing draft package, and the human feedback below.",
+    "Regenerate the COMPLETE replacement manifest and all draft plan files, then call plan_execute_revise with the same run_id and previous_package_hash.",
+    "After revision the plugin will validate the full package and reopen human Review & Approval.",
+    "",
+    "Human revision request:",
+    feedback,
+  ].join("\n");
+  await pi.sendMessage(
+    {
+      customType: "plan-execute-revision-request",
+      content: prompt,
+      display: false,
+      details: { run_id: basenameForPrompt(pkg.root), previous_package_hash: pkg.package_hash, feedback },
+    },
+    { deliverAs: "followUp", triggerTurn: true },
+  );
+}
+
+function basenameForPrompt(path: string): string {
+  const parts = resolve(path).split("/");
+  return parts[parts.length - 1] ?? path;
 }
 
 const SETUP_STATUS_KEY = "plan-execute-setup";
@@ -418,13 +548,6 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     notify(ctx, saved
       ? `Project configured: Executor ${saved.executorModel} (${saved.executorReasoningEffort ?? saved.reasoningEffort ?? "backend default"}) → Reviewer ${saved.reviewerModel} (${saved.reviewerReasoningEffort ?? saved.reasoningEffort ?? "backend default"}); review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
       : "Setup cancelled; no model selection or network consent was saved.", saved ? "info" : "warning");
-    if (saved) {
-      try {
-        await execFile("git", ["check-ignore", "-q", ".pi-plan-execute-auto/config.json"], { cwd: ctx.cwd, timeout: 10_000 });
-      } catch {
-        notify(ctx, "Before approving execution, ignore .pi-plan-execute-auto/ via a reviewed .gitignore commit; plugin config/runtime files must not dirty the source worktree.", "warning");
-      }
-    }
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -597,18 +720,15 @@ async function persistAndEscalatePause(
   }
   await writeWorkflowState(pkg.root, state);
   const details = escalationDetails(state, reason);
-  const summary = escalationSummary(details);
+  await appendRunEvent(pkg.root, "workflow_paused", details).catch(() => undefined);
+  await captureCurrentMainPiSession(ctx, pkg.root);
   showWidget(ctx, stateLines(state));
   pi.appendEntry(STATE_ENTRY, state);
-  pi.appendEntry(ESCALATION_MESSAGE, details);
-  try {
-    await pi.sendMessage(
-      { customType: ESCALATION_MESSAGE, content: summary, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
-  } catch (error) {
-    notify(ctx, `Execution & Review paused, but Main Pi escalation failed: ${String(error)}`, "error");
-  }
+  notify(
+    ctx,
+    `Execution & Review paused for ${state.run_id}. Details are saved under ${pkg.root}/.runtime/; inspect them when you want to diagnose the run.`,
+    "warning",
+  );
   return { status: "paused", state, reason };
 }
 
@@ -941,6 +1061,7 @@ async function startStageB(
           ? { executorMode: "build" }
           : {}),
       permissionMode: configuredPermissionMode,
+      runRoot: pkg.root,
       onPermissionChoice: async (role, request) => {
         if (!ctx.hasUI) return undefined;
         const tool = request.toolCall.title ?? request.toolCall.name ?? request.toolCall.toolCallId;
@@ -976,9 +1097,9 @@ async function startStageB(
         showWidget(ctx, [
           `Execution & Review · ${event.phase_id} · round ${event.round}`,
           `Executor ${event.executor_status} · Reviewer ${event.reviewer_status}`,
-          `Branch ${dedicated.branchName}`,
           event.message,
         ]);
+        void appendRunEvent(pkg.root, "workflow_status", event as unknown as Record<string, unknown>).catch(() => undefined);
       },
     });
     // Registry cancellation has already been relayed into the signal consumed by ACP and commands.
@@ -1001,6 +1122,17 @@ async function startStageB(
     pi.appendEntry(STATE_ENTRY, result.state);
     return result;
   } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "SOURCE_WORKTREE_DIRTY" || error.code === "WORKTREE_PATH_EXISTS") &&
+      !state.worktree_path
+    ) {
+      const reason = error.message;
+      await appendRunEvent(pkg.root, "start_blocked", { code: error.code, reason }).catch(() => undefined);
+      showWidget(ctx, stateLines(state));
+      return { status: "not_started", state, reason };
+    }
     return persistAndEscalatePause(pi, ctx, pkg, state, `[WORKTREE_SETUP] ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     activeRuns.delete(runId);
@@ -1106,12 +1238,76 @@ export async function approvedSetup(
   };
 }
 
+type DraftReviewResult =
+  | StartResult
+  | { status: "awaiting_approval"; state: WorkflowState }
+  | { status: "revision_requested"; state: WorkflowState }
+  | { status: "cancelled"; state: WorkflowState };
+
+async function reviewDraftAndStart(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
+  selection: Awaited<ReturnType<typeof approvedSetup>>,
+  explicitStartCommand = false,
+): Promise<DraftReviewResult> {
+  const current = await readWorkflowState(pkg.root);
+  if (!current || current.status !== "draft") {
+    throw new Error(`Run ${basenameForPrompt(pkg.root)} is no longer an editable draft.`);
+  }
+  const readiness = () => executionReadinessPreflight(
+    pi,
+    ctx,
+    current.run_id,
+    selection.executorModel,
+    selection.reviewerModel,
+  );
+  let decision = await chooseApproval(ctx, pkg, selection.profile, current.plan_revision ?? 1, readiness);
+  if (decision.kind === "pending" && explicitStartCommand) {
+    await readiness();
+    decision = { kind: "approve-start" };
+  }
+  if (decision.kind === "pending") return { status: "awaiting_approval", state: current };
+  if (decision.kind === "cancel") {
+    const cancelled = await cancelRun(pkg, current.run_id);
+    await appendRunEvent(pkg.root, "plan_cancelled", { plan_revision: current.plan_revision ?? 1 }).catch(() => undefined);
+    return { status: "cancelled", state: cancelled };
+  }
+  if (decision.kind === "request-changes") {
+    await requestPlanRevision(pi, ctx, pkg, decision.feedback);
+    return { status: "revision_requested", state: current };
+  }
+
+  const frozen = await freezeRun(pkg, current.run_id, {
+    reviewedPackageHash: pkg.package_hash,
+    executorModel: selection.executorModel,
+    reviewerModel: selection.reviewerModel,
+    ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+    ...(selection.executorReasoningEffort ? { executorReasoningEffort: selection.executorReasoningEffort } : {}),
+    ...(selection.reviewerReasoningEffort ? { reviewerReasoningEffort: selection.reviewerReasoningEffort } : {}),
+    permissionMode: selection.permissionMode,
+    reviewRoundLimit: selection.reviewRoundLimit,
+  });
+  await appendRunEvent(pkg.root, "plan_approved", {
+    package_hash: pkg.package_hash,
+    plan_revision: frozen.plan_revision ?? current.plan_revision ?? 1,
+    executor_model: selection.executorModel,
+    reviewer_model: selection.reviewerModel,
+    review_round_limit: selection.reviewRoundLimit,
+    permission_mode: selection.permissionMode,
+  }).catch(() => undefined);
+  await captureCurrentMainPiSession(ctx, pkg.root);
+  showWidget(ctx, stateLines(frozen));
+  pi.appendEntry(STATE_ENTRY, frozen);
+  return startStageB(pi, ctx, current.run_id, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
+}
+
 async function handleFinalize(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   params: FinalizeParams,
 ): Promise<ReturnType<typeof textResult>> {
-  if (params.approval === "cancel") return textResult("Finalization cancelled before writing a package.", { status: "cancelled" });
+  if (params.approval === "cancel") return textResult("Plan finalization cancelled.", { status: "cancelled" });
   try {
     const selection = await approvedSetup(ctx.cwd, ctx.hasUI, params);
     const input = packageInput(params, selection.reviewRoundLimit);
@@ -1119,39 +1315,97 @@ async function handleFinalize(
     const written = await writeValidatedPackage(ctx.cwd, input, runId);
     const draft = createDraftState(written.package, runId);
     await writeWorkflowState(written.package.root, draft);
-    showWidget(ctx, ["Plan Review & Approval", "✓ Documents written", "✓ Manifest valid", `✓ ${written.package.phases.length} phases found`, `✓ Review limit ${selection.reviewRoundLimit} per phase`, "○ Human approval pending"]);
-    const approval = await chooseApproval(ctx, written.package, selection.profile);
-    if (approval === "pending") {
+    await appendRunEvent(written.package.root, "plan_draft_created", {
+      package_hash: written.package.package_hash,
+      plan_revision: 1,
+      phases: written.package.phases.map((phase) => phase.phase.id),
+    });
+    await captureCurrentMainPiSession(ctx, written.package.root);
+    showWidget(ctx, ["Plan Review & Approval", `Run ${runId} · revision 1`, `${written.package.phases.length} phases · ready for review`]);
+
+    const result = await reviewDraftAndStart(pi, ctx, written.package, selection);
+    if (result.status === "awaiting_approval") {
       return textResult(
-        `${formatPackageSummary(written.package)}\n\nHuman approval is required. Use the TUI approval action or /plan-execute approve ${runId} start.`,
-        { status: "awaiting_approval", run_id: runId, package_dir: written.package.root, package_hash: written.package.package_hash },
+        `Draft plan ${runId} is ready for human review. Run /plan-execute start ${runId} when you want to review/approve it.`,
+        { status: result.status, run_id: runId, package_hash: written.package.package_hash },
       );
     }
-    if (approval === "cancel") {
-      const cancelled = await cancelRun(written.package, runId);
-      showWidget(ctx, ["Plan Review & Approval", "Cancelled", `Run ${runId}`]);
-      return textResult(`Package ${runId} was cancelled; it was not frozen.`, { status: cancelled.status, run_id: runId });
+    if (result.status === "revision_requested") {
+      return textResult("Plan changes requested. Main Pi will regenerate the complete draft and reopen Review & Approval.", {
+        status: result.status, run_id: runId,
+      });
     }
-    const frozen = await freezeRun(written.package, runId, {
-      reviewedPackageHash: written.package.package_hash,
-      executorModel: selection.executorModel,
-      reviewerModel: selection.reviewerModel,
-      ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
-      ...(selection.executorReasoningEffort ? { executorReasoningEffort: selection.executorReasoningEffort } : {}),
-      ...(selection.reviewerReasoningEffort ? { reviewerReasoningEffort: selection.reviewerReasoningEffort } : {}),
-      permissionMode: selection.permissionMode,
-      reviewRoundLimit: selection.reviewRoundLimit,
-    });
-    showWidget(ctx, stateLines(frozen));
-    // The human's Approve & Start choice is the sole authority; model parameters cannot suppress it.
-    if (!approvalStartsStageB(approval)) throw new Error("Unexpected approval decision.");
-    const started = await startStageB(pi, ctx, runId, {
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
-    });
-    if (started.status === "not_started") {
-      return textResult(`Plan approved, but Execution & Review could not start: ${started.reason}`, { status: "paused", run_id: runId, state: started.state });
+    if (result.status === "cancelled") {
+      return textResult(`Plan ${runId} cancelled before approval.`, { status: result.status, run_id: runId });
     }
-    return textResult(`Plan approved. Execution & Review: ${started.status}.`, { status: started.status, run_id: runId, state: started.state });
+    if (result.status === "not_started") {
+      return textResult(
+        `Plan approved, but execution has not started: ${result.reason}\nFix the prerequisite and run /plan-execute start ${runId}.`,
+        { status: result.status, run_id: runId, state: result.state },
+      );
+    }
+    return textResult(`Execution & Review: ${result.status}.`, { status: result.status, run_id: runId, state: result.state });
+  } catch (error) {
+    const details = errorDetails(error);
+    notify(ctx, details.text, "error");
+    return textResult(details.text, details.details);
+  }
+}
+
+async function handleRevise(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: ReviseParams,
+): Promise<ReturnType<typeof textResult>> {
+  try {
+    const loaded = await loadValidatedRun(ctx.cwd, params.run_id);
+    if (loaded.state.status !== "draft") {
+      throw new Error(`Run ${params.run_id} is already ${loaded.state.status}; approved/running plans cannot be rewritten.`);
+    }
+    if (loaded.package.package_hash !== params.previous_package_hash) {
+      throw new Error("The draft changed since the human revision request; reload the latest plan before revising it.");
+    }
+    const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
+    const input = packageInput(params as unknown as FinalizeParams, selection.reviewRoundLimit);
+    const previousHash = loaded.package.package_hash;
+    const written = await replaceValidatedDraftPackage(ctx.cwd, input, params.run_id, previousHash);
+    const nextState = await readWorkflowState(written.package.root);
+    if (!nextState) throw new Error("Revised draft state could not be reloaded.");
+    await appendRunEvent(written.package.root, "plan_revised", {
+      previous_package_hash: previousHash,
+      package_hash: written.package.package_hash,
+      plan_revision: nextState.plan_revision ?? 2,
+    });
+    await captureCurrentMainPiSession(ctx, written.package.root);
+    showWidget(ctx, [
+      "Plan Review & Approval",
+      `Run ${params.run_id} · revision ${nextState.plan_revision ?? 2}`,
+      `${written.package.phases.length} phases · revision validated`,
+    ]);
+
+    const result = await reviewDraftAndStart(pi, ctx, written.package, selection);
+    if (result.status === "revision_requested") {
+      return textResult("More plan changes requested. Main Pi will regenerate the draft again.", {
+        status: result.status, run_id: params.run_id,
+      });
+    }
+    if (result.status === "awaiting_approval") {
+      return textResult(`Revised plan ${params.run_id} is ready for approval.`, {
+        status: result.status, run_id: params.run_id, package_hash: written.package.package_hash,
+      });
+    }
+    if (result.status === "cancelled") {
+      return textResult(`Plan ${params.run_id} cancelled before approval.`, { status: result.status, run_id: params.run_id });
+    }
+    if (result.status === "not_started") {
+      return textResult(
+        `Plan approved, but execution has not started: ${result.reason}\nFix the prerequisite and run /plan-execute start ${params.run_id}.`,
+        { status: result.status, run_id: params.run_id, state: result.state },
+      );
+    }
+    return textResult(`Execution & Review: ${result.status}.`, {
+      status: result.status, run_id: params.run_id, state: result.state,
+    });
   } catch (error) {
     const details = errorDetails(error);
     notify(ctx, details.text, "error");
@@ -1224,6 +1478,43 @@ async function commandApprove(
   }
 }
 
+async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runId: string): Promise<void> {
+  try {
+    const loaded = await loadValidatedRun(ctx.cwd, runId);
+    let result: DraftReviewResult | StartResult;
+    if (loaded.state.status === "draft") {
+      const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
+      result = await reviewDraftAndStart(pi, ctx, loaded.package, selection, true);
+    } else {
+      result = await startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
+    }
+
+    if (result.status === "revision_requested") {
+      notify(ctx, "Plan changes sent back to Main Pi. The revised draft will reopen Review & Approval.", "info");
+      return;
+    }
+    if (result.status === "awaiting_approval") {
+      notify(ctx, `Run ${runId} is still awaiting human approval.`, "warning");
+      return;
+    }
+    if (result.status === "cancelled") {
+      notify(ctx, `Run ${runId} was cancelled before execution.`, "info");
+      return;
+    }
+    if (result.status === "not_started") {
+      notify(ctx, `Execution has not started: ${result.reason}\nFix the prerequisite and run /plan-execute start ${runId} again.`, "warning");
+      return;
+    }
+    if (result.status === "paused") {
+      notify(ctx, `Execution & Review is paused. Diagnostic details are in ${loaded.package.root}/.runtime/.`, "warning");
+      return;
+    }
+    notify(ctx, `Execution & Review ${result.status}.`, "info");
+  } catch (error) {
+    notify(ctx, error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
 async function commandStop(ctx: ExtensionCommandContext, runId: string): Promise<void> {
   const active = activeRuns.get(runId);
   if (!active) {
@@ -1237,13 +1528,13 @@ async function commandStop(ctx: ExtensionCommandContext, runId: string): Promise
 export default function planExecuteAuto(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "plan_execute_finalize",
-    label: "Finalize Phased Plan",
-    description: "Write and structurally validate the current Main Pi planning context as a phased Golden Document Package.",
-    promptSnippet: "Finalize a human-approved plan into a validated phased document package",
+    label: "Create Draft Plan",
+    description: "Write and structurally validate the current Main Pi planning context as a phased draft plan package.",
+    promptSnippet: "Create a validated phased draft plan for human review",
     promptGuidelines: [
-      "Use plan_execute_finalize only after the human explicitly says the plan is ready; it must contain at least one ordered phase.",
-      "Each phase in plan_execute_finalize needs an independent spec file, acceptance YAML contract, and required plugin-owned completion commit.",
-      "Do not mark plan_execute_finalize approved or frozen on the human's behalf; the plugin collects human approval in native Pi UI.",
+      "Use plan_execute_finalize only after the human explicitly invokes /plan-execute; it must contain at least one ordered phase.",
+      "Each phase needs an independent spec file, acceptance YAML contract, and required plugin-owned completion commit.",
+      "Do not approve/freeze the package or implement project code; the plugin owns the human revision/approval loop.",
     ],
     parameters: FINALIZE_SCHEMA,
     executionMode: "sequential",
@@ -1252,37 +1543,46 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerTool({
+    name: "plan_execute_revise",
+    label: "Revise Draft Plan",
+    description: "Atomically replace an existing draft plan after explicit human revision feedback, then reopen human review.",
+    promptSnippet: "Regenerate the complete draft plan from human revision feedback",
+    promptGuidelines: [
+      "Use only for a draft run after the plugin sends a plan-execute-revision-request.",
+      "Pass the exact run_id and previous_package_hash from that request.",
+      "Regenerate the COMPLETE manifest and complete set of draft plan files; do not send a partial patch.",
+      "Do not implement project code or approve the revised plan on the human's behalf.",
+    ],
+    parameters: REVISE_SCHEMA,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return handleRevise(pi, ctx, params);
+    },
+  });
+
   pi.registerCommand("plan-execute", {
-    description: "Set up ACP models or run a human-approved phased plan-execute workflow",
+    description: "Create/review a phased plan or control its Execution & Review run",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
-      const action = tokens[0] ?? "finalize";
+      const action = tokens[0];
+      if (!action || action === "finalize") return commandFinalize(pi, ctx);
       if (action === "setup") return commandSetup(ctx);
-      if (action === "config") return commandConfig(ctx);
-      if (action === "reset-config") return commandResetConfig(ctx);
-      if (action === "finalize") return commandFinalize(pi, ctx);
-      if (action === "validate" && tokens[1]) return commandValidate(ctx, tokens[1]);
-      if (action === "approve" && tokens[1]) return commandApprove(pi, ctx, tokens[1], tokens[2] === "start");
+      if (action === "start" && tokens[1]) return commandStart(pi, ctx, tokens[1]);
       if (action === "stop" && tokens[1]) return commandStop(ctx, tokens[1]);
-      if (action === "start" && tokens[1]) {
-        try {
-          const result = await startStageB(pi, ctx, tokens[1], { ...(ctx.signal ? { signal: ctx.signal } : {}) });
-          notify(ctx, result.status === "not_started" ? result.reason : `Execution & Review ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
-        } catch (error) {
-          notify(ctx, error instanceof Error ? error.message : String(error), "error");
-        }
-        return;
-      }
       if (action === "status" && tokens[1]) {
         try {
           const status = await readRunStatus(ctx.cwd, tokens[1]);
-          notify(ctx, status ? formatStatus(status) : `Unknown workflow ${tokens[1]}.`, status ? "info" : "warning");
+          notify(ctx, status
+            ? `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`
+            : `Unknown workflow ${tokens[1]}.`,
+          status ? "info" : "warning");
         } catch (error) {
           notify(ctx, error instanceof Error ? error.message : String(error), "error");
         }
         return;
       }
-      notify(ctx, "Usage: /plan-execute [finalize] | setup | config | reset-config | validate <run-id> | approve <run-id> [start] | start <run-id> | stop <run-id> | status <run-id>", "info");
+      notify(ctx, "Usage: /plan-execute | setup | start <run-id> | stop <run-id> | status <run-id>", "info");
     },
   });
 
@@ -1291,11 +1591,6 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     const status = data.status ?? "unknown";
     const runId = data.run_id ?? "unknown";
     return new Text(theme.fg(status === "completed" ? "success" : status === "paused" ? "warning" : "accent", `plan-execute ${runId}: ${status}`), 0, 0);
-  });
-
-  pi.registerMessageRenderer(ESCALATION_MESSAGE, (message, _options, theme) => {
-    const content = typeof message.content === "string" ? message.content : "Execution & Review needs attention (see details).";
-    return new Text(theme.fg("warning", content), 0, 0);
   });
 
   pi.on("session_start", (_event, ctx) => {

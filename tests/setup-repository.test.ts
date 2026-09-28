@@ -33,14 +33,15 @@ test("setup does not initialize Git unless the human explicitly selects it", asy
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("initializing creates Git and an uncommitted runtime ignore rule without staging user files", async () => {
+test("initializing configures a repository-local runtime ignore rule without changing project files", async () => {
   const { root, project } = await fixture();
   const notes: string[] = [];
   try {
     await writeFile(join(project, "user-file.txt"), "keep these bytes\n");
     assert.equal(await ensureSetupRepository(project, ui("Initialize Git repository here (no files staged)", false, notes)), true);
     assert.equal(await exists(join(project, ".git")), true);
-    assert.equal(await readFile(join(project, ".gitignore"), "utf8"), ".pi-plan-execute-auto/\n");
+    assert.equal(await exists(join(project, ".gitignore")), false);
+    assert.match(await readFile(join(project, ".git", "info", "exclude"), "utf8"), /\.pi-plan-execute-auto\//);
     assert.equal(await readFile(join(project, "user-file.txt"), "utf8"), "keep these bytes\n");
     await assert.rejects(git("git", ["-C", project, "rev-parse", "--verify", "HEAD"]));
     assert.equal((await git("git", ["-C", project, "ls-files"])).stdout.trim(), "");
@@ -60,33 +61,37 @@ test("separately approved baseline commit is empty and never captures untracked 
     assert.equal(await ensureSetupRepository(project, widget), true);
     assert.ok((await git("git", ["-C", project, "rev-parse", "HEAD"])).stdout.trim());
     assert.equal((await git("git", ["-C", project, "ls-tree", "-r", "--name-only", "HEAD"])).stdout.trim(), "");
-    assert.deepEqual((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim().split("\n"), ["?? .gitignore", "?? user-file.txt"]);
+    assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "?? user-file.txt");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("setup appends the runtime rule once without changing other .gitignore bytes", async () => {
+test("setup appends the runtime rule once to Git info/exclude without changing .gitignore", async () => {
   const { root, project } = await fixture();
   try {
     await git("git", ["-C", project, "init", "-q"]);
-    await writeFile(join(project, ".gitignore"), "# existing\r\nnode_modules/", "utf8");
+    await writeFile(join(project, ".gitignore"), "# existing\r\nnode_modules/\n", "utf8");
+    const before = await readFile(join(project, ".gitignore"), "utf8");
     await ensureSetupRepository(project, ui("unused", false));
-    assert.equal(await readFile(join(project, ".gitignore"), "utf8"), "# existing\r\nnode_modules/\r\n.pi-plan-execute-auto/\r\n");
     await ensureSetupRepository(project, ui("unused", false));
-    assert.equal(await readFile(join(project, ".gitignore"), "utf8"), "# existing\r\nnode_modules/\r\n.pi-plan-execute-auto/\r\n");
+    assert.equal(await readFile(join(project, ".gitignore"), "utf8"), before);
+    const exclude = await readFile(join(project, ".git", "info", "exclude"), "utf8");
+    assert.equal((exclude.match(/\.pi-plan-execute-auto\//g) ?? []).length, 1);
     await mkdir(join(project, ".pi-plan-execute-auto"));
     await writeFile(join(project, ".pi-plan-execute-auto", "config.json"), "{}\n");
     assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "?? .gitignore");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("setup refuses a symlinked .gitignore without changing its target", async () => {
+test("setup refuses a symlinked Git info/exclude without changing its target", async () => {
   const { root, project } = await fixture();
   try {
     await git("git", ["-C", project, "init", "-q"]);
+    const exclude = join(project, ".git", "info", "exclude");
     const outside = join(root, "outside-ignore");
     await writeFile(outside, "keep\n");
-    await symlink(outside, join(project, ".gitignore"));
-    await assert.rejects(ensureSetupRepository(project, ui("unused", false)), /symlinked .gitignore/);
+    await rm(exclude, { force: true });
+    await symlink(outside, exclude);
+    await assert.rejects(ensureSetupRepository(project, ui("unused", false)), /symlinked Git info\/exclude/);
     assert.equal(await readFile(outside, "utf8"), "keep\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -103,7 +108,7 @@ test("an unborn repository with staged files is never committed automatically", 
       notify() {},
     }), true);
     await assert.rejects(git("git", ["-C", project, "rev-parse", "--verify", "HEAD"]));
-    assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "A  staged.txt\n?? .gitignore");
+    assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "A  staged.txt");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

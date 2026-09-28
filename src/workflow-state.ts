@@ -39,6 +39,7 @@ export function createDraftState(pkg: ValidatedPackage, runId: string): Workflow
     package_dir: pkg.root,
     status: "draft",
     created_at: new Date().toISOString(),
+    plan_revision: 1,
     phases: initialPhaseStates(pkg),
   };
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   access,
+  cp,
   lstat,
   mkdir,
   readdir,
@@ -673,6 +674,111 @@ export async function writeValidatedPackage(
   return { package: validation.package, created: true };
 }
 
+
+export async function replaceValidatedDraftPackage(
+  cwd: string,
+  input: FinalizeInput,
+  runId: string,
+  expectedPackageHash: string,
+): Promise<PackageWriteResult> {
+  const inputErrors = validateFinalizeInput(input);
+  if (inputErrors.length > 0) throw new PackageInputError(inputErrors);
+  assertSafeRunId(runId);
+  const root = resolve(cwd, ".pi-plan-execute-auto", runId);
+  const current = await readWorkflowState(root);
+  if (!current || current.run_id !== runId || current.status !== "draft") {
+    throw new Error(`Workflow ${runId} is not an editable draft.`);
+  }
+  if (current.package_hash !== expectedPackageHash) {
+    throw new Error("The draft plan changed after the requested revision; review the latest package before rewriting it.");
+  }
+  const previousValidation = await validatePackageDirectory(root);
+  if (!previousValidation.ok || !previousValidation.package || previousValidation.package.package_hash !== expectedPackageHash) {
+    throw new Error("The current draft package no longer matches the revision base hash.");
+  }
+
+  const parent = dirname(root);
+  const temporary = join(parent, `.tmp-revise-${runId}-${process.pid}-${Date.now()}`);
+  const backup = join(parent, `.backup-revise-${runId}-${process.pid}-${Date.now()}`);
+  await mkdir(temporary, { recursive: true });
+  try {
+    const manifest: Manifest = {
+      version: WORKFLOW_VERSION,
+      documents: input.manifest.documents ?? [],
+      phases: input.manifest.phases,
+    };
+    if (input.manifest.max_review_rounds !== undefined) manifest.max_review_rounds = input.manifest.max_review_rounds;
+    await writeFile(join(temporary, MANIFEST_FILE), serializeManifest(manifest), "utf8");
+    for (const file of input.files as PackageFileInput[]) {
+      const path = normalizePackagePath(file.path);
+      if (!path) throw new Error(`Invalid package file path ${file.path}.`);
+      const target = join(temporary, ...path.split("/"));
+      const resolvedTarget = resolve(target);
+      if (resolvedTarget !== temporary && !resolvedTarget.startsWith(`${temporary}${sep}`)) {
+        throw new Error(`Package file escapes package root: ${file.path}.`);
+      }
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, file.content, "utf8");
+    }
+    const staged = await validatePackageDirectory(temporary);
+    if (!staged.ok || !staged.package) throw new PackageValidationError(staged.errors);
+
+    await rename(root, backup);
+    try {
+      await rename(temporary, root);
+      const oldRuntime = join(backup, RUNTIME_DIRECTORY);
+      try {
+        await cp(oldRuntime, join(root, RUNTIME_DIRECTORY), { recursive: true, force: true, errorOnExist: false });
+      } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+      }
+
+      const revision = current.plan_revision ?? 1;
+      const snapshotRoot = join(root, RUNTIME_DIRECTORY, "planning", "revisions", `revision-${String(revision).padStart(3, "0")}`, "package");
+      for (const relativePath of previousValidation.package.golden_files) {
+        const source = join(backup, ...relativePath.split("/"));
+        const target = join(snapshotRoot, ...relativePath.split("/"));
+        await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+        await cp(source, target, { force: true });
+      }
+
+      const validation = await validatePackageDirectory(root);
+      if (!validation.ok || !validation.package) throw new PackageValidationError(validation.errors);
+      const next: import("./types.js").WorkflowState = {
+        ...current,
+        package_hash: validation.package.package_hash,
+        package_dir: validation.package.root,
+        status: "draft",
+        plan_revision: revision + 1,
+        phases: validation.package.phases.map((phase) => ({
+          phase_id: phase.phase.id,
+          status: "pending",
+          review_rounds: 0,
+          execution_report_paths: [],
+          review_report_paths: [],
+          unresolved_findings: [],
+        })),
+      };
+      delete next.approved_at;
+      delete next.started_at;
+      delete next.completed_at;
+      delete next.pause_reason;
+      delete next.branch_name;
+      delete next.worktree_path;
+      delete next.controlled_environment_paths;
+      await writeWorkflowState(root, next);
+      await rm(backup, { recursive: true, force: true });
+      return { package: validation.package, created: false };
+    } catch (error) {
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+      await rename(backup, root).catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 export class PackageInputError extends Error {
   readonly issues: PackageValidationIssue[];
 
@@ -699,6 +805,7 @@ export async function readWorkflowState(root: string): Promise<import("./types.j
     const value: unknown = JSON.parse(content);
     if (!isRecord(value) || value.version !== WORKFLOW_VERSION || !isString(value.run_id)) return undefined;
     if (!isString(value.package_hash) || !isString(value.package_dir) || !isString(value.created_at)) return undefined;
+    if (value.plan_revision !== undefined && (!isInteger(value.plan_revision) || value.plan_revision < 1)) return undefined;
     if (!isString(value.status) || !["draft", "frozen", "running", "paused", "completed", "cancelled"].includes(value.status)) return undefined;
     if (!Array.isArray(value.phases)) return undefined;
     for (const phase of value.phases) {

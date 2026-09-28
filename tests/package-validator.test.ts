@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   formatValidationIssues,
   readWorkflowState,
+  replaceValidatedDraftPackage,
   serializeManifest,
   validatePackageDirectory,
   writeValidatedPackage,
@@ -157,6 +158,45 @@ test("run-id traversal is rejected before any package path is resolved", async (
     await assert.rejects(writeValidatedPackage(cwd, validInput(), "../../escaped"), /Invalid run_id/);
     const { packageRoot } = await import("../src/workflow-state.js");
     assert.throws(() => packageRoot(cwd, "../../escaped"), /Invalid run_id/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("draft plan revision atomically replaces golden files, preserves runtime diagnostics, and snapshots the previous revision", async () => {
+  const cwd = await tempDir();
+  try {
+    const initial = await writeValidatedPackage(cwd, validInput(), "revision-test");
+    await writeWorkflowState(initial.package.root, createDraftState(initial.package, "revision-test"));
+    await mkdir(join(initial.package.root, ".runtime"), { recursive: true });
+    await writeFile(join(initial.package.root, ".runtime", "events.jsonl"), "{\"type\":\"before-revision\"}\n", "utf8");
+
+    const revisedInput = validInput();
+    revisedInput.run_id = "revision-test";
+    const spec = revisedInput.files.find((entry) => entry.path === "phases/phase-01.md");
+    assert.ok(spec);
+    spec.content = "Implement the revised test change with extra acceptance detail.\n";
+
+    const revised = await replaceValidatedDraftPackage(
+      cwd,
+      revisedInput,
+      "revision-test",
+      initial.package.package_hash,
+    );
+    assert.notEqual(revised.package.package_hash, initial.package.package_hash);
+    const state = await readWorkflowState(revised.package.root);
+    assert.equal(state?.status, "draft");
+    assert.equal(state?.plan_revision, 2);
+    assert.equal(state?.package_hash, revised.package.package_hash);
+    assert.match(await readFile(join(revised.package.root, ".runtime", "events.jsonl"), "utf8"), /before-revision/);
+    assert.match(
+      await readFile(join(revised.package.root, ".runtime", "planning", "revisions", "revision-001", "package", "phases", "phase-01.md"), "utf8"),
+      /Implement the test change/,
+    );
+    await assert.rejects(
+      replaceValidatedDraftPackage(cwd, revisedInput, "revision-test", initial.package.package_hash),
+      /changed after the requested revision|revision base hash/,
+    );
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
