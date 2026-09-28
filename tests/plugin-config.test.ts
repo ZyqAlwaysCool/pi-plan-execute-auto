@@ -326,8 +326,9 @@ test("setup shows a live progress indicator during ACP catalog discovery and cle
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("declined live Agent CLI connectivity preflight stores no project or consent file", async () => {
+test("declined live Agent CLI connectivity check skips provider call and still saves setup", async () => {
   const { root, project, agentDir } = await fixture();
+  let providerCalls = 0;
   const ctx = {
     cwd: project, hasUI: true, ui: {
       notify() {},
@@ -343,12 +344,14 @@ test("declined live Agent CLI connectivity preflight stores no project or consen
     },
   } as unknown as Parameters<typeof runSetupWizard>[0];
   try {
-    assert.equal(await runSetupWizard(ctx, [
+    const configured = await runSetupWizard(ctx, [
       { backend: "pi", executable: "/bin/pi", version: "fixture", models: ["pi/openai-codex/gpt-5.5"] },
     ], agentDir, async () => ["pi/openai-codex/gpt-5.5"], async () => ["low", "medium", "high"],
-    async () => { throw new Error("No model request should start without separate human approval"); }), undefined);
-    assert.equal(await loadProjectPluginProfile(project, agentDir), undefined);
-    await assert.rejects(readFile(join(project, ".pi-plan-execute-auto", "config.json")), /ENOENT/);
+    async () => { providerCalls += 1; });
+    assert.ok(configured);
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(await loadProjectPluginProfile(project, agentDir), configured);
+    assert.equal(JSON.parse(await readFile(join(project, ".pi-plan-execute-auto", "config.json"), "utf8")).executorModel, configured?.executorModel);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
