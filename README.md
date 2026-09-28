@@ -85,9 +85,9 @@ plan/...
   completions/...
 ```
 
-In addition, AgentPrism records run-local Executor/Reviewer session lifecycle, prompts, terminal turns, permission decisions, and event counts into `.runtime/events.jsonl`. Existing structured execution reports, review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative workflow evidence.
+In addition, AgentPrism records run-local Executor/Reviewer session lifecycle, prompts, ACP stream events (including tool activity when the backend exposes it), terminal turns, permission decisions, and event counts into `.runtime/events.jsonl`. Existing structured execution reports, review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative workflow evidence.
 
-The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. The bundle can still contain source snippets, prompts, model outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
+Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
 
 The main UI is deliberately compact: current run/phase/round and high-level state stay visible, while detailed diagnostics live in the run directory. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
 

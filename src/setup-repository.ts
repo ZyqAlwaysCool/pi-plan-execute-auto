@@ -128,9 +128,9 @@ export async function ensureSetupRepository(cwd: string, ui: SetupRepositoryUI):
   }
   try {
     await git(root, ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "--only", "--no-verify", "-m", "Initialize plan-execute repository"]);
-    ui.notify("Created an empty initial commit. Untracked project files were not staged; commit or ignore them before Stage B.", "info");
+    ui.notify("Created an empty initial commit. Untracked project files were not staged; commit or ignore them before Execution & Review.", "info");
   } catch {
-    ui.notify("Git was initialized, but the empty baseline commit failed (check Git user.name/user.email). Commit manually before Stage B; setup can continue.", "warning");
+    ui.notify("Git was initialized, but the empty baseline commit failed (check Git user.name/user.email). Commit manually before Execution & Review; setup can continue.", "warning");
   }
   return true;
 }
