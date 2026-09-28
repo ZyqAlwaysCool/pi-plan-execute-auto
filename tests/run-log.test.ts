@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { agentSessionTranscriptRelativePath, appendAgentSessionEvent, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
+import { MAX_MAIN_PI_SESSION_BYTES, agentSessionTranscriptRelativePath, appendAgentSessionEvent, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 
 test("agent session diagnostics are split into safe per-session transcript files", async () => {
   const root = await mkdtemp(join(tmpdir(), "peac-session-log-"));
@@ -35,6 +35,42 @@ test("concurrent run event writes remain valid JSONL and preserve every event", 
     const parsed = lines.map((line) => JSON.parse(line) as { type: string; index: number });
     assert.ok(parsed.every((entry) => entry.type === "concurrent_fixture"));
     assert.deepEqual(parsed.map((entry) => entry.index).sort((a, b) => a - b), Array.from({ length: 250 }, (_, index) => index));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Main Pi session capture keeps only a bounded recent diagnostic snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-main-session-bounded-"));
+  try {
+    const entries = Array.from({ length: 500 }, (_, index) => ({
+      type: "message",
+      id: `entry-${index}`,
+      message: {
+        role: index % 2 === 0 ? "assistant" : "user",
+        content: [{
+          type: "text",
+          text: `ENTRY-${index}-${"x".repeat(20_000)}`,
+        }],
+      },
+    }));
+    await captureMainPiSession(root, entries);
+    const raw = await readFile(join(root, ".runtime", "main-pi-session.json"), "utf8");
+    const snapshot = JSON.parse(raw) as {
+      source_entry_count: number;
+      retained_entry_count: number;
+      truncated: boolean;
+      entries: unknown[];
+    };
+    assert.ok(Buffer.byteLength(raw, "utf8") <= MAX_MAIN_PI_SESSION_BYTES);
+    assert.equal(snapshot.source_entry_count, 500);
+    assert.equal(snapshot.retained_entry_count, snapshot.entries.length);
+    assert.ok(snapshot.retained_entry_count > 0);
+    assert.ok(snapshot.retained_entry_count <= 120);
+    assert.equal(snapshot.truncated, true);
+    assert.match(raw, /ENTRY-499-/);
+    assert.doesNotMatch(raw, /ENTRY-0-/);
+    assert.match(raw, /diagnostic string truncated/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

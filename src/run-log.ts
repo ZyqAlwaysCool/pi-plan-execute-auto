@@ -108,14 +108,96 @@ export async function writeRunJson(runRoot: string, relative: string, value: unk
   await rename(temporary, path);
 }
 
+export const MAX_MAIN_PI_SESSION_BYTES = 512 * 1024;
+const MAX_MAIN_PI_SESSION_ENTRIES = 120;
+const MAX_MAIN_PI_ENTRY_NODES = 256;
+const MAX_MAIN_PI_STRING_BYTES = 8 * 1024;
+const MAX_MAIN_PI_ARRAY_ITEMS = 24;
+const MAX_MAIN_PI_OBJECT_KEYS = 32;
+const MAX_MAIN_PI_DEPTH = 5;
+
+function truncateDiagnosticString(value: string): string {
+  if (Buffer.byteLength(value, "utf8") <= MAX_MAIN_PI_STRING_BYTES) return value;
+  const marker = "\n[diagnostic string truncated]";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const bytes = Buffer.from(value, "utf8");
+  return `${bytes.subarray(0, Math.max(0, MAX_MAIN_PI_STRING_BYTES - markerBytes)).toString("utf8")}${marker}`;
+}
+
+function compactDiagnosticValue(
+  value: unknown,
+  budget: { nodes: number; seen: WeakSet<object> },
+  depth = 0,
+): unknown {
+  if (budget.nodes >= MAX_MAIN_PI_ENTRY_NODES) return "[diagnostic node limit reached]";
+  budget.nodes += 1;
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return truncateDiagnosticString(value);
+  if (typeof value === "bigint") return value.toString();
+  if (value instanceof Error) {
+    return compactDiagnosticValue(
+      { name: value.name, message: value.message, stack: value.stack },
+      budget,
+      depth,
+    );
+  }
+  if (!value || typeof value !== "object") return `[${typeof value}]`;
+  if (budget.seen.has(value as object)) return "[Circular]";
+  if (depth >= MAX_MAIN_PI_DEPTH) return "[diagnostic depth limit reached]";
+  budget.seen.add(value as object);
+
+  if (Array.isArray(value)) {
+    if (value.length <= MAX_MAIN_PI_ARRAY_ITEMS) {
+      return value.map((entry) => compactDiagnosticValue(entry, budget, depth + 1));
+    }
+    const edge = Math.floor(MAX_MAIN_PI_ARRAY_ITEMS / 2);
+    return [
+      ...value.slice(0, edge).map((entry) => compactDiagnosticValue(entry, budget, depth + 1)),
+      `[${value.length - (edge * 2)} array item(s) omitted]`,
+      ...value.slice(-edge).map((entry) => compactDiagnosticValue(entry, budget, depth + 1)),
+    ];
+  }
+
+  const result: Record<string, unknown> = {};
+  const objectEntries = Object.entries(value as Record<string, unknown>);
+  for (const [key, entry] of objectEntries.slice(0, MAX_MAIN_PI_OBJECT_KEYS)) {
+    result[key.slice(0, 256)] = compactDiagnosticValue(entry, budget, depth + 1);
+  }
+  if (objectEntries.length > MAX_MAIN_PI_OBJECT_KEYS) {
+    result.__omitted_keys = objectEntries.length - MAX_MAIN_PI_OBJECT_KEYS;
+  }
+  return result;
+}
+
+function compactMainPiEntry(entry: unknown): unknown {
+  return compactDiagnosticValue(entry, { nodes: 0, seen: new WeakSet<object>() });
+}
+
+function mainPiSessionSnapshot(entries: unknown): Record<string, unknown> {
+  const sourceEntries = Array.isArray(entries) ? entries : [];
+  const candidates = sourceEntries.slice(-MAX_MAIN_PI_SESSION_ENTRIES).map(compactMainPiEntry);
+  const capturedAt = new Date().toISOString();
+  let retained = candidates;
+  for (;;) {
+    const snapshot = {
+      captured_at: capturedAt,
+      source_entry_count: sourceEntries.length,
+      retained_entry_count: retained.length,
+      truncated: !Array.isArray(entries) || retained.length < sourceEntries.length,
+      entries: retained,
+    };
+    if (Buffer.byteLength(json(snapshot), "utf8") + 1 <= MAX_MAIN_PI_SESSION_BYTES || retained.length === 0) {
+      return snapshot;
+    }
+    retained = retained.slice(1);
+  }
+}
+
 export async function captureMainPiSession(
   runRoot: string,
   entries: unknown,
 ): Promise<void> {
-  await writeRunJson(runRoot, ".runtime/main-pi-session.json", {
-    captured_at: new Date().toISOString(),
-    entries,
-  });
+  await writeRunJson(runRoot, ".runtime/main-pi-session.json", mainPiSessionSnapshot(entries));
 }
 
 export function runtimePath(runRoot: string, ...parts: string[]): string {
