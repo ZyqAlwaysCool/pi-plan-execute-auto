@@ -198,6 +198,8 @@ export async function freezeRun(
     throw new Error("The package hash changed after review; it remains draft and requires a new review.");
   }
   const state = createDraftState(validation.package, runId);
+  state.created_at = current?.created_at ?? state.created_at;
+  state.plan_revision = current?.plan_revision ?? 1;
   state.status = "frozen";
   state.approved_at = new Date().toISOString();
   if (options?.executorModel) state.executor_model = options.executorModel;

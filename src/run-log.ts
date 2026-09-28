@@ -13,9 +13,29 @@ function auditPath(runRoot: string, relative: string): string {
   return path;
 }
 
+const SECRET_ENV_KEY = /(?:^|_)(?:API_?KEY|AUTH_?TOKEN|ACCESS_?TOKEN|REFRESH_?TOKEN|SECRET|PASSWORD|BEARER)(?:$|_)/iu;
+
+function knownSecretValues(): string[] {
+  return [...new Set(Object.entries(process.env)
+    .filter(([key, value]) => Boolean(value) && SECRET_ENV_KEY.test(key))
+    .map(([, value]) => value!)
+    .filter((value) => value.length >= 8))]
+    .sort((a, b) => b.length - a.length);
+}
+
+function redactSerialized(text: string): string {
+  let redacted = text;
+  for (const secret of knownSecretValues()) redacted = redacted.split(secret).join("[REDACTED_HOST_CREDENTIAL]");
+  redacted = redacted
+    .replace(/(authorization\\?["']?\s*[:=]\s*\\?["']?bearer\s+)[^\\\s"']+/giu, "$1[REDACTED]")
+    .replace(/((?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|password|secret)\\?["']?\s*[:=]\s*\\?["'])[^"']+/giu, "$1[REDACTED]");
+  return redacted;
+}
+
 function json(value: unknown): string {
   const seen = new WeakSet<object>();
-  return JSON.stringify(value, (_key, item) => {
+  const serialized = JSON.stringify(value, (key, item) => {
+    if (SECRET_ENV_KEY.test(key) && typeof item === "string") return "[REDACTED_CREDENTIAL_FIELD]";
     if (typeof item === "bigint") return item.toString();
     if (item instanceof Error) return { name: item.name, message: item.message, stack: item.stack };
     if (item && typeof item === "object") {
@@ -24,6 +44,7 @@ function json(value: unknown): string {
     }
     return item;
   });
+  return redactSerialized(serialized);
 }
 
 export async function appendRunEvent(

@@ -290,6 +290,9 @@ export class AgentPrismSessionPair implements HarnessPair {
     const eventCounts: Record<string, number> = {};
     for await (const event of agent.stream(prompt, options)) {
       eventCounts[event.type] = (eventCounts[event.type] ?? 0) + 1;
+      await this.audit("agent_stream_event", {
+        role, session_id: agent.sessionId, backend: agent.backendId, model: agent.model, event,
+      });
       try {
         this.options.onLiveEvent?.(role, event.type);
       } catch {

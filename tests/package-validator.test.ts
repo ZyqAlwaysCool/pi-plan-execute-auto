@@ -167,7 +167,8 @@ test("draft plan revision atomically replaces golden files, preserves runtime di
   const cwd = await tempDir();
   try {
     const initial = await writeValidatedPackage(cwd, validInput(), "revision-test");
-    await writeWorkflowState(initial.package.root, createDraftState(initial.package, "revision-test"));
+    const initialState = createDraftState(initial.package, "revision-test");
+    await writeWorkflowState(initial.package.root, initialState);
     await mkdir(join(initial.package.root, ".runtime"), { recursive: true });
     await writeFile(join(initial.package.root, ".runtime", "events.jsonl"), "{\"type\":\"before-revision\"}\n", "utf8");
 
@@ -197,6 +198,12 @@ test("draft plan revision atomically replaces golden files, preserves runtime di
       replaceValidatedDraftPackage(cwd, revisedInput, "revision-test", initial.package.package_hash),
       /changed after the requested revision|revision base hash/,
     );
+    const frozen = await freezeRun(revised.package, "revision-test", {
+      reviewedPackageHash: revised.package.package_hash,
+    });
+    assert.equal(frozen.status, "frozen");
+    assert.equal(frozen.plan_revision, 2);
+    assert.equal(frozen.created_at, initialState.created_at);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

@@ -1,7 +1,7 @@
 import { execFile as callback } from "node:child_process";
 import { lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -110,6 +110,28 @@ test("an unborn repository with staged files is never committed automatically", 
     await assert.rejects(git("git", ["-C", project, "rev-parse", "--verify", "HEAD"]));
     assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "A  staged.txt");
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("setup uses the common Git info/exclude when started from a linked worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-linked-worktree-"));
+  const main = join(root, "main");
+  const linked = join(root, "linked");
+  try {
+    await mkdir(main);
+    await git("git", ["-C", main, "init", "-q"]);
+    await git("git", ["-C", main, "config", "user.name", "Setup Fixture"]);
+    await git("git", ["-C", main, "config", "user.email", "setup@example.invalid"]);
+    await git("git", ["-C", main, "commit", "--allow-empty", "-m", "base"]);
+    await git("git", ["-C", main, "worktree", "add", "-b", "linked-test", linked]);
+    assert.equal(await ensureSetupRepository(linked, ui("unused", false)), true);
+    const common = (await git("git", ["-C", linked, "rev-parse", "--git-common-dir"])).stdout.trim();
+    const commonDir = resolve(linked, common);
+    assert.match(await readFile(join(commonDir, "info", "exclude"), "utf8"), /\.pi-plan-execute-auto\//);
+    assert.equal(await exists(join(linked, ".gitignore")), false);
+  } finally {
+    await git("git", ["-C", main, "worktree", "remove", "--force", linked]).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("host GIT_DIR/GIT_WORK_TREE variables cannot redirect setup", async () => {

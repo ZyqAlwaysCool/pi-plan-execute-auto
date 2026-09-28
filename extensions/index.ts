@@ -233,10 +233,12 @@ async function chooseApproval(
       continue;
     }
     if (choice === "Request Changes") {
-      const feedback = (await ctx.ui.editor(
-        "Describe the plan changes for Main Pi",
-        "Describe what should be added, removed, clarified, reordered, or changed in acceptance. Submit to ask Main Pi to regenerate the complete draft plan.",
-      ))?.trim();
+      notify(
+        ctx,
+        "Describe what should be added, removed, clarified, reordered, or changed in acceptance. Submit the editor to ask Main Pi to regenerate the complete draft plan.",
+        "info",
+      );
+      const feedback = (await ctx.ui.editor("Describe plan changes for Main Pi", ""))?.trim();
       if (feedback) return { kind: "request-changes", feedback };
       continue;
     }
@@ -1126,7 +1128,7 @@ async function startStageB(
     if (
       error instanceof Error &&
       "code" in error &&
-      (error.code === "SOURCE_WORKTREE_DIRTY" || error.code === "WORKTREE_PATH_EXISTS") &&
+      (error.code === "SOURCE_WORKTREE_DIRTY" || error.code === "WORKTREE_PATH_EXISTS" || error.code === "HARNESS_STAGED_CHANGES") &&
       !state.worktree_path
     ) {
       const reason = error.message;

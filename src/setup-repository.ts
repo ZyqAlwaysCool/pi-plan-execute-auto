@@ -41,11 +41,12 @@ async function ensurePluginIgnored(root: string, ui: SetupRepositoryUI): Promise
     .then(() => true, () => false);
   if (ignored) return;
 
-  const gitDir = resolve(await git(root, ["rev-parse", "--absolute-git-dir"]));
+  const commonDirRaw = await git(root, ["rev-parse", "--git-common-dir"]);
+  const commonDir = resolve(root, commonDirRaw);
   const excludeRaw = await git(root, ["rev-parse", "--git-path", "info/exclude"]);
   const excludePath = resolve(root, excludeRaw);
   const infoDir = dirname(excludePath);
-  if (infoDir !== resolve(gitDir, "info")) {
+  if (infoDir !== resolve(commonDir, "info")) {
     throw new Error("Refusing unexpected Git info/exclude path; configure .pi-plan-execute-auto/ ignore manually.");
   }
   await mkdir(infoDir, { recursive: true, mode: 0o700 });
