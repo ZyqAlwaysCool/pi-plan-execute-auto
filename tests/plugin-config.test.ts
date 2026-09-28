@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approvedSetup, frozenProfileMatches, runSetupWizard } from "../extensions/index.js";
+import { approvedSetup, chooseExistingSetupAction, frozenProfileMatches, runSetupWizard } from "../extensions/index.js";
 import type { WorkflowState } from "../src/types.js";
 import { inspectClaudeNativeSandbox, loadProjectPluginProfile, normalizeSelectedModel, parseOpenCodeModels, parsePiModels, saveProjectPluginProfile } from "../src/plugin-config.js";
 
@@ -98,6 +98,149 @@ test("per-repository human setup stores no secrets and overrides model-supplied 
     assert.equal(frozenProfileMatches(missingEffort, saved), false);
     assert.equal((await approvedSetup(project, true, undefined, agentDir)).reasoningEffort, "high");
     await assert.rejects(approvedSetup(project, true, { executor_model: "opencode/opencode/big-pickle" }, agentDir), /Model-supplied ACP routes differ/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("existing setup can be kept without discovery or provider calls", async () => {
+  const { root, project, agentDir } = await fixture();
+  const notices: string[] = [];
+  let checks = 0;
+  try {
+    const profile = await saveProjectPluginProfile(project, {
+      executorModel: "opencode/deepseek-local/deepseek-flash",
+      reviewerModel: "codex/gpt-6-luna",
+      executorReasoningEffort: "high",
+      reviewerReasoningEffort: "medium",
+      permissionMode: "autonomous",
+      reviewRoundLimit: 5,
+    }, agentDir);
+    const ctx = {
+      cwd: project,
+      hasUI: true,
+      ui: {
+        notify(message: string) { notices.push(message); },
+        async select(title: string, choices: string[]) {
+          assert.equal(title, "Plan Execute Setup");
+          assert.deepEqual(choices, [
+            "Keep current setup",
+            "Run health check — optional, may incur provider charges",
+            "Reconfigure",
+            "Cancel",
+          ]);
+          return "Keep current setup";
+        },
+        async confirm() { throw new Error("Keep must not request confirmation"); },
+      },
+    } as unknown as Parameters<typeof chooseExistingSetupAction>[0];
+    assert.equal(await chooseExistingSetupAction(ctx, profile, async () => { checks += 1; }), "keep");
+    assert.equal(checks, 0);
+    assert.match(notices.join("\n"), /Current project setup/);
+    assert.match(notices.join("\n"), /No CLI discovery, model probe, or provider call was run/);
+    assert.deepEqual(await loadProjectPluginProfile(project, agentDir), profile);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("existing setup health check is optional and never rewrites the saved profile", async () => {
+  const { root, project, agentDir } = await fixture();
+  try {
+    const profile = await saveProjectPluginProfile(project, {
+      executorModel: "pi/openai-codex/gpt-5.5",
+      reviewerModel: "pi/openai-codex/gpt-5.5",
+      executorReasoningEffort: "high",
+      reviewerReasoningEffort: "high",
+      permissionMode: "ask",
+      reviewRoundLimit: 8,
+    }, agentDir);
+    const protectedBefore = JSON.stringify(profile);
+    let checks = 0;
+    const notices: string[] = [];
+    const ctx = {
+      cwd: project,
+      hasUI: true,
+      ui: {
+        notify(message: string) { notices.push(message); },
+        async select() { return "Run health check — optional, may incur provider charges"; },
+        async confirm(title: string, message: string) {
+          assert.match(title, /health check for current setup/i);
+          assert.match(message, /may incur provider charges/);
+          assert.match(message, /saved project setup will not be changed/i);
+          return true;
+        },
+        setStatus() {},
+      },
+    } as unknown as Parameters<typeof chooseExistingSetupAction>[0];
+    assert.equal(await chooseExistingSetupAction(ctx, profile, async (_root, model, effort) => {
+      checks += 1;
+      assert.equal(model, "pi/openai-codex/gpt-5.5");
+      assert.equal(effort, "high");
+    }), "keep");
+    assert.equal(checks, 1, "identical Executor/Reviewer routes should be checked once");
+    assert.match(notices.join("\n"), /Health check passed/);
+    assert.equal(JSON.stringify(await loadProjectPluginProfile(project, agentDir)), protectedBefore);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed health check leaves the existing setup untouched", async () => {
+  const { root, project, agentDir } = await fixture();
+  try {
+    const profile = await saveProjectPluginProfile(project, {
+      executorModel: "codex/gpt-6-luna",
+      reviewerModel: "opencode/deepseek-local/deepseek-flash",
+      executorReasoningEffort: "high",
+      reviewerReasoningEffort: "medium",
+    }, agentDir);
+    const before = JSON.stringify(profile);
+    const ctx = {
+      cwd: project,
+      hasUI: true,
+      ui: {
+        notify() {},
+        async select() { return "Run health check — optional, may incur provider charges"; },
+        async confirm() { return true; },
+        setStatus() {},
+      },
+    } as unknown as Parameters<typeof chooseExistingSetupAction>[0];
+    await assert.rejects(
+      chooseExistingSetupAction(ctx, profile, async () => { throw new Error("fixture provider unavailable"); }),
+      /fixture provider unavailable/,
+    );
+    assert.equal(JSON.stringify(await loadProjectPluginProfile(project, agentDir)), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reconfigure warns that existing approved runs keep frozen settings", async () => {
+  const { root, project, agentDir } = await fixture();
+  let warning = "";
+  try {
+    const profile = await saveProjectPluginProfile(project, {
+      executorModel: "opencode/deepseek-local/deepseek-flash",
+      reviewerModel: "codex/gpt-6-luna",
+    }, agentDir);
+    const ctx = {
+      cwd: project,
+      hasUI: true,
+      ui: {
+        notify() {},
+        async select() { return "Reconfigure"; },
+        async confirm(title: string, message: string) {
+          assert.equal(title, "Reconfigure this project?");
+          warning = message;
+          return true;
+        },
+      },
+    } as unknown as Parameters<typeof chooseExistingSetupAction>[0];
+    assert.equal(await chooseExistingSetupAction(ctx, profile), "reconfigure");
+    assert.match(warning, /future plans\/runs/);
+    assert.match(warning, /Existing approved runs keep the settings frozen/);
+    assert.match(warning, /will not silently switch agents/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

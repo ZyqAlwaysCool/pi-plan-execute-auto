@@ -412,6 +412,79 @@ async function chooseRoleEffort(
   return chosen === "backend default" ? "default" : selectStageBReasoningEffort(chosen);
 }
 
+function setupProfileSummary(profile: ProjectPluginProfile): string {
+  return [
+    "Current project setup",
+    `Executor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})`,
+    `Reviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})`,
+    `Review loop limit: ${profile.reviewRoundLimit} round(s) per phase`,
+    `Permissions: ${profile.permissionMode === "autonomous" ? "Autonomous" : "Ask me"}`,
+    `Approved: ${profile.networkRiskApprovedAt}`,
+  ].join("\n");
+}
+
+async function runCurrentSetupHealthCheck(
+  ctx: ExtensionCommandContext,
+  profile: ProjectPluginProfile,
+  verifyConnectivity: (projectRoot: string, model: string, effort?: ReasoningEffort) => Promise<void> = verifyAcpModelCall,
+): Promise<"passed" | "skipped"> {
+  const selected = [
+    [profile.executorModel, profile.executorReasoningEffort ?? profile.reasoningEffort],
+    [profile.reviewerModel, profile.reviewerReasoningEffort ?? profile.reasoningEffort],
+  ] as const;
+  const unique = selected.filter(([model, effort], index) =>
+    selected.findIndex(([otherModel, otherEffort]) => model === otherModel && effort === otherEffort) === index);
+  const labels = unique.map(([model, effort]) => `${model} (${effort ?? "backend default"})`);
+  const approved = await ctx.ui.confirm(
+    "Run health check for current setup? (optional)",
+    `Routes: ${labels.join(", ")}. This sends a tiny READY request through each selected Agent CLI/provider and may incur provider charges. ` +
+    "No project files are mounted. The saved project setup will not be changed whether the check passes, fails, or is skipped.",
+  );
+  if (!approved) {
+    notify(ctx, "Health check skipped. Current project setup is unchanged.", "info");
+    return "skipped";
+  }
+  for (const [model, effort] of unique) {
+    await withSetupProgress(ctx, `Checking ${model} (${effort ?? "backend default"})`, () =>
+      verifyConnectivity(ctx.cwd, model, effort));
+  }
+  notify(ctx, "Health check passed for the current Executor/Reviewer routes. Project setup is unchanged.", "info");
+  return "passed";
+}
+
+export async function chooseExistingSetupAction(
+  ctx: ExtensionCommandContext,
+  profile: ProjectPluginProfile,
+  verifyConnectivity: (projectRoot: string, model: string, effort?: ReasoningEffort) => Promise<void> = verifyAcpModelCall,
+): Promise<"keep" | "reconfigure" | "cancel"> {
+  notify(ctx, setupProfileSummary(profile), "info");
+  for (;;) {
+    const choice = await ctx.ui.select("Plan Execute Setup", [
+      "Keep current setup",
+      "Run health check — optional, may incur provider charges",
+      "Reconfigure",
+      "Cancel",
+    ]);
+    if (!choice || choice === "Cancel") return "cancel";
+    if (choice === "Keep current setup") {
+      notify(ctx, "Current project setup kept. No CLI discovery, model probe, or provider call was run.", "info");
+      return "keep";
+    }
+    if (choice.startsWith("Run health check")) {
+      await runCurrentSetupHealthCheck(ctx, profile, verifyConnectivity);
+      return "keep";
+    }
+    if (choice === "Reconfigure") {
+      const approved = await ctx.ui.confirm(
+        "Reconfigure this project?",
+        "New selections become the default for future plans/runs. Existing approved runs keep the settings frozen into their own state; " +
+        "a frozen run whose settings differ from the new project setup will not silently switch agents and cannot be resumed until you restore matching setup or create a new run.",
+      );
+      if (approved) return "reconfigure";
+    }
+  }
+}
+
 export async function runSetupWizard(
   ctx: ExtensionCommandContext,
   clis: DetectedCli[] | (() => Promise<DetectedCli[]>),
@@ -546,6 +619,22 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
   }
   try {
     if (!await ensureSetupRepository(ctx.cwd, ctx.ui)) return;
+
+    let existing: ProjectPluginProfile | undefined;
+    try {
+      existing = await loadProjectPluginProfile(ctx.cwd);
+    } catch (error) {
+      notify(
+        ctx,
+        `Existing project setup could not be validated and must be reapproved: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    if (existing) {
+      const action = await chooseExistingSetupAction(ctx, existing);
+      if (action !== "reconfigure") return;
+    }
+
     const isolation = await defaultIsolationProvider.preflight();
     notify(
       ctx,
@@ -555,7 +644,7 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     const saved = await runSetupWizard(ctx, discoverAcpClis);
     notify(ctx, saved
       ? `Project configured: Executor ${saved.executorModel} (${saved.executorReasoningEffort ?? saved.reasoningEffort ?? "backend default"}) → Reviewer ${saved.reviewerModel} (${saved.reviewerReasoningEffort ?? saved.reasoningEffort ?? "backend default"}); review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
-      : "Setup cancelled; no model selection or network consent was saved.", saved ? "info" : "warning");
+      : "Setup cancelled; the previous project setup (if any) was left unchanged.", saved ? "info" : "warning");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }

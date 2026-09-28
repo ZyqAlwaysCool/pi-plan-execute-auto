@@ -117,6 +117,17 @@ Run:
 /plan-execute setup
 ```
 
+Setup is **project-scoped**, not Pi-session-scoped. A new Pi conversation in the same Git project automatically reuses the previously approved setup; you do not need to run setup again just because the conversation changed.
+
+If `/plan-execute setup` is run again and the existing project setup is valid, the plugin first shows the current Executor/Reviewer routes, reasoning levels, review limit, permission mode, and approval time, then offers:
+
+- **Keep current setup** — exits immediately without CLI discovery, model probing, provider calls, or config writes;
+- **Run health check** — optionally sends the small potentially-billable READY probes through the currently saved routes; pass, failure, or skip never rewrites the saved setup;
+- **Reconfigure** — warns about frozen-run compatibility and only then enters the full setup wizard;
+- **Cancel** — leaves everything unchanged.
+
+Reconfiguration changes the project default for future plans/runs. Existing approved runs keep their own frozen settings and never silently switch to the newly selected agents; a frozen run with mismatched settings must use a matching setup again or be replaced by a new run.
+
 Setup performs an environment preflight before saving configuration:
 
 - Git initialization is offered only if the directory is not already a repository and still requires explicit consent;
