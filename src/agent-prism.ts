@@ -21,7 +21,7 @@ import {
 } from "./reports.js";
 import { defaultIsolationProvider } from "./isolation-provider.js";
 import type { SandboxedBackend } from "./sandbox.js";
-import { appendAgentSessionEvent, appendRunEvent } from "./run-log.js";
+import { appendAgentSessionEvent } from "./run-log.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -184,7 +184,6 @@ export class AgentPrismSessionPair implements HarnessPair {
 
   private async audit(type: string, details: Record<string, unknown>): Promise<void> {
     if (!this.options.runRoot) return;
-    await appendRunEvent(this.options.runRoot, type, details).catch(() => undefined);
     const role = details.role;
     const sessionId = details.session_id;
     if ((role === "executor" || role === "reviewer") && typeof sessionId === "string" && sessionId) {
@@ -296,11 +295,6 @@ export class AgentPrismSessionPair implements HarnessPair {
     const eventCounts: Record<string, number> = {};
     for await (const event of agent.stream(prompt, options)) {
       eventCounts[event.type] = (eventCounts[event.type] ?? 0) + 1;
-      if (event.type !== "agent_thought_chunk" && event.type !== "agent_message_chunk") {
-        await this.audit("agent_stream_event", {
-          role, session_id: agent.sessionId, backend: agent.backendId, model: agent.model, event,
-        });
-      }
       try {
         this.options.onLiveEvent?.(role, event.type);
       } catch {

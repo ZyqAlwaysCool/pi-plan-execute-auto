@@ -826,8 +826,17 @@ async function persistAndEscalatePause(
     current.last_error = reason;
   }
   await writeWorkflowState(pkg.root, state);
-  const details = escalationDetails(state, reason);
-  await appendRunEvent(pkg.root, "workflow_paused", details).catch(() => undefined);
+  await appendRunEvent(pkg.root, "workflow_paused", {
+    run_id: state.run_id,
+    reason,
+    phase_id: current?.phase_id ?? null,
+    review_rounds: current?.review_rounds ?? 0,
+    executor_session_id: current?.executor_session_id ?? null,
+    reviewer_session_id: current?.reviewer_session_id ?? null,
+    execution_report_path: current?.execution_report_path ?? null,
+    review_report_path: current?.review_report_path ?? null,
+    acceptance_report_path: current?.acceptance_report_path ?? null,
+  }).catch(() => undefined);
   await captureCurrentMainPiSession(ctx, pkg.root);
   showWidget(ctx, stateLines(state));
   pi.appendEntry(STATE_ENTRY, state);
@@ -1711,7 +1720,7 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
       ctx,
       [
         `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`,
-        `Full event log: ${eventDisplay}`,
+        `Workflow timeline: ${eventDisplay}`,
         ...(executorDisplay ? [`Latest Executor transcript: ${executorDisplay}`] : []),
         ...(reviewerDisplay ? [`Latest Reviewer transcript: ${reviewerDisplay}`] : []),
       ].join("\n"),
@@ -1722,7 +1731,7 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
     const choices = [
       ...(executorDisplay ? ["Preview latest Executor transcript"] : []),
       ...(reviewerDisplay ? ["Preview latest Reviewer transcript"] : []),
-      "Preview full event log",
+      "Preview workflow timeline",
       "Close",
     ];
     const choice = await ctx.ui.select("Run diagnostics", choices);
@@ -1730,8 +1739,8 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
       await showDiagnosticPreview(ctx, "Latest Executor transcript", join(root, executorRelative), executorDisplay);
     } else if (choice === "Preview latest Reviewer transcript" && reviewerRelative && reviewerDisplay) {
       await showDiagnosticPreview(ctx, "Latest Reviewer transcript", join(root, reviewerRelative), reviewerDisplay);
-    } else if (choice === "Preview full event log") {
-      await showDiagnosticPreview(ctx, "Full run event log", join(root, ".runtime", "events.jsonl"), eventDisplay);
+    } else if (choice === "Preview workflow timeline") {
+      await showDiagnosticPreview(ctx, "Workflow timeline", join(root, ".runtime", "events.jsonl"), eventDisplay);
     }
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");

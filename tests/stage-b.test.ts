@@ -176,6 +176,36 @@ async function runController(
   return result;
 }
 
+test("draft planning state cannot start Executor or Reviewer work", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = new FakeHarness(setup.cwd, base);
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, {
+        cwd: setup.cwd,
+        runtimeRoot: ".pi-plan-execute-auto/stage-b-test",
+      }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+    assert.equal(result.status, "not_started");
+    assert.match(result.reason ?? "", /Human approval is required/);
+    assert.equal(state.status, "draft");
+    assert.equal(harness.executeCalls, 0);
+    assert.equal(harness.reworkCalls, 0);
+    assert.equal(harness.reviewCalls, 0);
+    assert.equal((await git(setup.cwd, ["status", "--porcelain"])).stdout.trim(), "");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
 test("prompt section limits retain rework feedback, previous findings, and output contracts", async () => {
   const setup = await setupRepo();
   try {

@@ -18,7 +18,7 @@ The plugin keeps **Main Pi** as the planning partner. The user decides when plan
    - **Cancel**.
 5. Plan revision can repeat as many times as needed before approval. Previous draft revisions are retained under the run's `.runtime/planning/revisions/` directory. Draft creation/revision tools only write and validate the draft; the human **Plan Review & Approval** dialog is opened after the Main Pi turn finishes, so a tool call can never silently cross the `draft → frozen` boundary.
 
-The AI cannot silently approve or start execution. A revision request never modifies project code.
+The AI cannot silently approve or start execution. A revision request is handled only by Main Pi in the Planning & Approval stage: it never creates an Executor/Reviewer session, never runs acceptance, never creates the execution worktree, and never modifies project deliverables. The Execution & Review controller also refuses to run while workflow state is still `draft`, providing a second hard boundary below the UI/tool layer.
 
 Before **Approve & Start**, the plugin runs a readiness check. Normal fixable prerequisites—such as a dirty main worktree, missing Git baseline commit, unavailable isolation runtime, or a stale worktree path—do not turn the run into a failed/paused execution. The plan remains editable/retryable until the prerequisite is fixed.
 
@@ -54,7 +54,7 @@ The normal command surface is intentionally small:
 - `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, and permission mode.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
 - `stop <run-id>` requests a safe stop of an active execution.
-- `status <run-id>` shows a compact status summary plus the full event-log path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
+- `status <run-id>` shows a compact status summary plus the workflow-timeline path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
 
 Structural validation, approval hashing, commit validation, and configuration integrity checks are automatic; they are not separate day-to-day commands.
 
@@ -88,7 +88,9 @@ plan/...
   completions/...
 ```
 
-In addition, AgentPrism records run-local Executor/Reviewer session lifecycle, prompts, meaningful ACP stream events (including tool activity, permission, usage and session updates when exposed by the backend), terminal turns, permission decisions, and event counts into `.runtime/events.jsonl`. High-frequency thought/message token chunks are not persisted one-by-one: their counts remain in the terminal turn metadata while the complete final turn text is stored once. The same Agent-specific events are also split into per-session files under `.runtime/sessions/executor/` and `.runtime/sessions/reviewer/`, so an individual CLI session can be inspected without filtering the global event stream. JSONL appends are serialized per file to prevent concurrent diagnostic writes from corrupting records. Existing structured execution reports, review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative workflow evidence.
+Diagnostics are intentionally layered rather than capturing every ACP event. `.runtime/events.jsonl` is a **compact workflow timeline** only: plan revisions/review choices, approval, phase/round transitions, start blockers, and pause/completion state. Agent internals do not duplicate into that global file.
+
+Each Executor/Reviewer session has a small transcript under `.runtime/sessions/executor/` or `.runtime/sessions/reviewer/`. A session transcript keeps only information useful for reconstruction: session start/close metadata, the plugin prompt for each turn, permission decisions, and the final terminal/structured turn with aggregate event counts. Raw thought/message chunks, usage-update streams, and other high-frequency ACP stream traffic are not persisted. Structured execution/review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative evidence. JSONL appends are serialized per file to prevent concurrent diagnostic writes from corrupting records.
 
 Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
 

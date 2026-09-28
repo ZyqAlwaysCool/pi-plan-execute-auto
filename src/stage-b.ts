@@ -901,6 +901,13 @@ export class StageBController {
   }
 
   async run(): Promise<StageBRunResult> {
+    if (this.state.status === "draft") {
+      return {
+        status: "not_started",
+        state: this.state,
+        reason: "Human approval is required before Execution & Review; draft planning never starts Executor or Reviewer sessions.",
+      };
+    }
     if (this.state.status === "paused" || this.state.status === "completed" || this.state.status === "cancelled") {
       return this.state.status === "completed"
         ? { status: "completed", state: this.state }
