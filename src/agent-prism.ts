@@ -21,7 +21,7 @@ import {
 } from "./reports.js";
 import { defaultIsolationProvider } from "./isolation-provider.js";
 import type { SandboxedBackend } from "./sandbox.js";
-import { appendRunEvent } from "./run-log.js";
+import { appendAgentSessionEvent, appendRunEvent } from "./run-log.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -185,6 +185,11 @@ export class AgentPrismSessionPair implements HarnessPair {
   private async audit(type: string, details: Record<string, unknown>): Promise<void> {
     if (!this.options.runRoot) return;
     await appendRunEvent(this.options.runRoot, type, details).catch(() => undefined);
+    const role = details.role;
+    const sessionId = details.session_id;
+    if ((role === "executor" || role === "reviewer") && typeof sessionId === "string" && sessionId) {
+      await appendAgentSessionEvent(this.options.runRoot, role, sessionId, type, details).catch(() => undefined);
+    }
   }
 
   private async closeExecutorSession(): Promise<void> {
@@ -206,17 +211,18 @@ export class AgentPrismSessionPair implements HarnessPair {
   private permissionResolver(role: "executor" | "reviewer") {
     return async (request: RequestPermissionRequest) => {
       const tool = request.toolCall.title ?? request.toolCall.name ?? request.toolCall.toolCallId;
+      const activeSession = role === "executor" ? this.executor?.sessionId : this.reviewer?.sessionId;
       if ((this.options.permissionMode ?? "autonomous") === "autonomous") {
         const optionId = selectedPermissionOptionId(request, true);
         await this.audit("agent_permission", {
-          role, mode: "autonomous", tool, selected_option_id: optionId ?? null,
+          role, session_id: activeSession ?? null, mode: "autonomous", tool, selected_option_id: optionId ?? null,
           options: request.options.map((option) => ({ option_id: option.optionId, name: option.name, kind: option.kind })),
         });
         return role === "executor" ? executorPermission(request) : reviewerPermission(request);
       }
       const optionId = await this.options.onPermissionChoice?.(role, request);
       await this.audit("agent_permission", {
-        role, mode: "ask", tool, selected_option_id: optionId ?? null,
+        role, session_id: activeSession ?? null, mode: "ask", tool, selected_option_id: optionId ?? null,
         options: request.options.map((option) => ({ option_id: option.optionId, name: option.name, kind: option.kind })),
       });
       return optionId ? selectPermissionOption(request, optionId) : { outcome: { outcome: "cancelled" as const } };

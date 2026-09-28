@@ -57,6 +57,36 @@ export async function appendRunEvent(
   await appendFile(path, `${json({ at: new Date().toISOString(), type, ...details })}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
+function safeSessionSegment(value: string): string {
+  const safe = value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160);
+  if (!safe || safe === "." || safe === "..") throw new Error("Invalid Agent session id for transcript path.");
+  return safe;
+}
+
+export function agentSessionTranscriptRelativePath(
+  role: "executor" | "reviewer",
+  sessionId: string,
+): string {
+  return `.runtime/sessions/${role}/${safeSessionSegment(sessionId)}.jsonl`;
+}
+
+export async function appendAgentSessionEvent(
+  runRoot: string,
+  role: "executor" | "reviewer",
+  sessionId: string,
+  type: string,
+  details: Record<string, unknown> = {},
+): Promise<string> {
+  const relative = agentSessionTranscriptRelativePath(role, sessionId);
+  const path = auditPath(runRoot, relative);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await appendFile(path, `${json({ at: new Date().toISOString(), type, role, session_id: sessionId, ...details })}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  return relative;
+}
+
 export async function writeRunJson(runRoot: string, relative: string, value: unknown): Promise<void> {
   const path = auditPath(runRoot, relative);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });

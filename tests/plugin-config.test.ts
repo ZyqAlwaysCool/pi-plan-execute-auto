@@ -190,6 +190,56 @@ test("interactive wizard records only a separate human network consent and confi
   }
 });
 
+test("live connectivity health check can be skipped without cancelling setup", async () => {
+  const { root, project, agentDir } = await fixture();
+  let checks = 0;
+  const notices: string[] = [];
+  const ctx = {
+    cwd: project,
+    hasUI: true,
+    ui: {
+      notify(message: string) { notices.push(message); },
+      async confirm(title: string) {
+        if (title.includes("live Agent CLI connectivity")) return false;
+        return true;
+      },
+      async select(title: string, choices: string[]) {
+        if (title.startsWith("Executor: choose")) return choices[0];
+        if (title.startsWith("Reviewer: choose")) return choices[1];
+        if (title.includes("model (candidates")) return choices[0];
+        if (title.includes(": reasoning effort")) return "high";
+        if (title.startsWith("Maximum review rounds")) return choices[1];
+        if (title.startsWith("Agent permission handling")) return choices[0];
+        throw new Error(`Unexpected selection: ${title}`);
+      },
+      async input() { throw new Error("manual model input not expected"); },
+    },
+  } as unknown as Parameters<typeof runSetupWizard>[0];
+  try {
+    const profile = await runSetupWizard(
+      ctx,
+      [
+        { backend: "opencode", executable: "/bin/opencode", version: "OpenCode fixture", models: ["opencode/deepseek-local/deepseek-flash"] },
+        { backend: "codex", executable: "/bin/codex", version: "Codex fixture", models: ["codex/gpt-6-luna"] },
+      ],
+      agentDir,
+      async (_root, backend) => backend === "opencode"
+        ? ["opencode/deepseek-local/deepseek-flash"]
+        : ["codex/gpt-6-luna"],
+      async () => ["low", "medium", "high"],
+      async () => { checks += 1; },
+    );
+    assert.ok(profile);
+    assert.equal(checks, 0);
+    assert.equal(profile?.executorModel, "opencode/deepseek-local/deepseek-flash");
+    assert.equal(profile?.reviewerModel, "codex/gpt-6-luna");
+    assert.match(notices.join("\n"), /connectivity checks skipped/i);
+    assert.deepEqual(await loadProjectPluginProfile(project, agentDir), profile);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("all four backend routes share one wizard; reasoning is chosen independently per role", async () => {
   const { root, project, agentDir } = await fixture();
   let smokeApprovals = 0;

@@ -56,7 +56,7 @@ import {
 import { defaultIsolationProvider } from "../src/isolation-provider.js";
 import { supportedBackendForModel } from "../src/sandbox.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
-import { appendRunEvent, captureMainPiSession } from "../src/run-log.js";
+import { agentSessionTranscriptRelativePath, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 import { StageBController } from "../src/stage-b.js";
 import { DEFAULT_MAX_REVIEW_ROUNDS } from "../src/types.js";
 import type {
@@ -427,7 +427,7 @@ export async function runSetupWizard(
     "Allow Agent CLI discovery?",
     "CLI model discovery may access the host network. ACP catalog fallbacks for Claude, Codex, OpenCode and Pi use a temporary sandboxed read-only session. " +
     "ACP servers still share the host network namespace. Do not proceed for sensitive repositories. " +
-    "Catalog discovery mounts no project files and submits no model turn. Selecting a backend without completed live tests will require a separate billable connectivity confirmation.",
+    "Catalog discovery mounts no project files and submits no model turn. A separate live connectivity check is offered later and may be skipped.",
   );
   if (!preConsent) return undefined;
   const detected = typeof clis === "function" ? await withSetupProgress(ctx, "Detecting local Agent CLIs", clis) : clis;
@@ -504,21 +504,27 @@ export async function runSetupWizard(
 
   const selectedChecks = [[executorModel, executorReasoningEffort], [reviewerModel, reviewerReasoningEffort]] as const;
   const needsLiveCheck = [...new Set(selectedChecks.map(([route, effort]) => `${route} (${effort ?? "backend default"})`))];
+  let liveConnectivity = "skipped";
   if (needsLiveCheck.length) {
     const allowCalls = await ctx.ui.confirm(
-      "Run live Agent CLI connectivity checks?",
+      "Run live Agent CLI connectivity checks? (optional)",
       `Selected routes: ${needsLiveCheck.join(", ")}. Each check opens the selected ACP/CLI in an isolated disposable repository and sends a tiny READY prompt. ` +
-      "This uses your normal CLI/provider configuration and may incur provider charges. A failed check stops setup; the plugin never substitutes another model. No project files are mounted.",
+      "This uses your normal CLI/provider configuration and may incur provider charges. Choose No to skip this optional check and continue setup normally. " +
+      "If you choose Yes, a failed check stops setup; the plugin never substitutes another model. No project files are mounted.",
     );
-    if (!allowCalls) return undefined;
-    for (const [route, effort] of selectedChecks.filter(([model, level], index) =>
-      selectedChecks.findIndex(([otherModel, otherLevel]) => model === otherModel && level === otherLevel) === index)) {
-      await withSetupProgress(ctx, `Checking ${route} (${effort ?? "backend default"})`, () => verifyConnectivity(ctx.cwd, route, effort));
+    if (allowCalls) {
+      for (const [route, effort] of selectedChecks.filter(([model, level], index) =>
+        selectedChecks.findIndex(([otherModel, otherLevel]) => model === otherModel && level === otherLevel) === index)) {
+        await withSetupProgress(ctx, `Checking ${route} (${effort ?? "backend default"})`, () => verifyConnectivity(ctx.cwd, route, effort));
+      }
+      liveConnectivity = "passed";
+    } else {
+      notify(ctx, "Live Agent CLI connectivity checks skipped. Setup will continue; authentication/provider errors, if any, may surface when Execution & Review actually starts.", "info");
     }
   }
   const consent = await ctx.ui.confirm(
     "Confirm normal Agent CLI network access?",
-    `Executor: ${executorModel} (${executorReasoningEffort ?? "backend default"})\nReviewer: ${reviewerModel} (${reviewerReasoningEffort ?? "backend default"})\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\n\n` +
+    `Executor: ${executorModel} (${executorReasoningEffort ?? "backend default"})\nReviewer: ${reviewerModel} (${reviewerReasoningEffort ?? "backend default"})\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\nLive connectivity: ${liveConnectivity}\n\n` +
     "The selected Agent CLIs and their tools keep normal network access, matching a normal standalone CLI session. " +
     "The plugin still isolates the dedicated worktree and unrelated host files; this confirmation does not approve or start execution.",
   );
@@ -1520,6 +1526,85 @@ async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runI
   }
 }
 
+function latestSessionId(state: WorkflowState, role: "executor" | "reviewer"): string | undefined {
+  const key = role === "executor" ? "executor_session_id" : "reviewer_session_id";
+  for (const phase of [...state.phases].reverse()) {
+    const session = phase[key];
+    if (typeof session === "string" && session) return session;
+  }
+  return undefined;
+}
+
+async function showDiagnosticPreview(
+  ctx: ExtensionCommandContext,
+  title: string,
+  absolutePath: string,
+  displayPath: string,
+): Promise<void> {
+  try {
+    const raw = await readFile(absolutePath, "utf8");
+    const maxBytes = 96 * 1024;
+    const preview = Buffer.byteLength(raw) <= maxBytes
+      ? raw
+      : `[Preview shows the last ${maxBytes / 1024} KiB; the complete transcript is in ${displayPath}.]\n\n${Buffer.from(raw).subarray(-maxBytes).toString("utf8")}`;
+    if (ctx.hasUI) {
+      await ctx.ui.confirm(title, `${preview}\n\nComplete file: ${displayPath}`);
+    } else {
+      notify(ctx, `Complete file: ${displayPath}`, "info");
+    }
+  } catch (error) {
+    notify(ctx, `Transcript is not available yet: ${displayPath}\n${error instanceof Error ? error.message : String(error)}`, "warning");
+  }
+}
+
+async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promise<void> {
+  try {
+    const status = await readRunStatus(ctx.cwd, runId);
+    if (!status) {
+      notify(ctx, `Unknown workflow ${runId}.`, "warning");
+      return;
+    }
+    const root = packageRoot(ctx.cwd, runId);
+    const state = await readWorkflowState(root);
+    const eventDisplay = join(".pi-plan-execute-auto", runId, ".runtime", "events.jsonl");
+    const executorSession = state ? latestSessionId(state, "executor") : undefined;
+    const reviewerSession = state ? latestSessionId(state, "reviewer") : undefined;
+    const executorRelative = executorSession ? agentSessionTranscriptRelativePath("executor", executorSession) : undefined;
+    const reviewerRelative = reviewerSession ? agentSessionTranscriptRelativePath("reviewer", reviewerSession) : undefined;
+    const executorDisplay = executorRelative ? join(".pi-plan-execute-auto", runId, executorRelative) : undefined;
+    const reviewerDisplay = reviewerRelative ? join(".pi-plan-execute-auto", runId, reviewerRelative) : undefined;
+
+    notify(
+      ctx,
+      [
+        `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`,
+        `Full event log: ${eventDisplay}`,
+        ...(executorDisplay ? [`Latest Executor transcript: ${executorDisplay}`] : []),
+        ...(reviewerDisplay ? [`Latest Reviewer transcript: ${reviewerDisplay}`] : []),
+      ].join("\n"),
+      "info",
+    );
+
+    if (!ctx.hasUI) return;
+    const choices = [
+      ...(executorDisplay ? ["Preview latest Executor transcript"] : []),
+      ...(reviewerDisplay ? ["Preview latest Reviewer transcript"] : []),
+      "Preview full event log",
+      "Close",
+    ];
+    const choice = await ctx.ui.select("Run diagnostics", choices);
+    if (choice === "Preview latest Executor transcript" && executorRelative && executorDisplay) {
+      await showDiagnosticPreview(ctx, "Latest Executor transcript", join(root, executorRelative), executorDisplay);
+    } else if (choice === "Preview latest Reviewer transcript" && reviewerRelative && reviewerDisplay) {
+      await showDiagnosticPreview(ctx, "Latest Reviewer transcript", join(root, reviewerRelative), reviewerDisplay);
+    } else if (choice === "Preview full event log") {
+      await showDiagnosticPreview(ctx, "Full run event log", join(root, ".runtime", "events.jsonl"), eventDisplay);
+    }
+  } catch (error) {
+    notify(ctx, error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
 async function commandStop(ctx: ExtensionCommandContext, runId: string): Promise<void> {
   const active = activeRuns.get(runId);
   if (!active) {
@@ -1575,18 +1660,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       if (action === "setup") return commandSetup(ctx);
       if (action === "start" && tokens[1]) return commandStart(pi, ctx, tokens[1]);
       if (action === "stop" && tokens[1]) return commandStop(ctx, tokens[1]);
-      if (action === "status" && tokens[1]) {
-        try {
-          const status = await readRunStatus(ctx.cwd, tokens[1]);
-          notify(ctx, status
-            ? `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`
-            : `Unknown workflow ${tokens[1]}.`,
-          status ? "info" : "warning");
-        } catch (error) {
-          notify(ctx, error instanceof Error ? error.message : String(error), "error");
-        }
-        return;
-      }
+      if (action === "status" && tokens[1]) return commandStatus(ctx, tokens[1]);
       notify(ctx, "Usage: /plan-execute | setup | start <run-id> | stop <run-id> | status <run-id>", "info");
     },
   });

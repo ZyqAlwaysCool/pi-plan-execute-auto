@@ -54,7 +54,7 @@ The normal command surface is intentionally small:
 - `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, and permission mode.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
 - `stop <run-id>` requests a safe stop of an active execution.
-- `status <run-id>` shows a compact status summary.
+- `status <run-id>` shows a compact status summary plus the full event-log path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
 
 Structural validation, approval hashing, commit validation, and configuration integrity checks are automatic; they are not separate day-to-day commands.
 
@@ -77,6 +77,9 @@ plan/...
 .runtime/
   events.jsonl
   main-pi-session.json
+  sessions/
+    executor/<session-id>.jsonl
+    reviewer/<session-id>.jsonl
   planning/
     revisions/
       revision-001/package/...
@@ -85,7 +88,7 @@ plan/...
   completions/...
 ```
 
-In addition, AgentPrism records run-local Executor/Reviewer session lifecycle, prompts, ACP stream events (including tool activity when the backend exposes it), terminal turns, permission decisions, and event counts into `.runtime/events.jsonl`. Existing structured execution reports, review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative workflow evidence.
+In addition, AgentPrism records run-local Executor/Reviewer session lifecycle, prompts, ACP stream events (including tool activity when the backend exposes it), terminal turns, permission decisions, and event counts into `.runtime/events.jsonl`. The same Agent-specific events are also split into per-session files under `.runtime/sessions/executor/` and `.runtime/sessions/reviewer/`, so an individual CLI session can be inspected without filtering the global event stream. Existing structured execution reports, review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative workflow evidence.
 
 Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
 
@@ -122,7 +125,7 @@ Setup performs an environment preflight before saving configuration:
 - unprivileged user namespaces work;
 - installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi;
 - Executor model/reasoning and Reviewer model/reasoning are chosen independently;
-- a live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable;
+- an optional live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable; choosing **No** skips the check and setup still completes normally;
 - if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;
 - the final networking behavior is shown before consent is saved.

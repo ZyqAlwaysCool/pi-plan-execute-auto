@@ -3,7 +3,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendRunEvent, captureMainPiSession } from "../src/run-log.js";
+import { agentSessionTranscriptRelativePath, appendAgentSessionEvent, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
+
+test("agent session diagnostics are split into safe per-session transcript files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-session-log-"));
+  try {
+    const relative = await appendAgentSessionEvent(
+      root,
+      "executor",
+      "session/with:unsafe chars",
+      "agent_prompt",
+      { prompt: "implement fixture" },
+    );
+    assert.equal(relative, agentSessionTranscriptRelativePath("executor", "session/with:unsafe chars"));
+    assert.match(relative, /^\.runtime\/sessions\/executor\/session_with_unsafe_chars\.jsonl$/);
+    const contents = await readFile(join(root, relative), "utf8");
+    assert.match(contents, /agent_prompt/);
+    assert.match(contents, /implement fixture/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("run diagnostics redact known host credential values and credential-shaped fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "peac-run-log-"));
