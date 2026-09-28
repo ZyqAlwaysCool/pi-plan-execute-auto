@@ -147,6 +147,7 @@ interface ActiveRun {
 }
 
 const activeRuns = new Map<string, ActiveRun>();
+const pendingHumanReviews = new Set<string>();
 
 function textResult(text: string, details: Record<string, unknown> = {}) {
   return {
@@ -221,8 +222,17 @@ async function chooseApproval(
   readiness?: () => Promise<void>,
 ): Promise<ApprovalDecision> {
   if (!ctx.hasUI) return { kind: "pending" };
+  await appendRunEvent(pkg.root, "plan_review_presented", {
+    package_hash: pkg.package_hash,
+    plan_revision: revision ?? null,
+  }).catch(() => undefined);
   for (;;) {
     const choice = await ctx.ui.select("Plan Review & Approval", ["Review Plan", "Request Changes", "Approve & Start", "Cancel"]);
+    await appendRunEvent(pkg.root, "plan_review_choice", {
+      package_hash: pkg.package_hash,
+      plan_revision: revision ?? null,
+      choice: choice ?? "dismissed",
+    }).catch(() => undefined);
     if (choice === "Cancel" || !choice) return { kind: "cancel" };
     if (choice === "Review Plan") {
       const review = await packageReviewText(pkg, revision);
@@ -1177,7 +1187,6 @@ async function startStageB(
       },
       onLiveEvent: (role, event) => {
         showWidget(ctx, [`Execution & Review · ${runId}`, `${role} · ${event}`]);
-        void appendRunEvent(pkg.root, "agent_live_event", { role, event }).catch(() => undefined);
       },
     });
     harness = sessionPair;
@@ -1422,29 +1431,20 @@ async function handleFinalize(
     });
     await captureCurrentMainPiSession(ctx, written.package.root);
     showWidget(ctx, ["Plan Review & Approval", `Run ${runId} · revision 1`, `${written.package.phases.length} phases · ready for review`]);
-
-    const result = await reviewDraftAndStart(pi, ctx, written.package, selection);
-    if (result.status === "awaiting_approval") {
-      return textResult(
-        `Draft plan ${runId} is ready for human review. Run /plan-execute start ${runId} when you want to review/approve it.`,
-        { status: result.status, run_id: runId, package_hash: written.package.package_hash },
-      );
+    if (ctx.hasUI) {
+      pendingHumanReviews.add(runId);
+      await appendRunEvent(written.package.root, "plan_review_queued", {
+        package_hash: written.package.package_hash,
+        plan_revision: 1,
+        source: "finalize",
+      }).catch(() => undefined);
     }
-    if (result.status === "revision_requested") {
-      return textResult("Plan changes requested. Main Pi will regenerate the complete draft and reopen Review & Approval.", {
-        status: result.status, run_id: runId,
-      });
-    }
-    if (result.status === "cancelled") {
-      return textResult(`Plan ${runId} cancelled before approval.`, { status: result.status, run_id: runId });
-    }
-    if (result.status === "not_started") {
-      return textResult(
-        `Plan approved, but execution has not started: ${result.reason}\nFix the prerequisite and run /plan-execute start ${runId}.`,
-        { status: result.status, run_id: runId, state: result.state },
-      );
-    }
-    return textResult(`Execution & Review: ${result.status}.`, { status: result.status, run_id: runId, state: result.state });
+    return textResult(
+      ctx.hasUI
+        ? `Draft plan ${runId} is validated. Human Review & Approval will open after this Main Pi turn completes.`
+        : `Draft plan ${runId} is validated and awaiting human approval. Run /plan-execute start ${runId} in an interactive Pi session to review it.`,
+      { status: "awaiting_approval", run_id: runId, package_hash: written.package.package_hash },
+    );
   } catch (error) {
     const details = errorDetails(error);
     notify(ctx, details.text, "error");
@@ -1480,36 +1480,80 @@ async function handleRevise(
     showWidget(ctx, [
       "Plan Review & Approval",
       `Run ${params.run_id} · revision ${nextState.plan_revision ?? 2}`,
-      `${written.package.phases.length} phases · revision validated`,
+      `${written.package.phases.length} phases · revision validated · awaiting human review`,
     ]);
-
-    const result = await reviewDraftAndStart(pi, ctx, written.package, selection);
-    if (result.status === "revision_requested") {
-      return textResult("More plan changes requested. Main Pi will regenerate the draft again.", {
-        status: result.status, run_id: params.run_id,
-      });
+    if (ctx.hasUI) {
+      pendingHumanReviews.add(params.run_id);
+      await appendRunEvent(written.package.root, "plan_review_queued", {
+        package_hash: written.package.package_hash,
+        plan_revision: nextState.plan_revision ?? 2,
+        source: "revise",
+      }).catch(() => undefined);
     }
-    if (result.status === "awaiting_approval") {
-      return textResult(`Revised plan ${params.run_id} is ready for approval.`, {
-        status: result.status, run_id: params.run_id, package_hash: written.package.package_hash,
-      });
-    }
-    if (result.status === "cancelled") {
-      return textResult(`Plan ${params.run_id} cancelled before approval.`, { status: result.status, run_id: params.run_id });
-    }
-    if (result.status === "not_started") {
-      return textResult(
-        `Plan approved, but execution has not started: ${result.reason}\nFix the prerequisite and run /plan-execute start ${params.run_id}.`,
-        { status: result.status, run_id: params.run_id, state: result.state },
-      );
-    }
-    return textResult(`Execution & Review: ${result.status}.`, {
-      status: result.status, run_id: params.run_id, state: result.state,
-    });
+    return textResult(
+      ctx.hasUI
+        ? `Revised plan ${params.run_id} is validated. Human Review & Approval will reopen after this Main Pi turn completes.`
+        : `Revised plan ${params.run_id} is validated and awaiting human approval.`,
+      {
+        status: "awaiting_approval",
+        run_id: params.run_id,
+        package_hash: written.package.package_hash,
+        plan_revision: nextState.plan_revision ?? 2,
+      },
+    );
   } catch (error) {
     const details = errorDetails(error);
     notify(ctx, details.text, "error");
     return textResult(details.text, details.details);
+  }
+}
+
+async function presentQueuedHumanReview(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runId: string,
+): Promise<void> {
+  const loaded = await loadValidatedRun(ctx.cwd, runId);
+  if (loaded.state.status !== "draft") {
+    await appendRunEvent(loaded.package.root, "plan_review_skipped", {
+      reason: `state is ${loaded.state.status}`,
+    }).catch(() => undefined);
+    return;
+  }
+  const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
+  const result = await reviewDraftAndStart(pi, ctx, loaded.package, selection);
+  if (result.status === "revision_requested") {
+    notify(ctx, "Plan changes sent back to Main Pi. The next revised draft will return to Review & Approval.", "info");
+    return;
+  }
+  if (result.status === "awaiting_approval") {
+    notify(ctx, `Run ${runId} is awaiting human approval.`, "warning");
+    return;
+  }
+  if (result.status === "cancelled") {
+    notify(ctx, `Plan ${runId} cancelled before execution.`, "info");
+    return;
+  }
+  if (result.status === "not_started") {
+    notify(ctx, `Plan approved, but execution has not started: ${result.reason}\nFix the prerequisite and run /plan-execute start ${runId}.`, "warning");
+    return;
+  }
+  if (result.status === "paused") {
+    notify(ctx, `Execution & Review paused for ${runId}. Diagnostic details are in ${loaded.package.root}/.runtime/.`, "warning");
+    return;
+  }
+  notify(ctx, `Execution & Review ${result.status} for ${runId}.`, "info");
+}
+
+async function drainQueuedHumanReview(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  if (!ctx.hasUI) return;
+  const runId = pendingHumanReviews.values().next().value as string | undefined;
+  if (!runId) return;
+  pendingHumanReviews.delete(runId);
+  try {
+    await presentQueuedHumanReview(pi, ctx, runId);
+  } catch (error) {
+    notify(ctx, `Could not open Plan Review & Approval for ${runId}: ${error instanceof Error ? error.message : String(error)}\nThe draft remains reviewable with /plan-execute start ${runId}.`, "error");
   }
 }
 
@@ -1771,7 +1815,12 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("turn_end", async (_event, ctx) => {
+    await drainQueuedHumanReview(pi, ctx);
+  });
+
   pi.on("session_shutdown", (_event, ctx) => {
+    pendingHumanReviews.clear();
     clearWidget(ctx);
   });
 }

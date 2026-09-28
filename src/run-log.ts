@@ -32,6 +32,24 @@ function redactSerialized(text: string): string {
   return redacted;
 }
 
+const appendQueues = new Map<string, Promise<void>>();
+
+async function appendJsonLine(path: string, line: string): Promise<void> {
+  const previous = appendQueues.get(path) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => current);
+  appendQueues.set(path, tail);
+  try {
+    await previous;
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await appendFile(path, line, { encoding: "utf8", mode: 0o600 });
+  } finally {
+    release();
+    if (appendQueues.get(path) === tail) appendQueues.delete(path);
+  }
+}
+
 function json(value: unknown): string {
   const seen = new WeakSet<object>();
   const serialized = JSON.stringify(value, (key, item) => {
@@ -53,8 +71,7 @@ export async function appendRunEvent(
   details: Record<string, unknown> = {},
 ): Promise<void> {
   const path = auditPath(runRoot, ".runtime/events.jsonl");
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await appendFile(path, `${json({ at: new Date().toISOString(), type, ...details })}\n`, { encoding: "utf8", mode: 0o600 });
+  await appendJsonLine(path, `${json({ at: new Date().toISOString(), type, ...details })}\n`);
 }
 
 function safeSessionSegment(value: string): string {
@@ -79,11 +96,7 @@ export async function appendAgentSessionEvent(
 ): Promise<string> {
   const relative = agentSessionTranscriptRelativePath(role, sessionId);
   const path = auditPath(runRoot, relative);
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await appendFile(path, `${json({ at: new Date().toISOString(), type, role, session_id: sessionId, ...details })}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
+  await appendJsonLine(path, `${json({ at: new Date().toISOString(), type, role, session_id: sessionId, ...details })}\n`);
   return relative;
 }
 

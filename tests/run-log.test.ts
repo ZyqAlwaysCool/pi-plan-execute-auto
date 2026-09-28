@@ -25,6 +25,21 @@ test("agent session diagnostics are split into safe per-session transcript files
   }
 });
 
+test("concurrent run event writes remain valid JSONL and preserve every event", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-run-log-concurrent-"));
+  try {
+    await Promise.all(Array.from({ length: 250 }, (_, index) =>
+      appendRunEvent(root, "concurrent_fixture", { index, payload: "x".repeat(256) })));
+    const lines = (await readFile(join(root, ".runtime", "events.jsonl"), "utf8")).trim().split("\n");
+    assert.equal(lines.length, 250);
+    const parsed = lines.map((line) => JSON.parse(line) as { type: string; index: number });
+    assert.ok(parsed.every((entry) => entry.type === "concurrent_fixture"));
+    assert.deepEqual(parsed.map((entry) => entry.index).sort((a, b) => a - b), Array.from({ length: 250 }, (_, index) => index));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("run diagnostics redact known host credential values and credential-shaped fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "peac-run-log-"));
   const previous = process.env.ANTHROPIC_AUTH_TOKEN;
