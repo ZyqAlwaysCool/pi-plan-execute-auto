@@ -281,7 +281,7 @@ export interface StageBStatusEvent {
 }
 
 export interface StageBRunResult {
-  status: "completed" | "paused" | "aborted";
+  status: "completed" | "paused" | "aborted" | "not_started";
   state: WorkflowState;
   reason?: string | undefined;
 }
