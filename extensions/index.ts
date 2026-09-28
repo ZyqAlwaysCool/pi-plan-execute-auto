@@ -1625,7 +1625,7 @@ async function commandApprove(
       return;
     }
     const result = await startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
-    notify(ctx, result.status === "not_started" ? result.reason : `Execution & Review ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
+    notify(ctx, result.status === "not_started" ? (result.reason ?? "Execution & Review has not started.") : `Execution & Review ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
