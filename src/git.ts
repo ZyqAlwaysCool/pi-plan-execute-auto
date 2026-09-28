@@ -771,16 +771,6 @@ export async function ensureDedicatedWorktree(
     cwd: options.sourceCwd,
     runtimeRoot: options.runtimeRoot,
   });
-  const baseCommit = await source.head(commandOptions);
-  await source.assertNoCachedChanges(commandOptions);
-  const dirty = await source.changedPaths(commandOptions);
-  if (dirty.length > 0) {
-    throw new GitPolicyError(
-      `Main worktree must be clean before creating the dedicated execution worktree: ${dirty.join(", ")}.`,
-      "SOURCE_WORKTREE_DIRTY",
-    );
-  }
-
   const targetPath = resolve(options.targetPath);
   const branchName = options.branchName;
   if (options.existing?.path || options.existing?.branchName) {
@@ -794,6 +784,16 @@ export async function ensureDedicatedWorktree(
     }
     const targetHead = await new GitWorkspace(options.targetGit, { cwd: targetPath }).head(commandOptions);
     return { branchName, path: targetPath, baseCommit: targetHead };
+  }
+
+  const baseCommit = await source.head(commandOptions);
+  await source.assertNoCachedChanges(commandOptions);
+  const dirty = await source.changedPaths(commandOptions);
+  if (dirty.length > 0) {
+    throw new GitPolicyError(
+      `Main worktree must be clean before creating the dedicated execution worktree: ${dirty.join(", ")}.`,
+      "SOURCE_WORKTREE_DIRTY",
+    );
   }
 
   await mkdir(dirname(targetPath), { recursive: true });

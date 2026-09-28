@@ -2,7 +2,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { lstat, mkdir, open, realpath, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFile = promisify(execFileCallback);

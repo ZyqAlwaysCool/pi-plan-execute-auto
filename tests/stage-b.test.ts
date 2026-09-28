@@ -340,6 +340,38 @@ test("dependency provisioning is bounded and cancellable", async () => {
   }
 });
 
+test("an existing dedicated worktree is not blocked by later changes in the main worktree", async () => {
+  const setup = await setupRepo();
+  const worktree = join(tmpdir(), `pi-plan-execute-auto-existing-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const branchName = "pi-plan-execute-auto/existing-test";
+  try {
+    await ensureDedicatedWorktree(createLocalGitOperations(setup.cwd), {
+      sourceCwd: setup.cwd,
+      runId: "existing-test",
+      runtimeRoot: ".pi-plan-execute-auto/existing-test",
+      targetPath: worktree,
+      branchName,
+      targetGit: createLocalGitOperations(worktree),
+    });
+    await writeFile(join(setup.cwd, "main-only-uncommitted.txt"), "main workspace may move on\n", "utf8");
+    const reopened = await ensureDedicatedWorktree(createLocalGitOperations(setup.cwd), {
+      sourceCwd: setup.cwd,
+      runId: "existing-test",
+      runtimeRoot: ".pi-plan-execute-auto/existing-test",
+      targetPath: worktree,
+      branchName,
+      targetGit: createLocalGitOperations(worktree),
+      existing: { path: worktree, branchName },
+    });
+    assert.equal(reopened.path, worktree);
+    assert.equal(reopened.branchName, branchName);
+  } finally {
+    await git(setup.cwd, ["worktree", "remove", "--force", worktree]);
+    await rm(worktree, { recursive: true, force: true });
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
 test("Stage B uses and verifies a run-scoped dedicated branch/worktree", async () => {
   const setup = await setupRepo();
   const worktree = join(tmpdir(), `pi-plan-execute-auto-worktree-${Date.now()}-${Math.random().toString(16).slice(2)}`);

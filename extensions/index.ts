@@ -1079,7 +1079,8 @@ async function startStageB(
         return index >= 0 ? request.options[index]?.optionId : undefined;
       },
       onLiveEvent: (role, event) => {
-        showWidget(ctx, [`Execution & Review · ${runId}`, `${role} · ${event}`, `Branch ${dedicated.branchName}`]);
+        showWidget(ctx, [`Execution & Review · ${runId}`, `${role} · ${event}`]);
+        void appendRunEvent(pkg.root, "agent_live_event", { role, event }).catch(() => undefined);
       },
     });
     harness = sessionPair;
@@ -1293,6 +1294,8 @@ async function reviewDraftAndStart(
     plan_revision: frozen.plan_revision ?? current.plan_revision ?? 1,
     executor_model: selection.executorModel,
     reviewer_model: selection.reviewerModel,
+    executor_reasoning_effort: selection.executorReasoningEffort ?? selection.reasoningEffort ?? "backend-default",
+    reviewer_reasoning_effort: selection.reviewerReasoningEffort ?? selection.reasoningEffort ?? "backend-default",
     review_round_limit: selection.reviewRoundLimit,
     permission_mode: selection.permissionMode,
   }).catch(() => undefined);

@@ -2,18 +2,25 @@
 
 Pi-native phased planning, execution, independent review, acceptance, and phase-commit workflow.
 
-The plugin keeps **Main Pi** as the planning partner. When the user decides the discussion is ready, `/plan-execute` turns the agreed plan into a phased execution/acceptance package, asks the human to review it, and starts automated execution only after **Approve & Start**.
+The plugin keeps **Main Pi** as the planning partner. The user decides when planning is mature enough to formalize by running `/plan-execute`. The resulting phased plan stays editable until the human explicitly approves it; only then does automated Execution & Review begin.
 
 ## Workflow
 
 ### Planning & Approval
 
 1. The user and Main Pi discuss the task normally for as many turns as needed.
-2. The user explicitly runs `/plan-execute` when the plan is ready to be formalized.
-3. Main Pi produces a validated package with ordered phases, phase specs, allowed paths, required self-tests, acceptance contracts, and phase commit messages.
-4. The human reviews the package and chooses **Approve & Start**.
+2. The user explicitly runs `/plan-execute`.
+3. Main Pi produces a validated draft package with ordered phases, phase specs, allowed paths, required self-tests, acceptance contracts, and phase commit messages.
+4. The human can:
+   - **Review Plan** — inspect the current draft;
+   - **Request Changes** — describe revisions in an editor; Main Pi regenerates the complete draft package and the plugin validates it again;
+   - **Approve & Start** — freeze the exact reviewed package hash and start execution;
+   - **Cancel**.
+5. Plan revision can repeat as many times as needed before approval. Previous draft revisions are retained under the run's `.runtime/planning/revisions/` directory.
 
-The AI cannot silently approve or start execution.
+The AI cannot silently approve or start execution. A revision request never modifies project code.
+
+Before **Approve & Start**, the plugin runs a readiness check. Normal fixable prerequisites—such as a dirty main worktree, missing Git baseline commit, unavailable isolation runtime, or a stale worktree path—do not turn the run into a failed/paused execution. The plan remains editable/retryable until the prerequisite is fixed.
 
 ### Execution & Review
 
@@ -29,6 +36,61 @@ For every phase:
 
 The process continues until all phases have development, self-test, independent review, final acceptance, and a phase commit.
 
+Only integrity/execution failures that genuinely require human attention are persisted as `paused`—for example package/evidence tampering, worktree identity mismatch, broken completion evidence, or an execution process restart that would violate the same-session invariant. Ordinary start prerequisites remain retryable with `/plan-execute start <run-id>`.
+
+## Commands
+
+The normal command surface is intentionally small:
+
+```text
+/plan-execute
+/plan-execute setup
+/plan-execute start <run-id>
+/plan-execute stop <run-id>
+/plan-execute status <run-id>
+```
+
+- `/plan-execute` formalizes the current planning discussion into a draft and opens Review & Approval.
+- `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, and permission mode.
+- `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
+- `stop <run-id>` requests a safe stop of an active execution.
+- `status <run-id>` shows a compact status summary.
+
+Structural validation, approval hashing, commit validation, and configuration integrity checks are automatic; they are not separate day-to-day commands.
+
+## Run-local diagnostics
+
+Each run is self-contained under:
+
+```text
+.pi-plan-execute-auto/<run-id>/
+```
+
+The directory contains the Golden Plan plus local diagnostic material under `.runtime/`. Copying the whole run directory is intended to provide enough context to diagnose most failures without scraping the main Pi UI.
+
+Typical contents include:
+
+```text
+manifest.yaml
+plan/...
+.state.json
+.runtime/
+  events.jsonl
+  main-pi-session.json
+  planning/
+    revisions/
+      revision-001/package/...
+  reports/...
+  diffs/...
+  completions/...
+```
+
+In addition, AgentPrism records run-local Executor/Reviewer session lifecycle, prompts, terminal turns, permission decisions, and event counts into `.runtime/events.jsonl`. Existing structured execution reports, review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative workflow evidence.
+
+The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. The bundle can still contain source snippets, prompts, model outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
+
+The main UI is deliberately compact: current run/phase/round and high-level state stay visible, while detailed diagnostics live in the run directory. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
+
 ## Full native Agent CLI sessions
 
 Built-in routes:
@@ -38,7 +100,7 @@ Built-in routes:
 - `opencode/<provider>/<model>`
 - `pi/<provider>/<model>`
 
-Executor and Reviewer are real independent ACP/CLI processes, not Main Pi subagents. The plugin preserves the selected CLI's normal model routing, gateway/provider environment, native user configuration, plugins/MCP/tool configuration, shell tools, and normal network access inside a private runtime copy.
+Executor and Reviewer are real independent ACP/CLI processes, not Main Pi subagents. The plugin preserves the selected CLI's normal model routing, gateway/provider environment, native user configuration, plugins/MCP/tool configuration, shell tools, proxies, and normal network access inside a private runtime copy.
 
 For example, `claude/sonnet` means “use the Claude CLI and select its `sonnet` slot”. If the user's Claude configuration maps that slot to another gateway model, that native mapping remains valid.
 
@@ -54,11 +116,12 @@ Run:
 
 Setup performs an environment preflight before saving configuration:
 
-- Git initialization is offered only if the directory is not already a repository (it still requires explicit consent); once at the repository root, setup creates or appends `.pi-plan-execute-auto/` in `.gitignore` when that directory is not already ignored. Existing ignore rules are preserved. Setup never stages or commits `.gitignore`: review and commit it yourself before **Approve & Start**, and keep generated package/config files out of Git;
+- Git initialization is offered only if the directory is not already a repository and still requires explicit consent;
+- plugin runtime/config is ignored through repository-local `.git/info/exclude`; setup does **not** create or modify project `.gitignore`, stage files, or create a project diff;
 - trusted Linux `bubblewrap` is available;
 - unprivileged user namespaces work;
-- installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi (cleared on success or failure);
-- Executor model and its advertised reasoning level are selected together, then Reviewer model and its own advertised reasoning level are selected (for example Executor `medium`, Reviewer `high`); each selection is rechecked at Stage B start;
+- installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi;
+- Executor model/reasoning and Reviewer model/reasoning are chosen independently;
 - a live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable;
 - if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;
@@ -162,16 +225,14 @@ npm run test:acp:pi:required
 
 Headless execution can additionally set:
 
-- `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=low|medium|high|max` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=low|medium|high|max` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides
-- `PI_PLAN_EXECUTE_PERMISSION_MODE=autonomous|ask`
-- `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`
+- `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=low|medium|high|max` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=low|medium|high|max` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides;
+- `PI_PLAN_EXECUTE_PERMISSION_MODE=autonomous|ask`;
+- `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`.
 
 Interactive setup remains the normal workflow.
 
 ## Validation status
 
-- **Codex/OpenCode:** real WSL validation on head `4768b81` passed Executor, Reviewer, and a complete one-phase workflow (**3/3**).
-- **Pi:** real WSL validation on head `4768b81` passed Executor, Reviewer, and a complete one-phase workflow (**3/3**).
-- **Claude:** the same pre-fix run reached **2/3**. The complete workflow failed when the plugin still forced `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, which made Claude Code require `socat` for Bash self-tests. That plugin-forced setting has now been removed. Claude must be rerun on the new head before **3/3** live validation is claimed; `socat` is only expected when the user's own Claude native sandbox configuration requires it.
+The native-session architecture previously passed real WSL validation for OpenCode Executor + Codex Reviewer (**3/3**) and Pi (**3/3**). Claude reached **2/3** before the plugin-forced Claude inner-sandbox issue was removed. After workflow/UX changes, rerun real provider gates on the current head before treating earlier provider results as validation of the new head.
 
 Non-billable CI is necessary but does not replace a real provider-call test for the selected CLI/model/gateway.
