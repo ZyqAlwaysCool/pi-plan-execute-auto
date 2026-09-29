@@ -176,6 +176,9 @@ test("macOS Seatbelt can launch a real OpenCode ACP session", {
       `exec "$@" 2>${quote(stderrPath)}`,
       "sh",
       runtimeCommand,
+      "--print-logs",
+      "--log-level",
+      "DEBUG",
       ...rawArgs.slice(commandIndex + 1),
     ];
     agent = new AcpAgent({
