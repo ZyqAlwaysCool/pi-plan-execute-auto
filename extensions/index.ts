@@ -1206,7 +1206,13 @@ async function startStageB(
     state.status === "frozen" &&
     state.phases.some((phase) => phase.status === "running" || phase.review_rounds > 0 || Boolean(phase.executor_session_id))
   ) {
-    return persistAndEscalatePause(pi, ctx, pkg, state, restartPause(state));
+    return persistAndEscalatePause(
+      pi,
+      ctx,
+      pkg,
+      state,
+      `[PROCESS_RESTART] Frozen run ${runId} contains persisted execution evidence from an interrupted process. Use /plan-execute resume ${runId} after it is marked paused.`,
+    );
   }
   if (state.status !== "frozen") {
     return { status: "not_started", state, reason: `Run is ${state.status}; its plan must be approved before Execution & Review can start.` };
@@ -1864,11 +1870,8 @@ async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runI
       return;
     }
     if (result.status === "paused") {
-      // A newly-paused run is already reported by persistAndEscalatePause.
-      // If the command started from an already-paused run, surface that state once.
-      if (loaded.state.status === "paused") {
-        notify(ctx, `Execution & Review is paused. Diagnostic details are in ${loaded.package.root}/.runtime/.`, "warning");
-      }
+      // commandStart never enters from a paused state; newly-paused execution is
+      // already reported by persistAndEscalatePause.
       return;
     }
     notify(ctx, `Execution & Review ${result.status}.`, "info");
