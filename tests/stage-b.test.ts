@@ -1390,3 +1390,48 @@ test("paused Stage B remains inert unless resume is explicitly requested", async
     await rm(setup.cwd, { recursive: true, force: true });
   }
 });
+
+
+test("resume reconciliation accepts a committed phase whose completion record landed before state save", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const completed = await runController(setup, new FakeHarness(setup.cwd, base));
+    assert.equal(completed.status, "completed");
+
+    const phase = completed.state.phases[0]!;
+    const committedSha = phase.phase_commit_sha;
+    assert.ok(committedSha);
+
+    // Simulate the crash window: immutable commit/record exist, but persisted
+    // workflow state still says the phase was running.
+    const stale = structuredClone(completed.state);
+    stale.status = "running";
+    delete stale.completed_at;
+    stale.pause_reason = undefined;
+    const stalePhase = stale.phases[0]!;
+    stalePhase.status = "running";
+    delete stalePhase.phase_commit_sha;
+    delete stalePhase.committed_at;
+    delete stalePhase.completion_record_path;
+    delete stalePhase.completion_record_sha256;
+    delete stalePhase.final_diff_path;
+    delete stalePhase.final_diff_sha256;
+    delete stalePhase.reviewed_diff_sha256;
+    await writeWorkflowState(setup.packageRoot, stale);
+
+    const recovered = await reconcilePersistedCompletions(
+      { appendEntry() {} } as never,
+      { cwd: setup.cwd, hasUI: false } as never,
+      setup.pkg,
+      stale,
+      { continueAfterRecovery: true },
+    );
+    assert.equal(recovered?.status, "completed");
+    assert.equal(stale.status, "completed");
+    assert.equal(stale.phases[0]?.status, "completed");
+    assert.equal(stale.phases[0]?.phase_commit_sha, committedSha);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});

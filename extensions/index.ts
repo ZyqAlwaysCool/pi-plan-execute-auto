@@ -982,6 +982,7 @@ export async function reconcilePersistedCompletions(
   ctx: ExtensionContext,
   pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
   state: WorkflowState,
+  options?: { continueAfterRecovery?: boolean },
 ): Promise<StageBRunResult | undefined> {
   if (!state.worktree_path || !state.branch_name) return undefined;
   validateControlledEnvironmentPaths(state);
@@ -1069,6 +1070,15 @@ export async function reconcilePersistedCompletions(
     state.completed_at ??= new Date().toISOString();
     await writeWorkflowState(pkg.root, state);
     return { status: "completed", state };
+  }
+  if (options?.continueAfterRecovery) {
+    await writeWorkflowState(pkg.root, state);
+    await appendRunEvent(pkg.root, "completion_reconciled_for_resume", {
+      run_id: state.run_id,
+      recovered_phases: recovered.map(({ phase }) => phase.phase_id),
+      next_phase: state.phases.find((phase) => phase.status !== "completed")?.phase_id ?? null,
+    }).catch(() => undefined);
+    return undefined;
   }
   return persistAndEscalatePause(
     pi,
@@ -1165,6 +1175,23 @@ async function startStageB(
   }
   if (resumeRequested) {
     if (activeRuns.has(runId)) return { status: "not_started", state, reason: `Run ${runId} is already active.` };
+    try {
+      const reconciled = await reconcilePersistedCompletions(pi, ctx, pkg, state, { continueAfterRecovery: true });
+      if (reconciled) {
+        showWidget(ctx, stateLines(reconciled.state));
+        pi.appendEntry(STATE_ENTRY, reconciled.state);
+        return reconciled;
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await appendRunEvent(pkg.root, "workflow_resume_rejected", {
+        run_id: runId,
+        reason,
+        pause_reason: state.pause_reason ?? null,
+        stage: "completion-reconciliation",
+      }).catch(() => undefined);
+      return { status: "not_started", state, reason: `Resume completion evidence verification failed: ${reason}` };
+    }
     const eligibility = evaluateResumeEligibility(state, { allowOrphanedRunning: true });
     if (!eligibility.ok) {
       await appendRunEvent(pkg.root, "workflow_resume_rejected", {
