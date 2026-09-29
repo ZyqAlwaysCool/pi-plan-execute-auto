@@ -89,6 +89,8 @@ const FINALIZE_PROMPT_LINES = [
   "Create a Golden Document Package with at least one ordered phase. Every phase needs its own spec, acceptance YAML contract, and required completion commit.",
   "Do not implement code or approve/freeze the package on the user's behalf. The plugin will validate the draft, let the human request revisions repeatedly, and ask for approval.",
   "Do not supply executor_model or reviewer_model: only the human's /plan-execute setup selection owns the ACP routing.",
+  "After plan_execute_finalize succeeds, end this Main Pi turn with only a brief handoff that the validated draft is ready and the plugin Review & Approval UI will open.",
+  "Do not restate or summarize the draft plan after finalization, do not ask for approval in chat, and do not give Request Changes instructions in prose; the plugin UI is authoritative for review and approval.",
 ];
 
 export function buildFinalizePrompt(directive?: string): string {
@@ -380,6 +382,7 @@ async function requestPlanRevision(
     "Use the complete current conversation, repository context, existing draft package, and the human feedback below.",
     "Regenerate the COMPLETE replacement manifest and all draft plan files, then call plan_execute_revise with the same run_id and previous_package_hash.",
     "After revision the plugin will validate the full package and reopen human Review & Approval.",
+    "After plan_execute_revise succeeds, end the Main Pi turn with only a brief handoff. Do not restate the revised plan or ask for approval in chat; the plugin UI owns review and approval.",
     "",
     "Human revision request:",
     feedback,
@@ -1605,7 +1608,7 @@ async function presentQueuedHumanReview(
     return;
   }
   if (result.status === "paused") {
-    notify(ctx, `Execution & Review paused for ${runId}. Diagnostic details are in ${loaded.package.root}/.runtime/.`, "warning");
+    // persistAndEscalatePause already emitted the authoritative pause warning.
     return;
   }
   notify(ctx, `Execution & Review ${result.status} for ${runId}.`, "info");
@@ -1682,7 +1685,8 @@ async function commandApprove(
       return;
     }
     const result = await startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
-    notify(ctx, result.status === "not_started" ? (result.reason ?? "Execution & Review has not started.") : `Execution & Review ${result.status}.`, result.status === "paused" || result.status === "not_started" ? "warning" : "info");
+    if (result.status === "paused") return;
+    notify(ctx, result.status === "not_started" ? (result.reason ?? "Execution & Review has not started.") : `Execution & Review ${result.status}.`, result.status === "not_started" ? "warning" : "info");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -1716,7 +1720,11 @@ async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runI
       return;
     }
     if (result.status === "paused") {
-      notify(ctx, `Execution & Review is paused. Diagnostic details are in ${loaded.package.root}/.runtime/.`, "warning");
+      // A newly-paused run is already reported by persistAndEscalatePause.
+      // If the command started from an already-paused run, surface that state once.
+      if (loaded.state.status === "paused") {
+        notify(ctx, `Execution & Review is paused. Diagnostic details are in ${loaded.package.root}/.runtime/.`, "warning");
+      }
       return;
     }
     notify(ctx, `Execution & Review ${result.status}.`, "info");
@@ -1824,6 +1832,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       "Use plan_execute_finalize only after the human explicitly invokes /plan-execute; it must contain at least one ordered phase.",
       "Each phase needs an independent spec file, acceptance YAML contract, and required plugin-owned completion commit.",
       "Do not approve/freeze the package or implement project code; the plugin owns the human revision/approval loop.",
+      "After a successful finalize, keep the Main Pi handoff brief and do not restate the draft or ask for approval in chat.",
     ],
     parameters: FINALIZE_SCHEMA,
     executionMode: "sequential",
@@ -1842,6 +1851,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       "Pass the exact run_id and previous_package_hash from that request.",
       "Regenerate the COMPLETE manifest and complete set of draft plan files; do not send a partial patch.",
       "Do not implement project code or approve the revised plan on the human's behalf.",
+      "After a successful revision, keep the Main Pi handoff brief and let the plugin UI reopen review.",
     ],
     parameters: REVISE_SCHEMA,
     executionMode: "sequential",
@@ -1884,8 +1894,15 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
-    await drainQueuedHumanReview(pi, ctx);
+  // Human review must not run inside turn_end. Pi awaits turn_end boundary
+  // handlers before the agent run can settle, so awaiting Review -> Stage B here
+  // can hold the Main Pi final response behind a long Executor/Reviewer run.
+  // agent_settled means the Main Pi run is fully finished; defer one event-loop
+  // tick so the UI can commit the settled state before opening blocking review UI.
+  pi.on("agent_settled", (_event, ctx) => {
+    setTimeout(() => {
+      void drainQueuedHumanReview(pi, ctx);
+    }, 0);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

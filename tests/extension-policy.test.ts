@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
+import planExecuteAuto, {
   approvalStartsStageB,
   buildFinalizePrompt,
   parsePlanExecuteCommand,
@@ -52,4 +52,27 @@ test("inline directive is authoritative for plan selection but never bypasses hu
   assert.match(prompt, /Do not ask the human to repeat or reconfirm/u);
   assert.match(prompt, /do NOT authorize bypassing.*Plan Review & Approval/u);
   assert.match(prompt, /Do not implement code or approve\/freeze/u);
+  assert.match(prompt, /end this Main Pi turn with only a brief handoff/u);
+  assert.match(prompt, /Do not restate or summarize the draft plan/u);
+});
+
+test("queued human review waits for full agent settlement and never blocks turn_end", () => {
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  const fakePi = {
+    registerTool() {},
+    registerCommand() {},
+    registerEntryRenderer() {},
+    on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      handlers.set(event, handler);
+      return () => {};
+    },
+  };
+  planExecuteAuto(fakePi as unknown as Parameters<typeof planExecuteAuto>[0]);
+
+  assert.equal(handlers.has("turn_end"), false, "review must not run in the awaited turn_end boundary");
+  const settled = handlers.get("agent_settled");
+  assert.ok(settled, "review lifecycle must attach to agent_settled");
+
+  const result = settled({ type: "agent_settled" }, { hasUI: false });
+  assert.equal(result, undefined, "agent_settled handler must schedule review without awaiting it");
 });
