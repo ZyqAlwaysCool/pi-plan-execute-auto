@@ -859,6 +859,7 @@ async function writeMacSandboxProfile(
 function macSandboxExecArgs(
   profilePath: string,
   environment: Array<[string, string]>,
+  cwd: string,
   command: string,
   args: string[],
 ): string[] {
@@ -866,6 +867,8 @@ function macSandboxExecArgs(
     "-f",
     profilePath,
     "/usr/bin/env",
+    "-C",
+    cwd,
     "-i",
     ...environment.map(([key, value]) => `${key}=${value}`),
     command,
@@ -1258,7 +1261,7 @@ async function createMacOSSandboxedBackend(options: SandboxOptions): Promise<San
     const environment = macSandboxEnvironment(normalized, scratchPath, runtime, backendId);
     const config: CustomBackendConfig = {
       command: sandboxExec,
-      args: macSandboxExecArgs(profilePath, environment, hostRuntime.command, hostRuntime.args),
+      args: macSandboxExecArgs(profilePath, environment, cwd, hostRuntime.command, hostRuntime.args),
       fork: { disposition: backendId === "claude" ? "id-only" : "live", cwd: "source-only" },
     };
     let cleaned = false;
@@ -1434,7 +1437,7 @@ async function exerciseMacOSFilesystemBoundary(
     try {
       await execFile(
         sandboxExec,
-        macSandboxExecArgs(profilePath, environment, "/bin/sh", ["-c", script]),
+        macSandboxExecArgs(profilePath, environment, cwd, "/bin/sh", ["-c", script]),
         {
           cwd,
           timeout: 10_000,
@@ -1550,7 +1553,7 @@ async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promi
     try {
       const result = await execFile(
         sandboxExec,
-        macSandboxExecArgs(profilePath, environment, "/bin/bash", ["-lc", options.command]),
+        macSandboxExecArgs(profilePath, environment, cwd, "/bin/bash", ["-lc", options.command]),
         {
           cwd,
           timeout,
