@@ -444,14 +444,14 @@ export class GitWorkspace {
     const absolute = resolve(this.cwd, path);
     const link = await readlink(absolute);
     const lexicalTarget = isAbsolute(link) ? resolve(link) : resolve(dirname(absolute), link);
-    const root = resolve(this.cwd);
-    const relativeTarget = relative(root, lexicalTarget);
+    const lexicalRoot = resolve(this.cwd);
+    const relativeTarget = relative(lexicalRoot, lexicalTarget);
     if (isAbsolute(link) || relativeTarget.startsWith("..") || isAbsolute(relativeTarget)) {
       throw new GitPolicyError(`Workspace symlink escapes the dedicated worktree: ${path} -> ${link}.`, "WORKSPACE_SYMLINK_ESCAPE");
     }
     try {
-      const realTarget = await realpath(absolute);
-      const realRelative = relative(root, realTarget);
+      const [realRoot, realTarget] = await Promise.all([realpath(this.cwd), realpath(absolute)]);
+      const realRelative = relative(realRoot, realTarget);
       if (realRelative.startsWith("..") || isAbsolute(realRelative)) {
         throw new GitPolicyError(`Workspace symlink resolves outside the dedicated worktree: ${path}.`, "WORKSPACE_SYMLINK_ESCAPE");
       }
@@ -554,7 +554,17 @@ export class GitWorkspace {
     if (branchResult.code !== 0 || topResult.code !== 0) {
       throw new GitPolicyError("Unable to verify dedicated worktree identity.", "WORKTREE_IDENTITY_UNKNOWN");
     }
-    if (branchResult.stdout.trim() !== this.dedicatedBranch || resolve(topResult.stdout.trim()) !== resolve(this.dedicatedWorktreePath)) {
+    let sameWorktree = false;
+    try {
+      const [reportedTop, expectedTop] = await Promise.all([
+        realpath(topResult.stdout.trim()),
+        realpath(this.dedicatedWorktreePath),
+      ]);
+      sameWorktree = reportedTop === expectedTop;
+    } catch {
+      throw new GitPolicyError("Unable to canonicalize dedicated worktree identity.", "WORKTREE_IDENTITY_UNKNOWN");
+    }
+    if (branchResult.stdout.trim() !== this.dedicatedBranch || !sameWorktree) {
       throw new GitPolicyError(
         `Execution & Review is not running in its dedicated worktree (${this.dedicatedBranch} at ${this.dedicatedWorktreePath}).`,
         "WORKTREE_IDENTITY_MISMATCH",
@@ -774,12 +784,33 @@ export async function ensureDedicatedWorktree(
   const targetPath = resolve(options.targetPath);
   const branchName = options.branchName;
   if (options.existing?.path || options.existing?.branchName) {
-    if (options.existing.path !== targetPath || options.existing.branchName !== branchName) {
+    if (!options.existing.path || options.existing.branchName !== branchName) {
+      throw new GitPolicyError("Persisted dedicated worktree identity does not match this run.", "WORKTREE_IDENTITY_MISMATCH");
+    }
+    let persistedMatches = false;
+    try {
+      const [persistedPath, expectedPath] = await Promise.all([
+        realpath(options.existing.path),
+        realpath(targetPath),
+      ]);
+      persistedMatches = persistedPath === expectedPath;
+    } catch {
+      throw new GitPolicyError("Persisted dedicated worktree cannot be canonicalized.", "WORKTREE_IDENTITY_UNKNOWN");
+    }
+    if (!persistedMatches) {
       throw new GitPolicyError("Persisted dedicated worktree identity does not match this run.", "WORKTREE_IDENTITY_MISMATCH");
     }
     const branch = await options.targetGit.run(["branch", "--show-current"], commandOptions);
     const top = await options.targetGit.run(["rev-parse", "--show-toplevel"], commandOptions);
-    if (branch.code !== 0 || top.code !== 0 || branch.stdout.trim() !== branchName || resolve(top.stdout.trim()) !== targetPath) {
+    let reportedMatches = false;
+    if (top.code === 0) {
+      try {
+        reportedMatches = await realpath(top.stdout.trim()) === await realpath(targetPath);
+      } catch {
+        reportedMatches = false;
+      }
+    }
+    if (branch.code !== 0 || top.code !== 0 || branch.stdout.trim() !== branchName || !reportedMatches) {
       throw new GitPolicyError("Persisted dedicated worktree cannot be verified.", "WORKTREE_IDENTITY_UNKNOWN");
     }
     const targetHead = await new GitWorkspace(options.targetGit, { cwd: targetPath }).head(commandOptions);

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile as callback } from "node:child_process";
-import { lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -72,7 +72,7 @@ test("per-repository human setup stores no secrets and overrides model-supplied 
     }, agentDir);
     assert.ok(saved.networkRiskApprovedAt);
     const files = await readdir(join(agentDir, "plan-execute-auto", "profiles"));
-    assert.deepEqual(files, [`${createHash("sha256").update(resolve(project)).digest("hex")}.json`]);
+    assert.deepEqual(files, [`${createHash("sha256").update(await realpath(project)).digest("hex")}.json`]);
     const path = join(agentDir, "plan-execute-auto", "profiles", files[0]!);
     assert.equal((await lstat(path)).mode & 0o077, 0);
     assert.doesNotMatch(await readFile(path, "utf8"), /auth\.json|apiKey|temporary-provider-key/);

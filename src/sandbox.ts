@@ -85,33 +85,42 @@ function isWithin(root: string, candidate: string): boolean {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+function canonicalPolicyPath(path: string): string {
+  return canonicalExistingPath(resolve(path)) ?? resolve(path);
+}
+
 function assertAgentRoots(options: SandboxOptions): void {
-  const cwd = resolve(options.cwd);
-  const sourceRoot = resolve(options.sourceRoot);
-  const goldenRoot = resolve(options.goldenRoot);
+  const cwd = canonicalPolicyPath(options.cwd);
+  const sourceRoot = canonicalPolicyPath(options.sourceRoot);
+  const goldenRoot = canonicalPolicyPath(options.goldenRoot);
   if (goldenRoot === sourceRoot || isWithin(goldenRoot, sourceRoot)) {
     throw new Error("Golden Package cannot contain the protected source root; mount only the run-specific package directory.");
   }
   if (isWithin(cwd, goldenRoot) || isWithin(goldenRoot, cwd)) {
     throw new Error("The dedicated worktree and Golden Package must be physically separate sandbox roots.");
   }
-  if (goldenRoot === "/") throw new Error("Golden Package cannot be the host filesystem root.");
-  for (const broadRoot of ["/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]) {
+  if (goldenRoot === canonicalPolicyPath("/")) throw new Error("Golden Package cannot be the host filesystem root.");
+  const broadGoldenRoots = ["/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]
+    .map(canonicalPolicyPath);
+  for (const broadRoot of broadGoldenRoots) {
     if (isWithin(goldenRoot, broadRoot) || isWithin(broadRoot, goldenRoot)) {
       throw new Error(`Golden Package cannot expose or overlap a broad host root: ${broadRoot}.`);
     }
   }
-  if (cwd === "/") throw new Error("Agent workspace cannot be the host filesystem root.");
-  for (const broadRoot of [homedir(), "/home", "/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]) {
+  if (cwd === canonicalPolicyPath("/")) throw new Error("Agent workspace cannot be the host filesystem root.");
+  const broadWorkspaceRoots = [homedir(), "/home", "/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]
+    .map(canonicalPolicyPath);
+  for (const broadRoot of broadWorkspaceRoots) {
     if (isWithin(cwd, broadRoot)) {
       throw new Error(`Agent workspace cannot expose a broad host root: ${broadRoot}.`);
     }
   }
-  if (isWithin("/tmp", cwd) || isWithin("/etc", cwd) || isWithin("/usr", cwd) || isWithin("/var", cwd) || isWithin("/opt", cwd) || isWithin("/root", cwd)) {
+  const systemWorkspaceRoots = ["/tmp", "/etc", "/usr", "/var", "/opt", "/root"].map(canonicalPolicyPath);
+  if (systemWorkspaceRoots.some((root) => isWithin(root, cwd))) {
     throw new Error("Agent worktree must be outside host system and temporary directories.");
   }
   const sensitiveHomeRoots = [".ssh", ".aws", ".azure", ".gnupg", ".config", ".kube", ".docker", ".npm", ".local/share"]
-    .map((entry) => resolve(homedir(), entry));
+    .map((entry) => canonicalPolicyPath(resolve(homedir(), entry)));
   for (const sensitiveRoot of sensitiveHomeRoots) {
     if (isWithin(cwd, sensitiveRoot) || isWithin(sensitiveRoot, cwd) || isWithin(goldenRoot, sensitiveRoot) || isWithin(sensitiveRoot, goldenRoot)) {
       throw new Error(`Agent workspace or Golden Package overlaps a protected credential directory: ${sensitiveRoot}.`);
