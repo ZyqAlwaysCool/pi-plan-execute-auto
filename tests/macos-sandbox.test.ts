@@ -176,3 +176,42 @@ test("macOS Seatbelt can launch a real OpenCode ACP session", {
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
+
+
+test("macOS Seatbelt can launch a real Codex ACP catalog session", {
+  skip: process.platform !== "darwin" || (!requireMacSandboxTests && !macSandboxAvailable)
+    ? "macOS sandbox-exec is unavailable"
+    : false,
+  timeout: 30_000,
+}, async () => {
+  const fixture = await makeFixture();
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  let agent: AcpAgent | undefined;
+  try {
+    sandbox = await createSandboxedBackend({
+      role: "reviewer",
+      model: "codex/catalog",
+      cwd: fixture.cwd,
+      sourceRoot: fixture.sourceRoot,
+      goldenRoot: fixture.goldenRoot,
+      includeProviderCredentials: true,
+    });
+    agent = new AcpAgent({
+      cwd: fixture.cwd,
+      model: "codex",
+      mode: "read-only",
+      backends: { codex: sandbox.config },
+      permissions: { defaultOutcome: "deny" },
+    });
+    await agent.ready();
+    assert.equal(agent.backendId, "codex");
+    assert.ok(
+      agent.configOptions.some((entry) => entry.id === "model" && entry.type === "select"),
+      "Codex ACP catalog session should advertise the model config option",
+    );
+  } finally {
+    await agent?.close({ keep: true }).catch(() => {});
+    await sandbox?.cleanup();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
