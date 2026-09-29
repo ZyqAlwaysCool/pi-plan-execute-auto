@@ -36,6 +36,7 @@ import type { GitCommandResult } from "./types.js";
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
 const SCRATCH_ROOT = "/tmp";
+const MACOS_SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const RUNTIME_ROOT = "/agent-runtime";
 const RUNTIME_NODE_BIN = `${RUNTIME_ROOT}/node-bin`;
 const RUNTIME_NODE_MODULES = `${RUNTIME_ROOT}/node_modules`;
@@ -167,6 +168,43 @@ export function findBubblewrap(): string {
     }
   }
   throw new Error("A root-owned system bubblewrap (bwrap) is required; refusing to start ACP without it.");
+}
+
+
+/** macOS isolation must use Apple's system-owned Seatbelt launcher, never a PATH override. */
+export function validateMacOSSandboxExec(path: string): string {
+  const requested = resolve(path);
+  if (requested !== MACOS_SANDBOX_EXEC) {
+    throw new Error(\`Refusing non-system macOS sandbox launcher: \${path}; expected \${MACOS_SANDBOX_EXEC}.\`);
+  }
+  let realPath: string;
+  try {
+    realPath = realpathSync(requested);
+  } catch {
+    throw new Error(\`macOS sandbox-exec does not exist: \${requested}\`);
+  }
+  const file = statSync(realPath);
+  if (
+    basename(realPath) !== "sandbox-exec" ||
+    file.uid !== 0 ||
+    (file.mode & 0o022) !== 0 ||
+    !file.isFile()
+  ) {
+    throw new Error(\`Refusing untrusted macOS sandbox-exec binary: \${realPath}.\`);
+  }
+  try {
+    accessSync(realPath, fsConstants.X_OK);
+  } catch {
+    throw new Error(\`macOS sandbox-exec is not executable: \${realPath}\`);
+  }
+  return requested;
+}
+
+export function findMacOSSandboxExec(): string {
+  if (process.platform !== "darwin") {
+    throw new Error("The macOS Seatbelt sandbox provider is available only on macOS.");
+  }
+  return validateMacOSSandboxExec(MACOS_SANDBOX_EXEC);
 }
 
 function findExecutable(name: string): string {
@@ -630,6 +668,202 @@ function safeProxyEnvironment(): Array<[string, string]> {
   return result;
 }
 
+
+function seatbeltString(value: string): string {
+  if (value.includes("\0")) throw new Error("Seatbelt profile paths cannot contain NUL bytes.");
+  return JSON.stringify(value);
+}
+
+function canonicalExistingPath(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function macHostRuntime(runtime: BackendRuntime): { command: string; args: string[] } {
+  const nodeBinary = realpathSync(process.execPath);
+  const mapPath = (value: string): string => {
+    if (value === join(RUNTIME_NODE_BIN, basename(nodeBinary))) return nodeBinary;
+    if (value.startsWith(\`\${RUNTIME_NODE_MODULES}/\`) && runtime.nodeModulesRoot) {
+      return join(runtime.nodeModulesRoot, relative(RUNTIME_NODE_MODULES, value));
+    }
+    if (runtime.extraBinary && value === runtime.extraBinary.target) return runtime.extraBinary.source;
+    return value;
+  };
+  return {
+    command: mapPath(runtime.command),
+    args: runtime.args.map(mapPath),
+  };
+}
+
+function macSandboxPathEntries(): string[] {
+  const candidates = [
+    join(homedir(), ".local", "bin"),
+    join(homedir(), ".cargo", "bin"),
+    join(homedir(), "bin"),
+    dirname(realpathSync(process.execPath)),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  return [...new Set(candidates.filter((path) => canonicalExistingPath(path)))];
+}
+
+function macSandboxEnvironment(
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  backendId?: SupportedAcpBackend,
+): Array<[string, string]> {
+  const runtimeRoot = join(scratchPath, "run");
+  const proxies = safeProxyEnvironment();
+  const hasNodeHttpProxy = proxies.some(([key, value]) =>
+    ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].includes(key) && /^https?:\/\//i.test(value),
+  );
+  const entries: Array<[string, string]> = [
+    ["HOME", join(runtimeRoot, "home")],
+    ["TMPDIR", scratchPath],
+    ["TMP", scratchPath],
+    ["TEMP", scratchPath],
+    ["CODEX_HOME", join(runtimeRoot, "codex-home")],
+    ["CLAUDE_CONFIG_DIR", join(runtimeRoot, "home", ".claude")],
+    ["PI_CODING_AGENT_DIR", join(runtimeRoot, "home", ".pi", "agent")],
+    ["XDG_DATA_HOME", join(runtimeRoot, "data")],
+    ["XDG_STATE_HOME", join(runtimeRoot, "state")],
+    ["XDG_CACHE_HOME", join(runtimeRoot, "cache")],
+    ["XDG_CONFIG_HOME", join(runtimeRoot, "config")],
+    ["PATH", macSandboxPathEntries().join(":")],
+    ["LANG", "C"],
+    ["LC_ALL", "C"],
+    ["TERM", "dumb"],
+    ["GIT_OPTIONAL_LOCKS", "0"],
+    ["GIT_CONFIG_NOSYSTEM", "1"],
+    ["GIT_CONFIG_GLOBAL", join(runtimeRoot, "home", ".gitconfig")],
+    ["GIT_DIR", join(runtimeRoot, "git-mirror")],
+    ["GIT_WORK_TREE", resolve(options.cwd)],
+    ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? [["NODE_USE_ENV_PROXY", "1"] as [string, string]] : []),
+    ...nativeBackendEnvironment(backendId),
+    ...proxies,
+  ];
+  for (const [key, value] of entries) {
+    if (key.includes("=") || key.includes("\0") || value.includes("\0")) {
+      throw new Error(\`Invalid environment entry for macOS sandbox: \${key}\`);
+    }
+  }
+  return entries;
+}
+
+function macSandboxProfile(
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  hostRuntime: { command: string; args: string[] },
+): string {
+  const readDirectories = new Set<string>();
+  const readFiles = new Set<string>();
+  const addDirectory = (path: string) => {
+    const real = canonicalExistingPath(path);
+    if (real) readDirectories.add(real);
+  };
+  const addFileOrDirectory = (path: string) => {
+    const real = canonicalExistingPath(path);
+    if (!real) return;
+    const stat = statSync(real);
+    if (stat.isDirectory()) readDirectories.add(real);
+    else if (stat.isFile()) readFiles.add(real);
+  };
+
+  for (const path of [
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/Library",
+    "/private/etc",
+    "/private/var/db",
+    "/opt/homebrew",
+    options.cwd,
+    options.goldenRoot,
+    scratchPath,
+    dirname(dirname(realpathSync(process.execPath))),
+    runtime.nodeModulesRoot ?? "",
+    ...macSandboxPathEntries(),
+  ]) {
+    if (path) addDirectory(path);
+  }
+  addFileOrDirectory(hostRuntime.command);
+  for (const arg of hostRuntime.args) {
+    if (isAbsolute(arg)) addFileOrDirectory(arg);
+  }
+  if (runtime.extraBinary) addFileOrDirectory(runtime.extraBinary.source);
+
+  const writableDirectories = new Set<string>([realpathSync(scratchPath)]);
+  if (options.role !== "reviewer") writableDirectories.add(realpathSync(options.cwd));
+
+  const denyWrites = new Set<string>([
+    realpathSync(options.sourceRoot),
+    realpathSync(options.goldenRoot),
+    join(realpathSync(scratchPath), "run", "git-mirror"),
+    ...(options.role === "reviewer" ? [realpathSync(options.cwd)] : []),
+  ]);
+
+  const lines = [
+    "(version 1)",
+    "(deny default)",
+    '(import "system.sb")',
+    "(allow process*)",
+    "(allow network*)",
+    "(allow mach-lookup)",
+    "(allow sysctl-read)",
+    "(allow file-read*",
+    ...[...readDirectories].sort().map((path) => \`  (subpath \${seatbeltString(path)})\`),
+    ...[...readFiles].sort().map((path) => \`  (literal \${seatbeltString(path)})\`),
+    ")",
+    "(allow file-write*",
+    ...[...writableDirectories].sort().map((path) => \`  (subpath \${seatbeltString(path)})\`),
+    ")",
+    "(deny file-write*",
+    ...[...denyWrites].sort().map((path) => \`  (subpath \${seatbeltString(path)})\`),
+    ")",
+  ];
+  return \`\${lines.join("\\n")}\\n\`;
+}
+
+async function writeMacSandboxProfile(
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  hostRuntime: { command: string; args: string[] },
+): Promise<string> {
+  const path = join(scratchPath, "run", "seatbelt.sb");
+  await writeFile(path, macSandboxProfile(options, scratchPath, runtime, hostRuntime), { mode: 0o600 });
+  return path;
+}
+
+function macSandboxExecArgs(
+  profilePath: string,
+  environment: Array<[string, string]>,
+  command: string,
+  args: string[],
+): string[] {
+  return [
+    "-f",
+    profilePath,
+    "/usr/bin/env",
+    "-i",
+    ...environment.map(([key, value]) => \`\${key}=\${value}\`),
+    command,
+    ...args,
+  ];
+}
+
 function quoteShell(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
@@ -944,7 +1178,106 @@ async function assertDedicatedWorktreePointer(cwd: string): Promise<void> {
   if (!target || !isAbsolute(target)) throw new Error("Sandbox cwd has an invalid .git worktree pointer.");
 }
 
+
+interface PreparedSandboxRuntime {
+  runtime: BackendRuntime;
+  credentials: string[];
+}
+
+async function prepareSandboxRuntime(
+  options: SandboxOptions,
+  backendId: SupportedAcpBackend,
+  cwd: string,
+  sourceRoot: string,
+  goldenRoot: string,
+  scratchPath: string,
+): Promise<PreparedSandboxRuntime> {
+  let runtime = backendRuntime(backendId);
+  const trustedOpenCodeBinary = backendId === "opencode" && runtime.extraBinary
+    ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
+    : undefined;
+  const credentials: string[] = [];
+  await prepareScratchLayout(scratchPath, cwd, options.signal);
+  const nativeStateCount = await stageNativeCliState(runtime, scratchPath);
+  if (trustedOpenCodeBinary && runtime.extraBinary) {
+    const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
+    runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
+  }
+  if (options.includeProviderCredentials && nativeStateCount === 0) {
+    if (backendId === "pi") {
+      credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
+    } else if (backendId === "opencode") {
+      const dataRoot = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
+      const configRoot = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
+      const selectedAuth = await stageSelectedOpenCodeCredential(options.model, scratchPath, dataRoot);
+      if (selectedAuth) credentials.push(selectedAuth);
+      const selectedConfig = await stageSelectedOpenCodeProviderConfig(options.model, scratchPath, configRoot);
+      if (selectedConfig) credentials.push(selectedConfig);
+      if (!selectedAuth && !selectedConfig) {
+        throw new Error("No native or isolated saved credential/config was found for the selected OpenCode provider.");
+      }
+    } else if (backendId === "codex") {
+      credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
+    } else if (!process.env.ANTHROPIC_AUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
+      throw new Error("Claude CLI state/authentication is unavailable inside the isolated session; run Claude login or provide the same host auth environment used by the working CLI.");
+    }
+  }
+  return { runtime, credentials };
+}
+
+async function createMacOSSandboxedBackend(options: SandboxOptions): Promise<SandboxedBackend> {
+  const backendId = supportedBackendForModel(options.model);
+  const cwd = await realpath(options.cwd);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const goldenRoot = await realpath(options.goldenRoot);
+  const normalized = { ...options, cwd, sourceRoot, goldenRoot };
+  assertAgentRoots(normalized);
+  const sandboxExec = findMacOSSandboxExec();
+  await assertDedicatedWorktreePointer(cwd);
+  const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-")));
+  try {
+    const { runtime, credentials } = await prepareSandboxRuntime(
+      normalized,
+      backendId,
+      cwd,
+      sourceRoot,
+      goldenRoot,
+      scratchPath,
+    );
+    const hostRuntime = macHostRuntime(runtime);
+    const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
+    const environment = macSandboxEnvironment(normalized, scratchPath, runtime, backendId);
+    const config: CustomBackendConfig = {
+      command: sandboxExec,
+      args: macSandboxExecArgs(profilePath, environment, hostRuntime.command, hostRuntime.args),
+      fork: { disposition: backendId === "claude" ? "id-only" : "live", cwd: "source-only" },
+    };
+    let cleaned = false;
+    return {
+      backendId,
+      config,
+      scratchPath,
+      async scrubCredentials() {
+        await Promise.all(credentials.map((path) => rm(path, { force: true })));
+        credentials.length = 0;
+      },
+      async cleanup() {
+        if (cleaned) return;
+        cleaned = true;
+        await rm(scratchPath, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function createSandboxedBackend(options: SandboxOptions): Promise<SandboxedBackend> {
+  if (process.platform === "darwin") return createMacOSSandboxedBackend(options);
+  if (process.platform !== "linux") {
+    throw new Error(`Unsupported isolation host platform: ${process.platform}. Supported hosts are Linux/WSL and macOS.`);
+  }
   const backendId = supportedBackendForModel(options.model);
   const cwd = await realpath(options.cwd);
   const sourceRoot = await realpath(options.sourceRoot);
@@ -952,38 +1285,16 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
   assertAgentRoots({ ...options, cwd, sourceRoot, goldenRoot });
   const bwrap = findBubblewrap();
   await assertDedicatedWorktreePointer(cwd);
-  let runtime = backendRuntime(backendId);
-  const trustedOpenCodeBinary = backendId === "opencode" && runtime.extraBinary
-    ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
-    : undefined;
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
-  const credentials: string[] = [];
   try {
-    await prepareScratchLayout(scratchPath, cwd, options.signal);
-    const nativeStateCount = await stageNativeCliState(runtime, scratchPath);
-    if (trustedOpenCodeBinary && runtime.extraBinary) {
-      const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
-      runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
-    }
-    if (options.includeProviderCredentials && nativeStateCount === 0) {
-      if (backendId === "pi") {
-        credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
-      } else if (backendId === "opencode") {
-        const dataRoot = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
-        const configRoot = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
-        const selectedAuth = await stageSelectedOpenCodeCredential(options.model, scratchPath, dataRoot);
-        if (selectedAuth) credentials.push(selectedAuth);
-        const selectedConfig = await stageSelectedOpenCodeProviderConfig(options.model, scratchPath, configRoot);
-        if (selectedConfig) credentials.push(selectedConfig);
-        if (!selectedAuth && !selectedConfig) {
-          throw new Error("No native or isolated saved credential/config was found for the selected OpenCode provider.");
-        }
-      } else if (backendId === "codex") {
-        credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
-      } else if (!process.env.ANTHROPIC_AUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
-        throw new Error("Claude CLI state/authentication is unavailable inside the isolated session; run Claude login or provide the same host auth environment used by the working CLI.");
-      }
-    }
+    const { runtime, credentials } = await prepareSandboxRuntime(
+      { ...options, cwd, sourceRoot, goldenRoot },
+      backendId,
+      cwd,
+      sourceRoot,
+      goldenRoot,
+      scratchPath,
+    );
     const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
     addMinimalFilesystem(
       commandArgs,
@@ -1083,6 +1394,78 @@ async function exerciseFilesystemBoundary(
   }
 }
 
+
+async function exerciseMacOSFilesystemBoundary(
+  options: SandboxOptions,
+  label: string,
+  sandboxExec: string,
+  profilePath: string,
+  environment: Array<[string, string]>,
+): Promise<void> {
+  const { cwd, sourceRoot, goldenRoot } = options;
+  const nonce = randomUUID();
+  const hostCanaries = [
+    join(homedir(), \`.pi-plan-execute-host-canary-\${nonce}\`),
+    join(dirname(sourceRoot), \`.pi-plan-execute-other-project-canary-\${nonce}\`),
+    join(SCRATCH_ROOT, \`.pi-plan-execute-tmp-canary-\${nonce}\`),
+  ];
+  const symlinkProbe = join(cwd, \`.pi-plan-execute-symlink-probe-\${nonce}\`);
+  const gitMirrorProbe = join(dirname(profilePath), "git-mirror", \`.pi-plan-execute-sandbox-probe-\${nonce}\`);
+  const deniedWrites: string[] = [];
+  let writableProbe: string | undefined;
+  try {
+    await Promise.all(hostCanaries.map((path) => writeFile(path, nonce, { flag: "wx", mode: 0o600 })));
+    const protectedRoots = options.role === "reviewer" ? [cwd, goldenRoot] : [goldenRoot];
+    deniedWrites.push(...protectedRoots.map((root) => join(root, \`.pi-plan-execute-sandbox-probe-\${nonce}\`)));
+    deniedWrites.push(gitMirrorProbe);
+    if (options.role !== "reviewer") writableProbe = join(cwd, \`.pi-plan-execute-sandbox-probe-\${nonce}\`);
+    await symlink(join(sourceRoot, "package.json"), symlinkProbe);
+    deniedWrites.push(symlinkProbe);
+    const script = probeScript(options.role, deniedWrites, writableProbe, hostCanaries);
+    try {
+      await execFile(
+        sandboxExec,
+        macSandboxExecArgs(profilePath, environment, "/bin/sh", ["-c", script]),
+        {
+          cwd,
+          timeout: 10_000,
+          maxBuffer: 1024 * 1024,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+      );
+    } catch (error) {
+      throw new Error(\`OS filesystem sandbox probe failed for \${label}/\${options.role}: \${String(error)}\`);
+    }
+  } finally {
+    await Promise.all([
+      ...hostCanaries.map((path) => rm(path, { force: true })),
+      ...deniedWrites.filter((path) => path !== gitMirrorProbe).map((path) => rm(path, { force: true })),
+      ...(writableProbe ? [rm(writableProbe, { force: true })] : []),
+      rm(symlinkProbe, { force: true }),
+    ]);
+  }
+}
+
+async function runMacOSFilesystemProbe(options: SandboxOptions, runtime: BackendRuntime, label: string): Promise<void> {
+  const cwd = await realpath(options.cwd);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const goldenRoot = await realpath(options.goldenRoot);
+  const normalized = { ...options, cwd, sourceRoot, goldenRoot };
+  assertAgentRoots(normalized);
+  await assertDedicatedWorktreePointer(cwd);
+  const sandboxExec = findMacOSSandboxExec();
+  const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-probe-")));
+  try {
+    await prepareProbeScratch(scratchPath);
+    const hostRuntime = macHostRuntime(runtime);
+    const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
+    const environment = macSandboxEnvironment(normalized, scratchPath, runtime, label as SupportedAcpBackend);
+    await exerciseMacOSFilesystemBoundary(normalized, label, sandboxExec, profilePath, environment);
+  } finally {
+    await rm(scratchPath, { recursive: true, force: true });
+  }
+}
+
 async function runFilesystemProbe(options: SandboxOptions, runtime: BackendRuntime, label: string): Promise<void> {
   const cwd = await realpath(options.cwd);
   const sourceRoot = await realpath(options.sourceRoot);
@@ -1105,6 +1488,13 @@ async function runFilesystemProbe(options: SandboxOptions, runtime: BackendRunti
 /** Exercise the actual trusted mount policy before opening an agent session. */
 export async function verifySandboxBoundary(options: SandboxOptions): Promise<void> {
   const backendId = supportedBackendForModel(options.model);
+  if (process.platform === "darwin") {
+    await runMacOSFilesystemProbe(options, backendRuntime(backendId), backendId);
+    return;
+  }
+  if (process.platform !== "linux") {
+    throw new Error(`Unsupported isolation host platform: ${process.platform}. Supported hosts are Linux/WSL and macOS.`);
+  }
   await runFilesystemProbe(options, backendRuntime(backendId), backendId);
 }
 
@@ -1122,8 +1512,64 @@ function outputText(value: unknown): string {
   return Buffer.isBuffer(value) ? value.toString("utf8") : "";
 }
 
+
+async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promise<GitCommandResult> {
+  const sandboxOptions: SandboxOptions = {
+    role: "acceptance",
+    model: "acceptance-command",
+    cwd: options.cwd,
+    sourceRoot: options.sourceRoot,
+    goldenRoot: options.goldenRoot,
+    ...(options.signal ? { signal: options.signal } : {}),
+  };
+  const runtime: BackendRuntime = { command: "/bin/bash", args: [], credentialSources: [] };
+  const cwd = await realpath(options.cwd);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const goldenRoot = await realpath(options.goldenRoot);
+  const normalized = { ...sandboxOptions, cwd, sourceRoot, goldenRoot };
+  assertAgentRoots(normalized);
+  await assertDedicatedWorktreePointer(cwd);
+  const sandboxExec = findMacOSSandboxExec();
+  const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-acceptance-")));
+  try {
+    await prepareScratchLayout(scratchPath, cwd, options.signal);
+    const hostRuntime = macHostRuntime(runtime);
+    const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
+    const environment = macSandboxEnvironment(normalized, scratchPath, runtime);
+    await exerciseMacOSFilesystemBoundary(normalized, "acceptance", sandboxExec, profilePath, environment);
+    const timeout = options.timeout ?? 120_000;
+    try {
+      const result = await execFile(
+        sandboxExec,
+        macSandboxExecArgs(profilePath, environment, "/bin/bash", ["-lc", options.command]),
+        {
+          cwd,
+          timeout,
+          maxBuffer: 16 * 1024 * 1024,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+      );
+      return { stdout: result.stdout, stderr: result.stderr, code: 0 };
+    } catch (error) {
+      const failure = error as { code?: unknown; killed?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown };
+      return {
+        stdout: outputText(failure.stdout),
+        stderr: outputText(failure.stderr),
+        code: typeof failure.code === "number" ? failure.code : -1,
+        ...(failure.killed || failure.signal || failure.code === "ETIMEDOUT" || failure.code === "ABORT_ERR" ? { killed: true } : {}),
+      };
+    }
+  } finally {
+    await rm(scratchPath, { recursive: true, force: true });
+  }
+}
+
 /** Run contract-supplied shell commands with the same filesystem boundary as the ACP actors. */
 export async function runSandboxedCommand(options: SandboxedCommandOptions): Promise<GitCommandResult> {
+  if (process.platform === "darwin") return runMacOSSandboxedCommand(options);
+  if (process.platform !== "linux") {
+    throw new Error(`Unsupported isolation host platform: ${process.platform}. Supported hosts are Linux/WSL and macOS.`);
+  }
   const sandboxOptions: SandboxOptions = {
     role: "acceptance",
     model: "acceptance-command",

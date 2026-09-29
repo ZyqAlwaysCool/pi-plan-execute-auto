@@ -136,8 +136,10 @@ Setup performs an environment preflight before saving configuration:
 
 - Git initialization is offered only if the directory is not already a repository and still requires explicit consent;
 - plugin runtime/config is ignored through repository-local `.git/info/exclude`; setup does **not** create or modify project `.gitignore`, stage files, or create a project diff;
-- trusted Linux `bubblewrap` is available;
-- unprivileged user namespaces work;
+- a trusted platform-native isolation provider is available:
+  - Linux/WSL: root-owned `bubblewrap` plus usable unprivileged user namespaces;
+  - macOS: Apple's system `/usr/bin/sandbox-exec` Seatbelt launcher;
+- the selected isolation provider passes its preflight before any Executor/Reviewer session can start;
 - installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi;
 - Executor model/reasoning and Reviewer model/reasoning are chosen independently;
 - an optional live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable; choosing **No** skips the check and setup still completes normally;
@@ -164,7 +166,9 @@ The selected permission mode and review limit are frozen into each approved run.
 
 ## Isolation model
 
-The common `IsolationProvider` currently has a Linux bubblewrap implementation. Its job is **containment**, not capability reduction.
+The common `IsolationProvider` is platform-native. Linux/WSL uses `bubblewrap`; macOS uses Apple's Seatbelt policy through the system-owned `/usr/bin/sandbox-exec`. Its job is **containment**, not capability reduction.
+
+Both providers fail closed: if the trusted OS sandbox is unavailable or the boundary self-test fails, Execution & Review does not start. The macOS `sandbox-exec` command is deprecated by Apple, so it is treated as an implementation detail rather than a permanent API contract; the provider validates the system binary and actual read/write boundary on every execution path instead of silently falling back to unsandboxed agents.
 
 It provides:
 
@@ -184,14 +188,15 @@ The plugin-owned phase commit is cross-checked against the phase base, expected 
 
 ## Requirements
 
-Linux or WSL with:
+Supported hosts:
 
+- Linux / WSL
+- macOS
 - Node.js 22+
 - Git
-- `bubblewrap`
 - whichever Agent CLIs you plan to select
 
-Ubuntu/WSL:
+Linux/WSL additionally requires `bubblewrap` and usable unprivileged user namespaces:
 
 ```bash
 sudo apt-get update
@@ -201,6 +206,15 @@ which bwrap
 unshare -Ur true
 ```
 
+macOS uses the system Seatbelt launcher and does not require Homebrew or a third-party sandbox package:
+
+```bash
+test -x /usr/bin/sandbox-exec
+/usr/bin/sandbox-exec -p '(version 1) (allow default)' /usr/bin/true
+```
+
+The macOS provider uses a default-deny Seatbelt profile, keeps the dedicated Executor worktree writable, mounts no host filesystem root, keeps the Reviewer worktree and Golden Package read-only, uses a run-private HOME/tmp/config area, exposes only required system/runtime paths, and preserves normal Agent CLI networking. If a future macOS release removes or disables `sandbox-exec`, the plugin fails closed until another macOS provider is available.
+
 No extra firewall, proxy, provider-specific daemon, or `socat` is required by this plugin itself.
 
 Claude-specific exception: if **your own Claude Code settings** enable Claude's native Bash sandbox, Linux/WSL Claude Code may require `socat`. In that case setup reports the exact reason and you can install it with:
@@ -209,17 +223,32 @@ Claude-specific exception: if **your own Claude Code settings** enable Claude's 
 sudo apt-get install -y socat
 ```
 
-Installing `socat` in that case preserves your chosen native Claude behavior; the plugin does not enable that sandbox on your behalf.
+On macOS this Linux-specific `socat` preflight is not applied. The plugin does not enable Claude's native sandbox on your behalf.
 
 ## Development validation
+
+Common checks:
 
 ```bash
 npm ci
 npm run check
 npm run build
-npm run test:sandbox:required
 npm test
 ```
+
+Linux/WSL sandbox gate:
+
+```bash
+npm run test:sandbox:required
+```
+
+macOS sandbox gate:
+
+```bash
+npm run test:sandbox:macos:required
+```
+
+GitHub Actions runs both OS-specific sandbox gates on their native hosts.
 
 Real provider validation is intentionally separate because it can incur charges:
 

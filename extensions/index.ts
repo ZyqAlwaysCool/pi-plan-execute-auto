@@ -547,18 +547,21 @@ export async function runSetupWizard(
   const reviewerReasoningEffort = reviewerChoice === "default" ? undefined : reviewerChoice;
   if ([executorModel, reviewerModel].some((model) => model.startsWith("claude/"))) {
     const claudeSandbox = await inspectClaudeSandbox(ctx.cwd);
-    if (claudeSandbox.enabled && !claudeSandbox.socat) {
+    const claudeNeedsSocat = process.platform === "linux" && claudeSandbox.enabled;
+    if (claudeNeedsSocat && !claudeSandbox.socat) {
       throw new Error(
         "Claude Code's native Bash sandbox is enabled by your own Claude configuration, but socat was not found on PATH. " +
-        "On Ubuntu/WSL install it with: sudo apt-get install -y socat. " +
-        "This is a Claude Code dependency for its native sandbox, not a pi-plan-execute-auto requirement. " +
+        "On Linux/WSL install it with: sudo apt-get install -y socat. " +
+        "This is a Claude Code dependency for its native Linux sandbox, not a pi-plan-execute-auto requirement. " +
         "Detected from: " + (claudeSandbox.sources.join("; ") || "Claude native configuration"),
       );
     }
     notify(
       ctx,
       claudeSandbox.enabled
-        ? `Claude native Bash sandbox: enabled by your Claude configuration\n✓ socat: ${claudeSandbox.socat}\nThe plugin preserves this native Claude behavior; socat is required by Claude Code in this configuration.`
+        ? claudeNeedsSocat
+          ? `Claude native Bash sandbox: enabled by your Claude configuration\n✓ socat: ${claudeSandbox.socat}\nThe plugin preserves this native Claude behavior; socat is required by Claude Code on Linux/WSL in this configuration.`
+          : "Claude native Bash sandbox: enabled by your Claude configuration. On macOS the plugin uses the platform Seatbelt boundary and does not require the Linux socat preflight."
         : "Claude native Bash sandbox: not enabled by the detected Claude configuration. pi-plan-execute-auto does not force it, so socat is not required by the plugin.",
       "info",
     );
@@ -646,9 +649,18 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     }
 
     const isolation = await defaultIsolationProvider.preflight();
+    const isolationDetails = isolation.provider === "linux-bubblewrap"
+      ? [`✓ bubblewrap: ${isolation.bubblewrap}`, "✓ Linux user namespaces available"]
+      : [`✓ sandbox-exec: ${isolation.sandboxExec}`, "✓ macOS Seatbelt launcher available"];
     notify(
       ctx,
-      `Environment preflight\n✓ Isolation: ${isolation.provider}\n✓ bubblewrap: ${isolation.bubblewrap}\n✓ Linux user namespaces available\n✓ Agent/tool network: normal host networking\n✓ Plugin-level socat dependency: none (Claude Code may require socat only if your own Claude native Bash sandbox is enabled)`,
+      [
+        "Environment preflight",
+        `✓ Isolation: ${isolation.provider}`,
+        ...isolationDetails,
+        "✓ Agent/tool network: normal host networking",
+        "✓ Plugin-level socat dependency: none (Claude Code may require socat only for its own native Linux/WSL Bash sandbox)",
+      ].join("\n"),
       "info",
     );
     const saved = await runSetupWizard(ctx, discoverAcpClis);
