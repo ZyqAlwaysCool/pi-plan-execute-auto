@@ -54,8 +54,12 @@ test("macOS backend uses the trusted Seatbelt launcher instead of bubblewrap", {
     : false,
 }, async () => {
   const fixture = await makeFixture();
+  const originalCodexPath = process.env.CODEX_PATH;
   let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
   try {
+    // The isolated adapter must use its package-compatible bundled Codex runtime,
+    // never a host CODEX_PATH override that may point at a different CLI version.
+    process.env.CODEX_PATH = "/opt/homebrew/bin/codex-host-version-must-not-leak";
     sandbox = await createSandboxedBackend({
       role: "reviewer",
       model: "codex/gpt-5.6-sol",
@@ -73,9 +77,12 @@ test("macOS backend uses the trusted Seatbelt launcher instead of bubblewrap", {
     assert.ok(args.includes("-i"));
     assert.ok(args.some((value) => value.startsWith("HOME=")));
     assert.ok(args.some((value) => value.startsWith("GIT_DIR=")));
+    assert.equal(args.some((value) => value.startsWith("CODEX_PATH=")), false);
     assert.equal(args.includes("bwrap"), false);
   } finally {
     await sandbox?.cleanup();
+    if (originalCodexPath === undefined) delete process.env.CODEX_PATH;
+    else process.env.CODEX_PATH = originalCodexPath;
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
@@ -178,7 +185,7 @@ test("macOS Seatbelt can launch a real OpenCode ACP session", {
 });
 
 
-test("macOS Seatbelt can launch a real Codex ACP catalog session", {
+test("macOS Seatbelt can launch Codex ACP through auth negotiation", {
   skip: process.platform !== "darwin" || (!requireMacSandboxTests && !macSandboxAvailable)
     ? "macOS sandbox-exec is unavailable"
     : false,
@@ -202,12 +209,29 @@ test("macOS Seatbelt can launch a real Codex ACP catalog session", {
       backends: { codex: sandbox.config },
       permissions: { defaultOutcome: "deny" },
     });
-    await agent.ready();
+
+    let ready = false;
+    try {
+      await agent.ready();
+      ready = true;
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+      assert.equal(
+        code,
+        "AUTH_REQUIRED",
+        `credentialless macOS Codex ACP may stop at auth negotiation, but must not die during startup: ${String(error)}`,
+      );
+    }
+
     assert.equal(agent.backendId, "codex");
-    assert.ok(
-      agent.configOptions.some((entry) => entry.id === "model" && entry.type === "select"),
-      "Codex ACP catalog session should advertise the model config option",
-    );
+    if (ready) {
+      assert.ok(
+        agent.configOptions.some((entry) => entry.id === "model" && entry.type === "select"),
+        "Authenticated Codex ACP catalog session should advertise the model config option",
+      );
+    }
   } finally {
     await agent?.close({ keep: true }).catch(() => {});
     await sandbox?.cleanup();

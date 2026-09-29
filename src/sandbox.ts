@@ -643,7 +643,7 @@ function nativeBackendEnvironment(backendId: SupportedAcpBackend | undefined): A
           "GROQ_", "OPENROUTER_", "AZURE_OPENAI_", "AWS_", "BEDROCK_", "VERTEX_", "OLLAMA_",
         ];
   const managed = new Set([
-    "HOME", "PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR",
+    "HOME", "PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CODEX_PATH", "PI_CODING_AGENT_DIR",
     "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
   ]);
   const entries: Array<[string, string]> = [];
