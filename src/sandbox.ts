@@ -755,6 +755,7 @@ function macSandboxEnvironment(
     ["GIT_OPTIONAL_LOCKS", "0"],
     ["GIT_CONFIG_NOSYSTEM", "1"],
     ["GIT_CONFIG_GLOBAL", join(runtimeRoot, "home", ".gitconfig")],
+    ...(backendId === "codex" ? [["APP_SERVER_LOGS", join(runtimeRoot, "codex-app-server-logs")] as [string, string]] : []),
     ["GIT_DIR", join(runtimeRoot, "git-mirror")],
     ["GIT_WORK_TREE", resolve(options.cwd)],
     ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? [["NODE_USE_ENV_PROXY", "1"] as [string, string]] : []),

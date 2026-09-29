@@ -48,12 +48,12 @@ jobs:
       - run: npm run check
       - run: npm run build
       - run: npm run test:sandbox:macos:required
-      - name: Dump recent OpenCode sandbox denials
+      - name: Dump recent ACP sandbox denials
         if: failure()
         run: |
           sudo log show --last 3m --style compact \
-            --predicate 'eventMessage BEGINSWITH[c] "Sandbox:" AND eventMessage CONTAINS[c] "opencode"' \
-            | tail -n 200 || true
+            --predicate 'eventMessage BEGINSWITH[c] "Sandbox:" AND (eventMessage CONTAINS[c] "codex" OR eventMessage CONTAINS[c] "pi-plan-execute-sandbox")' \
+            | tail -n 300 || true
       - run: npm test
 
 # Real ACP provider integration is deliberately a separate, explicit billable job:

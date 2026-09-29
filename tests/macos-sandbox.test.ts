@@ -202,7 +202,13 @@ test("macOS Seatbelt can launch a real Codex ACP catalog session", {
       backends: { codex: sandbox.config },
       permissions: { defaultOutcome: "deny" },
     });
-    await agent.ready();
+    try {
+      await agent.ready();
+    } catch (error) {
+      const logPath = join(sandbox.scratchPath, "run", "codex-app-server-logs", "app-server.log");
+      const appServerLog = await readFile(logPath, "utf8").catch(() => "");
+      throw new Error(`Codex ACP failed inside macOS Seatbelt: ${String(error)}\n--- Codex ACP app-server log ---\n${appServerLog}`);
+    }
     assert.equal(agent.backendId, "codex");
     assert.ok(
       agent.configOptions.some((entry) => entry.id === "model" && entry.type === "select"),
