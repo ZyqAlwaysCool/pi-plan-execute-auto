@@ -833,7 +833,7 @@ function macSandboxProfile(
     ...[...denyWrites].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
     ")",
   ];
-  return `${lines.join("\\n")}\\n`;
+  return `${lines.join("\n")}\n`;
 }
 
 async function writeMacSandboxProfile(
