@@ -1420,14 +1420,26 @@ test("resume reconciliation accepts a committed phase whose completion record la
     delete stalePhase.reviewed_diff_sha256;
     await writeWorkflowState(setup.packageRoot, stale);
 
-    const recovered = await reconcilePersistedCompletions(
-      { appendEntry() {} } as never,
-      { cwd: setup.cwd, hasUI: false } as never,
-      setup.pkg,
-      stale,
-      { continueAfterRecovery: true },
-    );
-    assert.equal(recovered?.status, "completed");
+    let harnessCalls = 0;
+    const harness: HarnessPair = {
+      async execute() { harnessCalls += 1; throw new Error("executor must not run"); },
+      async rework() { harnessCalls += 1; throw new Error("executor must not run"); },
+      async review() { harnessCalls += 1; throw new Error("reviewer must not run"); },
+      async close() {},
+    };
+    const recovered = await new StageBController({
+      package: setup.pkg,
+      state: stale,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      resumePaused: true,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+
+    assert.equal(recovered.status, "completed");
+    assert.equal(harnessCalls, 0);
     assert.equal(stale.status, "completed");
     assert.equal(stale.phases[0]?.status, "completed");
     assert.equal(stale.phases[0]?.phase_commit_sha, committedSha);
