@@ -175,13 +175,13 @@ export function findBubblewrap(): string {
 export function validateMacOSSandboxExec(path: string): string {
   const requested = resolve(path);
   if (requested !== MACOS_SANDBOX_EXEC) {
-    throw new Error(\`Refusing non-system macOS sandbox launcher: \${path}; expected \${MACOS_SANDBOX_EXEC}.\`);
+    throw new Error(`Refusing non-system macOS sandbox launcher: ${path}; expected ${MACOS_SANDBOX_EXEC}.`);
   }
   let realPath: string;
   try {
     realPath = realpathSync(requested);
   } catch {
-    throw new Error(\`macOS sandbox-exec does not exist: \${requested}\`);
+    throw new Error(`macOS sandbox-exec does not exist: ${requested}`);
   }
   const file = statSync(realPath);
   if (
@@ -190,12 +190,12 @@ export function validateMacOSSandboxExec(path: string): string {
     (file.mode & 0o022) !== 0 ||
     !file.isFile()
   ) {
-    throw new Error(\`Refusing untrusted macOS sandbox-exec binary: \${realPath}.\`);
+    throw new Error(`Refusing untrusted macOS sandbox-exec binary: ${realPath}.`);
   }
   try {
     accessSync(realPath, fsConstants.X_OK);
   } catch {
-    throw new Error(\`macOS sandbox-exec is not executable: \${realPath}\`);
+    throw new Error(`macOS sandbox-exec is not executable: ${realPath}`);
   }
   return requested;
 }
@@ -686,7 +686,7 @@ function macHostRuntime(runtime: BackendRuntime): { command: string; args: strin
   const nodeBinary = realpathSync(process.execPath);
   const mapPath = (value: string): string => {
     if (value === join(RUNTIME_NODE_BIN, basename(nodeBinary))) return nodeBinary;
-    if (value.startsWith(\`\${RUNTIME_NODE_MODULES}/\`) && runtime.nodeModulesRoot) {
+    if (value.startsWith(`${RUNTIME_NODE_MODULES}/`) && runtime.nodeModulesRoot) {
       return join(runtime.nodeModulesRoot, relative(RUNTIME_NODE_MODULES, value));
     }
     if (runtime.extraBinary && value === runtime.extraBinary.target) return runtime.extraBinary.source;
@@ -754,7 +754,7 @@ function macSandboxEnvironment(
   ];
   for (const [key, value] of entries) {
     if (key.includes("=") || key.includes("\0") || value.includes("\0")) {
-      throw new Error(\`Invalid environment entry for macOS sandbox: \${key}\`);
+      throw new Error(`Invalid environment entry for macOS sandbox: ${key}`);
     }
   }
   return entries;
@@ -823,17 +823,17 @@ function macSandboxProfile(
     "(allow mach-lookup)",
     "(allow sysctl-read)",
     "(allow file-read*",
-    ...[...readDirectories].sort().map((path) => \`  (subpath \${seatbeltString(path)})\`),
-    ...[...readFiles].sort().map((path) => \`  (literal \${seatbeltString(path)})\`),
+    ...[...readDirectories].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
+    ...[...readFiles].sort().map((path) => `  (literal ${seatbeltString(path)})`),
     ")",
     "(allow file-write*",
-    ...[...writableDirectories].sort().map((path) => \`  (subpath \${seatbeltString(path)})\`),
+    ...[...writableDirectories].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
     ")",
     "(deny file-write*",
-    ...[...denyWrites].sort().map((path) => \`  (subpath \${seatbeltString(path)})\`),
+    ...[...denyWrites].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
     ")",
   ];
-  return \`\${lines.join("\\n")}\\n\`;
+  return `${lines.join("\\n")}\\n`;
 }
 
 async function writeMacSandboxProfile(
@@ -858,7 +858,7 @@ function macSandboxExecArgs(
     profilePath,
     "/usr/bin/env",
     "-i",
-    ...environment.map(([key, value]) => \`\${key}=\${value}\`),
+    ...environment.map(([key, value]) => `${key}=${value}`),
     command,
     ...args,
   ];
@@ -1405,20 +1405,20 @@ async function exerciseMacOSFilesystemBoundary(
   const { cwd, sourceRoot, goldenRoot } = options;
   const nonce = randomUUID();
   const hostCanaries = [
-    join(homedir(), \`.pi-plan-execute-host-canary-\${nonce}\`),
-    join(dirname(sourceRoot), \`.pi-plan-execute-other-project-canary-\${nonce}\`),
-    join(SCRATCH_ROOT, \`.pi-plan-execute-tmp-canary-\${nonce}\`),
+    join(homedir(), `.pi-plan-execute-host-canary-${nonce}`),
+    join(dirname(sourceRoot), `.pi-plan-execute-other-project-canary-${nonce}`),
+    join(SCRATCH_ROOT, `.pi-plan-execute-tmp-canary-${nonce}`),
   ];
-  const symlinkProbe = join(cwd, \`.pi-plan-execute-symlink-probe-\${nonce}\`);
-  const gitMirrorProbe = join(dirname(profilePath), "git-mirror", \`.pi-plan-execute-sandbox-probe-\${nonce}\`);
+  const symlinkProbe = join(cwd, `.pi-plan-execute-symlink-probe-${nonce}`);
+  const gitMirrorProbe = join(dirname(profilePath), "git-mirror", `.pi-plan-execute-sandbox-probe-${nonce}`);
   const deniedWrites: string[] = [];
   let writableProbe: string | undefined;
   try {
     await Promise.all(hostCanaries.map((path) => writeFile(path, nonce, { flag: "wx", mode: 0o600 })));
     const protectedRoots = options.role === "reviewer" ? [cwd, goldenRoot] : [goldenRoot];
-    deniedWrites.push(...protectedRoots.map((root) => join(root, \`.pi-plan-execute-sandbox-probe-\${nonce}\`)));
+    deniedWrites.push(...protectedRoots.map((root) => join(root, `.pi-plan-execute-sandbox-probe-${nonce}`)));
     deniedWrites.push(gitMirrorProbe);
-    if (options.role !== "reviewer") writableProbe = join(cwd, \`.pi-plan-execute-sandbox-probe-\${nonce}\`);
+    if (options.role !== "reviewer") writableProbe = join(cwd, `.pi-plan-execute-sandbox-probe-${nonce}`);
     await symlink(join(sourceRoot, "package.json"), symlinkProbe);
     deniedWrites.push(symlinkProbe);
     const script = probeScript(options.role, deniedWrites, writableProbe, hostCanaries);
@@ -1434,7 +1434,7 @@ async function exerciseMacOSFilesystemBoundary(
         },
       );
     } catch (error) {
-      throw new Error(\`OS filesystem sandbox probe failed for \${label}/\${options.role}: \${String(error)}\`);
+      throw new Error(`OS filesystem sandbox probe failed for ${label}/${options.role}: ${String(error)}`);
     }
   } finally {
     await Promise.all([
