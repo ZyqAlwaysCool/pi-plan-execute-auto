@@ -755,7 +755,6 @@ function macSandboxEnvironment(
     ["GIT_OPTIONAL_LOCKS", "0"],
     ["GIT_CONFIG_NOSYSTEM", "1"],
     ["GIT_CONFIG_GLOBAL", join(runtimeRoot, "home", ".gitconfig")],
-    ...(backendId === "codex" ? [["APP_SERVER_LOGS", join(runtimeRoot, "codex-app-server-logs")] as [string, string]] : []),
     ["GIT_DIR", join(runtimeRoot, "git-mirror")],
     ["GIT_WORK_TREE", resolve(options.cwd)],
     ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? [["NODE_USE_ENV_PROXY", "1"] as [string, string]] : []),
@@ -768,6 +767,18 @@ function macSandboxEnvironment(
     }
   }
   return entries;
+}
+
+function ancestorMetadataPaths(path: string): string[] {
+  const ancestors: string[] = [];
+  let current = dirname(resolve(path));
+  while (current !== "/" && current !== ".") {
+    ancestors.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return ancestors;
 }
 
 function macSandboxProfile(
@@ -824,6 +835,15 @@ function macSandboxProfile(
     ...(options.role === "reviewer" ? [realpathSync(options.cwd)] : []),
   ]);
 
+  // Seatbelt does not infer traversal metadata rights from a permitted descendant.
+  // Node realpathSync() resolves an absolute entrypoint by lstat'ing every ancestor
+  // (for example /Users -> /Users/name -> ... -> node_modules). Grant metadata on
+  // only those exact ancestor directories; never grant directory-data access there.
+  const metadataAncestors = new Set<string>();
+  for (const path of [...readDirectories, ...readFiles, ...writableDirectories]) {
+    for (const ancestor of ancestorMetadataPaths(path)) metadataAncestors.add(ancestor);
+  }
+
   const lines = [
     "(version 1)",
     "(deny default)",
@@ -832,6 +852,9 @@ function macSandboxProfile(
     "(allow network*)",
     "(allow mach-lookup)",
     "(allow sysctl-read)",
+    "(allow file-read-metadata",
+    ...[...metadataAncestors].sort().map((path) => `  (literal ${seatbeltString(path)})`),
+    ")",
     "(allow file-read*",
     ...[...readDirectories].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
     ...[...readFiles].sort().map((path) => `  (literal ${seatbeltString(path)})`),

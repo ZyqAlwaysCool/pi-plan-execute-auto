@@ -195,43 +195,14 @@ test("macOS Seatbelt can launch a real Codex ACP catalog session", {
       sourceRoot: fixture.sourceRoot,
       goldenRoot: fixture.goldenRoot,
     });
-    const rawArgs = [...(sandbox.config.args ?? [])];
-    const envIndex = rawArgs.indexOf("-i");
-    assert.ok(envIndex >= 0, "macOS backend should launch through env -i");
-    let commandIndex = envIndex + 1;
-    while (commandIndex < rawArgs.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(rawArgs[commandIndex] ?? "")) {
-      commandIndex += 1;
-    }
-    const runtimeCommand = rawArgs[commandIndex];
-    assert.ok(runtimeCommand, "Codex ACP runtime command should be present");
-    const stderrPath = join(sandbox.scratchPath, "codex-acp.stderr");
-    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-    const diagnosticArgs = [
-      ...rawArgs.slice(0, commandIndex),
-      "/bin/sh",
-      "-c",
-      `exec "$@" 2>${quote(stderrPath)}`,
-      "sh",
-      runtimeCommand,
-      ...rawArgs.slice(commandIndex + 1),
-    ];
     agent = new AcpAgent({
       cwd: fixture.cwd,
       model: "codex",
       mode: "read-only",
-      backends: { codex: { ...sandbox.config, args: diagnosticArgs } },
+      backends: { codex: sandbox.config },
       permissions: { defaultOutcome: "deny" },
     });
-    try {
-      await agent.ready();
-    } catch (error) {
-      const logPath = join(sandbox.scratchPath, "run", "codex-app-server-logs", "app-server.log");
-      const [adapterStderr, appServerLog] = await Promise.all([
-        readFile(stderrPath, "utf8").catch(() => ""),
-        readFile(logPath, "utf8").catch(() => ""),
-      ]);
-      throw new Error(`Codex ACP failed inside macOS Seatbelt: ${String(error)}\n--- Codex ACP stderr ---\n${adapterStderr}\n--- Codex ACP app-server log ---\n${appServerLog}`);
-    }
+    await agent.ready();
     assert.equal(agent.backendId, "codex");
     assert.ok(
       agent.configOptions.some((entry) => entry.id === "model" && entry.type === "select"),
