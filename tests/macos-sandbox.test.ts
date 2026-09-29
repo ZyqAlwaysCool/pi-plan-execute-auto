@@ -194,7 +194,6 @@ test("macOS Seatbelt can launch a real Codex ACP catalog session", {
       cwd: fixture.cwd,
       sourceRoot: fixture.sourceRoot,
       goldenRoot: fixture.goldenRoot,
-      includeProviderCredentials: true,
     });
     agent = new AcpAgent({
       cwd: fixture.cwd,
