@@ -115,6 +115,7 @@ class FakeHarness implements HarnessPair {
   reworkCalls = 0;
   reviewCalls = 0;
   lastReviewPrompt = "";
+  lastReworkPrompt = "";
   private readonly cwd: string;
   private readonly baseCommit: string;
   private readonly reworkRequired: boolean;
@@ -131,8 +132,9 @@ class FakeHarness implements HarnessPair {
     return execution(this.baseCommit, this.reworkRequired ? "blocked" : "complete");
   }
 
-  async rework(): Promise<ExecutionReport> {
+  async rework(prompt: string): Promise<ExecutionReport> {
     this.reworkCalls += 1;
+    this.lastReworkPrompt = prompt;
     await writeFile(join(this.cwd, "src", "change.txt"), "fixed\n", "utf8");
     const result = execution(this.baseCommit);
     return { ...result, round: 2 };
@@ -1310,6 +1312,80 @@ test("review loop breaker pauses without creating a completion commit", async ()
     assert.equal(result.state.phases[0]?.phase_commit_sha, undefined);
     const count = await git(setup.cwd, ["rev-list", "--count", "HEAD"]);
     assert.equal(count.stdout.trim(), "1");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+
+test("explicit Stage B resume rebuilds a fresh executor turn from persisted paused checkpoint", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    await writeFile(join(setup.cwd, "src", "change.txt"), "partial from interrupted session\n", "utf8");
+
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "paused";
+    state.pause_reason = "[HARNESS_ERROR] Reviewer provider usage limit interrupted the run.";
+    state.review_round_limit = 3;
+    const phase = state.phases[0]!;
+    phase.status = "paused";
+    phase.base_commit_sha = base;
+    phase.review_rounds = 1;
+    phase.last_error = state.pause_reason;
+
+    const harness = new FakeHarness(setup.cwd, base);
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, {
+        cwd: setup.cwd,
+        runtimeRoot: ".pi-plan-execute-auto/stage-b-test",
+      }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      maxReviewRounds: 3,
+      resumePaused: true,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+
+    assert.equal(result.status, "completed");
+    assert.equal(harness.executeCalls, 0, "resume checkpoint should be treated as rework of persisted partial work");
+    assert.equal(harness.reworkCalls, 1);
+    assert.equal(harness.reviewCalls, 1);
+    assert.match(harness.lastReworkPrompt, /RESUME CHECKPOINT/);
+    assert.match(harness.lastReworkPrompt, /fresh Executor session/);
+    assert.match(harness.lastReworkPrompt, /HARNESS_ERROR/);
+    assert.match(harness.lastReworkPrompt, /CURRENT ACTUAL WORKTREE DIFF/);
+    assert.equal(result.state.phases[0]?.review_rounds, 2);
+    assert.equal(result.state.phases[0]?.status, "completed");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("paused Stage B remains inert unless resume is explicitly requested", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "paused";
+    state.pause_reason = "[HARNESS_ERROR] transient";
+    state.phases[0]!.status = "paused";
+    state.phases[0]!.base_commit_sha = base;
+    const harness = new FakeHarness(setup.cwd, base);
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      requireDedicatedWorktree: false,
+      saveState: async () => {},
+    }).run();
+    assert.equal(result.status, "paused");
+    assert.equal(harness.executeCalls + harness.reworkCalls + harness.reviewCalls, 0);
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
   }

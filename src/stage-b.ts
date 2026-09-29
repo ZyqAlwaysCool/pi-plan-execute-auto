@@ -121,6 +121,8 @@ export interface StageBControllerOptions {
   gitTimeoutMs?: number | undefined;
   /** Extension entry points set this; unit tests may use an explicitly in-memory harness. */
   requireDedicatedWorktree?: boolean;
+  /** Explicit safe-resume: rebuild fresh ACP sessions around persisted phase/worktree evidence. */
+  resumePaused?: boolean;
 }
 
 /**
@@ -522,6 +524,31 @@ export class StageBController {
     return lines.join("\n\n");
   }
 
+  private resumeFeedback(
+    phase: PhasePackage,
+    history: ReviewReport[],
+  ): string {
+    const state = this.phaseState(phase);
+    const pieces = [
+      "RESUME CHECKPOINT: a previous ACP session ended before this phase completed.",
+      "This is a fresh Executor session. Do not assume conversational memory from the prior session.",
+      `Persisted rounds already consumed: ${state.review_rounds} of ${this.maxReviewRounds}.`,
+      `Previous pause: ${state.last_error ?? this.state.pause_reason ?? "(unknown)"}`,
+      "Inspect the actual current worktree diff and frozen phase contract before changing anything.",
+      "Preserve valid in-scope partial work; fix it in place rather than resetting or discarding the worktree.",
+    ];
+    if (state.acceptance_results?.length) {
+      pieces.push(`Last persisted deterministic acceptance:\n${formatAcceptanceResults(state.acceptance_results)}`);
+    }
+    if (state.unresolved_findings.length > 0) {
+      pieces.push(`Persisted unresolved findings:\n${state.unresolved_findings.map((finding) => `- ${finding.id}: ${finding.summary}`).join("\n")}`);
+    }
+    const lastReview = history.at(-1);
+    if (lastReview) pieces.push(`Last persisted Reviewer report:\n${formatReviewFeedback(lastReview)}`);
+    pieces.push("Continue CURRENT PHASE ONLY, rerun every required self-test, and return a fresh structured execution report. Do not commit.");
+    return pieces.join("\n\n");
+  }
+
   private feedbackForExecution(
     execution: ExecutionReport,
     acceptance: AcceptanceResult[],
@@ -566,6 +593,8 @@ export class StageBController {
   private async phase(phase: PhasePackage): Promise<StageBRunResult | undefined> {
     await this.assertCompletedEvidence();
     const phaseState = this.phaseState(phase);
+    const resumingFromCheckpoint = this.options.resumePaused === true &&
+      (phaseState.status === "paused" || phaseState.status === "running");
     if (phaseState.status === "completed") {
       if (!(await this.reconcileCompletion(phase))) {
         throw new WorkflowPauseError("COMPLETION_RECORD_MISSING", `Completed phase ${phase.phase.id} has no immutable completion record.`);
@@ -596,8 +625,9 @@ export class StageBController {
       phaseState.status = "running";
     }
 
-    let feedback: string | undefined;
     let history = await this.loadReviewHistory(phase);
+    let feedback: string | undefined = resumingFromCheckpoint ? this.resumeFeedback(phase, history) : undefined;
+    let freshResumeTurn = resumingFromCheckpoint;
     while (phaseState.review_rounds < this.maxReviewRounds) {
       if (this.options.signal?.aborted) {
         return this.pause(phase, "Execution & Review was cancelled before phase completion.", "ABORTED");
@@ -614,7 +644,11 @@ export class StageBController {
         round,
         executor_status: "running",
         reviewer_status: "pending",
-        message: feedback ? "Executor resuming same session after feedback." : "Executor implementing current phase.",
+        message: freshResumeTurn
+          ? "Executor rebuilding a fresh session from the persisted resume checkpoint."
+          : feedback
+            ? "Executor resuming same session after feedback."
+            : "Executor implementing current phase.",
       });
 
       const harnessOptions = {
@@ -653,6 +687,7 @@ export class StageBController {
           `Executor harness failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+      freshResumeTurn = false;
       await this.assertNoHistoryOrIndexMutation(beforeExecutorSnapshot, "Executor");
       await this.assertReportHashes(beforeExecutorReports, "Executor");
       await this.assertPackageUnchanged();
@@ -908,7 +943,11 @@ export class StageBController {
         reason: "Human approval is required before Execution & Review; draft planning never starts Executor or Reviewer sessions.",
       };
     }
-    if (this.state.status === "paused" || this.state.status === "completed" || this.state.status === "cancelled") {
+    if (
+      (this.state.status === "paused" && this.options.resumePaused !== true) ||
+      this.state.status === "completed" ||
+      this.state.status === "cancelled"
+    ) {
       return this.state.status === "completed"
         ? { status: "completed", state: this.state }
         : this.state.pause_reason

@@ -55,6 +55,7 @@ import {
 } from "../src/plugin-config.js";
 import { defaultIsolationProvider } from "../src/isolation-provider.js";
 import { supportedBackendForModel } from "../src/sandbox.js";
+import { isPathAllowed } from "../src/glob.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
 import { agentSessionTranscriptRelativePath, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 import { StageBController } from "../src/stage-b.js";
@@ -113,6 +114,7 @@ export type PlanExecuteCommand =
   | { kind: "finalize"; directive?: string }
   | { kind: "setup" }
   | { kind: "start"; runId: string }
+  | { kind: "resume"; runId: string }
   | { kind: "stop"; runId: string }
   | { kind: "status"; runId: string }
   | { kind: "usage" };
@@ -129,6 +131,7 @@ export function parsePlanExecuteCommand(args: string): PlanExecuteCommand {
   }
   if (action === "setup") return tokens.length === 1 ? { kind: "setup" } : { kind: "usage" };
   if (action === "start") return tokens.length === 2 ? { kind: "start", runId: tokens[1]! } : { kind: "usage" };
+  if (action === "resume") return tokens.length === 2 ? { kind: "resume", runId: tokens[1]! } : { kind: "usage" };
   if (action === "stop") return tokens.length === 2 ? { kind: "stop", runId: tokens[1]! } : { kind: "usage" };
   if (action === "status") return tokens.length === 2 ? { kind: "status", runId: tokens[1]! } : { kind: "usage" };
 
@@ -817,15 +820,81 @@ type StartResult =
       reason: string;
     };
 
-function restartPause(state: WorkflowState): string {
-  const current = state.phases.find((phase) => phase.status !== "completed");
-  state.status = "paused";
-  state.pause_reason = "[PROCESS_RESTART] A persisted running workflow cannot safely resume its AgentPrism executor session; start a new approved run after Main Pi review.";
-  if (current) {
-    current.status = "paused";
-    current.last_error = state.pause_reason;
+const RESUMABLE_PAUSE_CODES = new Set([
+  "ABORTED",
+  "HARNESS_ERROR",
+  "PROCESS_RESTART",
+  "PROCESS_RESTART_RECONCILED",
+]);
+
+function pauseCode(reason: string | undefined): string | undefined {
+  return reason?.match(/^\[([A-Z0-9_]+)\]/u)?.[1];
+}
+
+export function evaluateResumeEligibility(
+  state: WorkflowState,
+  options?: { allowOrphanedRunning?: boolean },
+): { ok: true; code: string; currentPhase: string } | { ok: false; reason: string } {
+  if (state.status !== "paused" && !(options?.allowOrphanedRunning && state.status === "running")) {
+    return { ok: false, reason: `Run is ${state.status}; only a paused run or an orphaned persisted running run can be resumed.` };
   }
-  return state.pause_reason;
+  if (!state.worktree_path || !state.branch_name) {
+    return { ok: false, reason: "Run has no persisted dedicated worktree/branch identity to resume safely." };
+  }
+  const current = state.phases.find((phase) => phase.status !== "completed");
+  if (!current) return { ok: false, reason: "Run has no incomplete phase to resume." };
+  const limit = state.review_round_limit ?? DEFAULT_MAX_REVIEW_ROUNDS;
+  if (current.review_rounds >= limit) {
+    return { ok: false, reason: `Current phase already consumed review_round_limit=${limit}; resume cannot create extra hidden review rounds.` };
+  }
+  const code = state.status === "running" ? "PROCESS_RESTART" : pauseCode(state.pause_reason);
+  if (!code || !RESUMABLE_PAUSE_CODES.has(code)) {
+    return {
+      ok: false,
+      reason: `Pause reason ${state.pause_reason ?? "(missing)"} is not an execution-interruption checkpoint. Safety/evidence failures require human repair or a new reviewed run.`,
+    };
+  }
+  return { ok: true, code, currentPhase: current.phase_id };
+}
+
+async function verifyResumeCheckpoint(
+  pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
+  state: WorkflowState,
+  git: GitWorkspace,
+): Promise<void> {
+  const currentIndex = state.phases.findIndex((phase) => phase.status !== "completed");
+  if (currentIndex < 0) throw new Error("Run has no incomplete phase.");
+  const current = state.phases[currentIndex]!;
+  const phase = pkg.phases.find((entry) => entry.phase.id === current.phase_id);
+  if (!phase) throw new Error(`Current phase ${current.phase_id} is missing from the frozen package.`);
+
+  await git.assertDedicatedIdentity();
+  await git.assertNoCachedChanges();
+  const head = await git.head();
+  const previous = currentIndex > 0 ? state.phases[currentIndex - 1] : undefined;
+  if (previous?.status === "completed" && previous.phase_commit_sha) {
+    if (current.base_commit_sha && current.base_commit_sha !== previous.phase_commit_sha) {
+      throw new Error(`Current phase base ${current.base_commit_sha} does not continue previous completion commit ${previous.phase_commit_sha}.`);
+    }
+    if (!current.base_commit_sha && head !== previous.phase_commit_sha) {
+      throw new Error(`Resume HEAD ${head} does not equal previous completion commit ${previous.phase_commit_sha}.`);
+    }
+  }
+  if (current.base_commit_sha && head !== current.base_commit_sha) {
+    throw new Error(`Resume HEAD ${head} does not equal current phase base ${current.base_commit_sha}.`);
+  }
+  if (!current.base_commit_sha && current.review_rounds > 0) {
+    throw new Error("Current phase has persisted review rounds but no phase base commit.");
+  }
+
+  const changed = await git.changedPaths();
+  if (!current.base_commit_sha && changed.length > 0) {
+    throw new Error("A phase without a persisted base commit must resume from a clean worktree.");
+  }
+  const outOfScope = changed.filter((path) => !isPathAllowed(path, phase.acceptance.scope.allowed_paths));
+  if (outOfScope.length > 0) {
+    throw new Error(`Resume checkpoint has out-of-scope changes for ${current.phase_id}: ${outOfScope.join(", ")}.`);
+  }
 }
 
 function escalationDetails(state: WorkflowState, reason: string | undefined): Record<string, unknown> {
@@ -1018,6 +1087,7 @@ async function startStageB(
     executorModel?: string;
     reviewerModel?: string;
     signal?: AbortSignal;
+    resume?: boolean;
   },
 ): Promise<StartResult> {
   let loaded: Awaited<ReturnType<typeof loadValidatedRun>>;
@@ -1074,12 +1144,15 @@ async function startStageB(
       );
     }
   }
-  if (state.status === "paused") {
-    return state.pause_reason
-      ? { status: "paused", state, reason: state.pause_reason }
-      : { status: "paused", state, reason: "Run is paused." };
+  const resumeRequested = options?.resume === true;
+  if (state.status === "paused" && !resumeRequested) {
+    return {
+      status: "paused",
+      state,
+      reason: `${state.pause_reason ?? "Run is paused."} Use /plan-execute resume ${runId} for an explicit safe-resume attempt.`,
+    };
   }
-  if (state.status === "running") {
+  if (state.status === "running" && !resumeRequested) {
     if (activeRuns.has(runId)) return { status: "not_started", state, reason: `Run ${runId} is already active.` };
     try {
       const reconciled = await reconcilePersistedCompletions(pi, ctx, pkg, state);
@@ -1087,7 +1160,20 @@ async function startStageB(
     } catch (error) {
       return persistAndEscalatePause(pi, ctx, pkg, state, `[PROCESS_RESTART_EVIDENCE] ${error instanceof Error ? error.message : String(error)}`);
     }
-    return persistAndEscalatePause(pi, ctx, pkg, state, restartPause(state));
+    const reason = "[PROCESS_RESTART] The previous Pi process ended while this run was active. Use /plan-execute resume " + runId + " to rebuild fresh ACP sessions from the persisted checkpoint.";
+    return persistAndEscalatePause(pi, ctx, pkg, state, reason);
+  }
+  if (resumeRequested) {
+    if (activeRuns.has(runId)) return { status: "not_started", state, reason: `Run ${runId} is already active.` };
+    const eligibility = evaluateResumeEligibility(state, { allowOrphanedRunning: true });
+    if (!eligibility.ok) {
+      await appendRunEvent(pkg.root, "workflow_resume_rejected", {
+        run_id: runId,
+        reason: eligibility.reason,
+        pause_reason: state.pause_reason ?? null,
+      }).catch(() => undefined);
+      return { status: "not_started", state, reason: `Resume refused: ${eligibility.reason}` };
+    }
   }
   if (
     state.status === "frozen" &&
@@ -1221,6 +1307,32 @@ async function startStageB(
       dedicatedBranch: dedicated.branchName,
       dedicatedWorktreePath: dedicated.path,
     });
+    if (resumeRequested) {
+      const eligibility = evaluateResumeEligibility(state, { allowOrphanedRunning: true });
+      if (!eligibility.ok) return { status: "not_started", state, reason: `Resume refused: ${eligibility.reason}` };
+      try {
+        await verifyResumeCheckpoint(pkg, state, git);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        await appendRunEvent(pkg.root, "workflow_resume_rejected", {
+          run_id: runId,
+          code: eligibility.code,
+          current_phase: eligibility.currentPhase,
+          reason,
+          pause_reason: state.pause_reason ?? null,
+        }).catch(() => undefined);
+        return { status: "not_started", state, reason: `Resume checkpoint verification failed: ${reason}` };
+      }
+      await appendRunEvent(pkg.root, "workflow_resumed", {
+        run_id: runId,
+        from_status: state.status,
+        resume_code: eligibility.code,
+        previous_pause_reason: state.pause_reason ?? null,
+        current_phase: eligibility.currentPhase,
+        review_rounds: state.phases.find((phase) => phase.phase_id === eligibility.currentPhase)?.review_rounds ?? 0,
+        completed_phases: state.phases.filter((phase) => phase.status === "completed").length,
+      }).catch(() => undefined);
+    }
     const sessionPair = new AgentPrismSessionPair({
       cwd: dedicated.path,
       sourceRoot: ctx.cwd,
@@ -1268,6 +1380,7 @@ async function startStageB(
       signal: linked.signal,
       acceptanceTimeoutMs: acceptanceTimeoutMs(),
       requireDedicatedWorktree: true,
+      resumePaused: resumeRequested,
       saveState: (next) => writeWorkflowState(pkg.root, next),
       onStatus: (event) => {
         showWidget(ctx, [
@@ -1695,6 +1808,10 @@ async function commandApprove(
 async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runId: string): Promise<void> {
   try {
     const loaded = await loadValidatedRun(ctx.cwd, runId);
+    if (loaded.state.status === "paused") {
+      notify(ctx, `Run ${runId} is paused. Use /plan-execute resume ${runId} to explicitly rebuild fresh ACP sessions from the persisted checkpoint.`, "warning");
+      return;
+    }
     let result: DraftReviewResult | StartResult;
     if (loaded.state.status === "draft") {
       const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
@@ -1728,6 +1845,44 @@ async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runI
       return;
     }
     notify(ctx, `Execution & Review ${result.status}.`, "info");
+  } catch (error) {
+    notify(ctx, error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+async function commandResume(pi: ExtensionAPI, ctx: ExtensionCommandContext, runId: string): Promise<void> {
+  try {
+    const loaded = await loadValidatedRun(ctx.cwd, runId);
+    const eligibility = evaluateResumeEligibility(loaded.state, { allowOrphanedRunning: true });
+    if (!eligibility.ok) {
+      notify(ctx, `Run ${runId} cannot be safely resumed: ${eligibility.reason}`, "warning");
+      return;
+    }
+    await appendRunEvent(loaded.package.root, "workflow_resume_requested", {
+      run_id: runId,
+      from_status: loaded.state.status,
+      resume_code: eligibility.code,
+      current_phase: eligibility.currentPhase,
+      pause_reason: loaded.state.pause_reason ?? null,
+    }).catch(() => undefined);
+    notify(
+      ctx,
+      `Resuming ${runId} from persisted checkpoint at ${eligibility.currentPhase}. Completed phases will be re-verified and skipped; fresh Executor/Reviewer ACP sessions will be created for unfinished work.`,
+      "info",
+    );
+    const result = await startStageB(pi, ctx, runId, {
+      resume: true,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+    if (result.status === "not_started") {
+      notify(ctx, result.reason ?? "Resume did not start.", "warning");
+      return;
+    }
+    if (result.status === "paused") {
+      // Newly-paused execution is already reported by persistAndEscalatePause.
+      return;
+    }
+    notify(ctx, `Execution & Review ${result.status} after resume.`, "info");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -1773,6 +1928,7 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
     }
     const root = packageRoot(ctx.cwd, runId);
     const state = await readWorkflowState(root);
+    const resume = state ? evaluateResumeEligibility(state, { allowOrphanedRunning: true }) : undefined;
     const eventDisplay = join(".pi-plan-execute-auto", runId, ".runtime", "events.jsonl");
     const executorSession = state ? latestSessionId(state, "executor") : undefined;
     const reviewerSession = state ? latestSessionId(state, "reviewer") : undefined;
@@ -1786,6 +1942,11 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
       [
         `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`,
         `Workflow timeline: ${eventDisplay}`,
+        ...(state?.status === "paused" || state?.status === "running"
+          ? [resume?.ok
+              ? `Resume: /plan-execute resume ${runId} (checkpoint ${resume.currentPhase})`
+              : `Resume: blocked · ${resume?.reason ?? "state unavailable"}`]
+          : []),
         ...(executorDisplay ? [`Latest Executor transcript: ${executorDisplay}`] : []),
         ...(reviewerDisplay ? [`Latest Reviewer transcript: ${reviewerDisplay}`] : []),
       ].join("\n"),
@@ -1867,11 +2028,12 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       if (command.kind === "finalize") return commandFinalize(pi, ctx, command.directive);
       if (command.kind === "setup") return commandSetup(ctx);
       if (command.kind === "start") return commandStart(pi, ctx, command.runId);
+      if (command.kind === "resume") return commandResume(pi, ctx, command.runId);
       if (command.kind === "stop") return commandStop(ctx, command.runId);
       if (command.kind === "status") return commandStatus(ctx, command.runId);
       notify(
         ctx,
-        "Usage: /plan-execute [自然语言指令] | finalize [指令] | setup | start <run-id> | stop <run-id> | status <run-id>",
+        "Usage: /plan-execute [自然语言指令] | finalize [指令] | setup | start <run-id> | resume <run-id> | stop <run-id> | status <run-id>",
         "info",
       );
     },

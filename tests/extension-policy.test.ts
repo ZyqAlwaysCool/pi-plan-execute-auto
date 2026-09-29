@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type { WorkflowState } from "../src/types.js";
 import planExecuteAuto, {
   approvalStartsStageB,
   buildFinalizePrompt,
+  evaluateResumeEligibility,
   parsePlanExecuteCommand,
   selectStageBReasoningEffort,
 } from "../extensions/index.js";
@@ -38,6 +40,7 @@ test("plan-execute accepts an inline natural-language directive without confusin
 test("plan-execute reserves only explicit control commands and validates their arity", () => {
   assert.deepEqual(parsePlanExecuteCommand("setup"), { kind: "setup" });
   assert.deepEqual(parsePlanExecuteCommand("start run-123"), { kind: "start", runId: "run-123" });
+  assert.deepEqual(parsePlanExecuteCommand("resume run-123"), { kind: "resume", runId: "run-123" });
   assert.deepEqual(parsePlanExecuteCommand("stop run-123"), { kind: "stop", runId: "run-123" });
   assert.deepEqual(parsePlanExecuteCommand("status run-123"), { kind: "status", runId: "run-123" });
   assert.deepEqual(parsePlanExecuteCommand("setup now"), { kind: "usage" });
@@ -75,4 +78,50 @@ test("queued human review waits for full agent settlement and never blocks turn_
 
   const result = settled({ type: "agent_settled" }, { hasUI: false });
   assert.equal(result, undefined, "agent_settled handler must schedule review without awaiting it");
+});
+
+
+test("safe resume accepts only execution-interruption checkpoints with remaining review budget", () => {
+  const base = {
+    version: 1,
+    run_id: "resume-test",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/resume-test",
+    status: "paused",
+    created_at: new Date(0).toISOString(),
+    review_round_limit: 5,
+    branch_name: "pi-plan-execute-auto/resume-test",
+    worktree_path: "/tmp/resume-worktree",
+    phases: [{
+      phase_id: "phase-01",
+      status: "paused",
+      review_rounds: 2,
+      execution_report_paths: [],
+      review_report_paths: [],
+      unresolved_findings: [],
+    }],
+  } as WorkflowState;
+
+  for (const code of ["ABORTED", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED"]) {
+    const state = { ...base, pause_reason: `[${code}] transient interruption`, phases: base.phases.map((phase) => ({ ...phase })) };
+    const result = evaluateResumeEligibility(state);
+    assert.equal(result.ok, true, code);
+  }
+
+  for (const code of ["MAX_REVIEW_ROUNDS", "HEAD_CHANGED", "GOLDEN_PACKAGE_CHANGED", "REVIEWER_CHANGED_WORKSPACE", "COMPLETION_EVIDENCE_INVALID"]) {
+    const state = { ...base, pause_reason: `[${code}] unsafe checkpoint`, phases: base.phases.map((phase) => ({ ...phase })) };
+    const result = evaluateResumeEligibility(state);
+    assert.equal(result.ok, false, code);
+  }
+
+  const exhausted = {
+    ...base,
+    pause_reason: "[HARNESS_ERROR] provider interruption",
+    phases: [{ ...base.phases[0]!, review_rounds: 5 }],
+  } as WorkflowState;
+  assert.equal(evaluateResumeEligibility(exhausted).ok, false);
+
+  const orphaned = { ...base, status: "running", pause_reason: undefined } as WorkflowState;
+  assert.equal(evaluateResumeEligibility(orphaned).ok, false);
+  assert.equal(evaluateResumeEligibility(orphaned, { allowOrphanedRunning: true }).ok, true);
 });
