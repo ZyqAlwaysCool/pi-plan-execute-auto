@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { AcpAgent } from "@automatalabs/workflows";
 import {
   createSandboxedBackend,
   findMacOSSandboxExec,
@@ -132,6 +133,43 @@ test("macOS acceptance commands can write only the dedicated worktree and privat
     }
   } finally {
     await rm(homeMarker, { force: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+
+test("macOS Seatbelt can launch a real OpenCode ACP session", {
+  skip: process.platform !== "darwin" || (!requireMacSandboxTests && !macSandboxAvailable)
+    ? "macOS sandbox-exec is unavailable"
+    : false,
+  timeout: 30_000,
+}, async () => {
+  const fixture = await makeFixture();
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  let agent: AcpAgent | undefined;
+  try {
+    const version = await execFile("opencode", ["--version"], { timeout: 10_000, maxBuffer: 64 * 1024 });
+    assert.match(version.stdout.trim(), /^1\.18\./u);
+
+    sandbox = await createSandboxedBackend({
+      role: "reviewer",
+      model: "opencode/catalog",
+      cwd: fixture.cwd,
+      sourceRoot: fixture.sourceRoot,
+      goldenRoot: fixture.goldenRoot,
+    });
+    agent = new AcpAgent({
+      cwd: fixture.cwd,
+      model: "opencode",
+      mode: "plan",
+      backends: { opencode: sandbox.config },
+      permissions: { defaultOutcome: "deny" },
+    });
+    await agent.ready();
+    assert.equal(agent.backendId, "opencode");
+  } finally {
+    await agent?.close({ keep: true }).catch(() => {});
+    await sandbox?.cleanup();
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

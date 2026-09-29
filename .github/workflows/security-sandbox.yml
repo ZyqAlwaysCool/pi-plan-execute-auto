@@ -40,6 +40,11 @@ jobs:
           test "$(stat -f %u /usr/bin/sandbox-exec)" = 0
           /usr/bin/sandbox-exec -p '(version 1) (allow default)' /usr/bin/true
       - run: npm ci
+      - name: Install OpenCode ACP fixture
+        run: |
+          npm install -g opencode-ai@1.18.33
+          which opencode
+          opencode --version
       - run: npm run check
       - run: npm run build
       - run: npm run test:sandbox:macos:required
