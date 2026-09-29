@@ -83,13 +83,58 @@ function validateControlledEnvironmentPaths(state: WorkflowState): void {
   }
 }
 
-const FINALIZE_PROMPT = [
+const FINALIZE_PROMPT_LINES = [
   "The user explicitly invoked /plan-execute.",
   "Use the complete current conversation and repository investigation context to call plan_execute_finalize.",
   "Create a Golden Document Package with at least one ordered phase. Every phase needs its own spec, acceptance YAML contract, and required completion commit.",
   "Do not implement code or approve/freeze the package on the user's behalf. The plugin will validate the draft, let the human request revisions repeatedly, and ask for approval.",
   "Do not supply executor_model or reviewer_model: only the human's /plan-execute setup selection owns the ACP routing.",
-].join("\n");
+];
+
+export function buildFinalizePrompt(directive?: string): string {
+  const humanDirective = directive?.trim();
+  if (!humanDirective) return FINALIZE_PROMPT_LINES.join("\n");
+  return [
+    ...FINALIZE_PROMPT_LINES,
+    "",
+    "The slash command included an explicit human directive for this invocation.",
+    "Treat that directive as authoritative when resolving alternatives or choices discussed earlier in the conversation.",
+    "Do not ask the human to repeat or reconfirm the directive merely because it was supplied as slash-command arguments; use the current conversation and repository context and finalize the draft now.",
+    "Words such as execute, start, implement, or their equivalents inside this directive select the intended plan/scope only; they do NOT authorize bypassing the plugin's later Plan Review & Approval gate or starting Stage B.",
+    "",
+    "Human /plan-execute directive (verbatim):",
+    humanDirective,
+  ].join("\n");
+}
+
+export type PlanExecuteCommand =
+  | { kind: "finalize"; directive?: string }
+  | { kind: "setup" }
+  | { kind: "start"; runId: string }
+  | { kind: "stop"; runId: string }
+  | { kind: "status"; runId: string }
+  | { kind: "usage" };
+
+export function parsePlanExecuteCommand(args: string): PlanExecuteCommand {
+  const trimmed = args.trim();
+  if (!trimmed) return { kind: "finalize" };
+
+  const tokens = trimmed.split(/\s+/u);
+  const action = tokens[0] ?? "";
+  if (action === "finalize") {
+    const directive = trimmed.slice(action.length).trim();
+    return directive ? { kind: "finalize", directive } : { kind: "finalize" };
+  }
+  if (action === "setup") return tokens.length === 1 ? { kind: "setup" } : { kind: "usage" };
+  if (action === "start") return tokens.length === 2 ? { kind: "start", runId: tokens[1]! } : { kind: "usage" };
+  if (action === "stop") return tokens.length === 2 ? { kind: "stop", runId: tokens[1]! } : { kind: "usage" };
+  if (action === "status") return tokens.length === 2 ? { kind: "status", runId: tokens[1]! } : { kind: "usage" };
+
+  // Any non-reserved text is an explicit human directive for finalization.
+  // This lets one command both select the plan and enter plan-execute, e.g.
+  // /plan-execute 按方案B执行
+  return { kind: "finalize", directive: trimmed };
+}
 
 const DOCUMENT_SCHEMA = Type.Object({
   id: Type.String({ minLength: 1 }),
@@ -1578,10 +1623,10 @@ async function drainQueuedHumanReview(pi: ExtensionAPI, ctx: ExtensionContext): 
   }
 }
 
-async function commandFinalize(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+async function commandFinalize(pi: ExtensionAPI, ctx: ExtensionCommandContext, directive?: string): Promise<void> {
   try {
     await approvedSetup(ctx.cwd, ctx.hasUI);
-    pi.sendUserMessage(FINALIZE_PROMPT, { expandPromptTemplates: false });
+    pi.sendUserMessage(buildFinalizePrompt(directive), { expandPromptTemplates: false });
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "warning");
   }
@@ -1806,16 +1851,19 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("plan-execute", {
-    description: "Create/review a phased plan or control its Execution & Review run",
+    description: "Create/review a phased plan, optionally with an inline directive, or control its Execution & Review run",
     handler: async (args, ctx) => {
-      const tokens = args.trim().split(/\s+/).filter(Boolean);
-      const action = tokens[0];
-      if (!action || action === "finalize") return commandFinalize(pi, ctx);
-      if (action === "setup") return commandSetup(ctx);
-      if (action === "start" && tokens[1]) return commandStart(pi, ctx, tokens[1]);
-      if (action === "stop" && tokens[1]) return commandStop(ctx, tokens[1]);
-      if (action === "status" && tokens[1]) return commandStatus(ctx, tokens[1]);
-      notify(ctx, "Usage: /plan-execute | setup | start <run-id> | stop <run-id> | status <run-id>", "info");
+      const command = parsePlanExecuteCommand(args);
+      if (command.kind === "finalize") return commandFinalize(pi, ctx, command.directive);
+      if (command.kind === "setup") return commandSetup(ctx);
+      if (command.kind === "start") return commandStart(pi, ctx, command.runId);
+      if (command.kind === "stop") return commandStop(ctx, command.runId);
+      if (command.kind === "status") return commandStatus(ctx, command.runId);
+      notify(
+        ctx,
+        "Usage: /plan-execute [自然语言指令] | finalize [指令] | setup | start <run-id> | stop <run-id> | status <run-id>",
+        "info",
+      );
     },
   });
 
