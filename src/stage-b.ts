@@ -36,6 +36,9 @@ import {
   type AcceptanceResult,
   type ExecutionReport,
   type HarnessPair,
+  type PauseInput,
+  type PauseRecord,
+  type PauseStage,
   type PhaseCompletionRecord,
   type PhasePackage,
   type PhaseState,
@@ -45,6 +48,7 @@ import {
   type ValidatedPackage,
   type WorkflowState,
 } from "./types.js";
+import { abortPauseInput, createPauseRecord, formatPauseReason } from "./pause.js";
 import {
   validatePackageDirectory,
   writeJsonAtomic,
@@ -529,11 +533,15 @@ export class StageBController {
     history: ReviewReport[],
   ): string {
     const state = this.phaseState(phase);
+    const pause = this.state.pause;
+    const previousPause = pause
+      ? `[${pause.code}] ${pause.summary}${pause.detail && pause.detail !== pause.summary ? ` (${pause.detail})` : ""}`
+      : state.last_error ?? this.state.pause_reason ?? "(unknown)";
     const pieces = [
       "RESUME CHECKPOINT: a previous ACP session ended before this phase completed.",
       "This is a fresh Executor session. Do not assume conversational memory from the prior session.",
       `Persisted rounds already consumed: ${state.review_rounds} of ${this.maxReviewRounds}.`,
-      `Previous pause: ${state.last_error ?? this.state.pause_reason ?? "(unknown)"}`,
+      `Previous pause: ${previousPause}`,
       "Inspect the actual current worktree diff and frozen phase contract before changing anything.",
       "Preserve valid in-scope partial work; fix it in place rather than resetting or discarding the worktree.",
     ];
@@ -568,11 +576,16 @@ export class StageBController {
     return pieces.join("\n\n");
   }
 
-  private async pause(phase: PhasePackage | undefined, reason: string, code: string): Promise<StageBRunResult> {
+  private async pause(phase: PhasePackage | undefined, input: PauseInput): Promise<StageBRunResult> {
+    const phaseState = phase ? this.phaseState(phase) : undefined;
+    const record: PauseRecord = createPauseRecord({
+      ...input,
+      ...(phase && phaseState ? { phase_id: phase.phase.id, round: phaseState.review_rounds } : {}),
+    });
     this.state.status = "paused";
-    this.state.pause_reason = `[${code}] ${reason}`;
-    if (phase) {
-      const phaseState = this.phaseState(phase);
+    this.state.pause = record;
+    this.state.pause_reason = formatPauseReason(record);
+    if (phase && phaseState) {
       if (phaseState.status !== "completed") {
         phaseState.status = "paused";
         phaseState.last_error = this.state.pause_reason;
@@ -580,14 +593,20 @@ export class StageBController {
       this.emit({
         phase_id: phase.phase.id,
         round: phaseState.review_rounds,
-        executor_status: "failed",
-        reviewer_status: "failed",
+        executor_status: "interrupted",
+        reviewer_status: "interrupted",
         message: this.state.pause_reason,
+        pause: record,
       });
     }
     await this.save();
-    const pauseReason = this.state.pause_reason ?? `[${code}] ${reason}`;
-    return { status: "paused", state: this.state, reason: pauseReason };
+    const pauseReason = this.state.pause_reason ?? formatPauseReason(record);
+    return { status: "paused", state: this.state, reason: pauseReason, pause: record };
+  }
+
+  /** Classify the Stage B abort signal into a precise, resumability-aware pause cause. */
+  private abortPause(stage: PauseStage, summary: string): PauseInput {
+    return abortPauseInput(this.options.signal?.reason, { stage, summary });
   }
 
   private async phase(phase: PhasePackage): Promise<StageBRunResult | undefined> {
@@ -630,7 +649,7 @@ export class StageBController {
     let freshResumeTurn = resumingFromCheckpoint;
     while (phaseState.review_rounds < this.maxReviewRounds) {
       if (this.options.signal?.aborted) {
-        return this.pause(phase, "Execution & Review was cancelled before phase completion.", "ABORTED");
+        return this.pause(phase, this.abortPause("phase", "Execution & Review was cancelled before phase completion."));
       }
       const round = phaseState.review_rounds + 1;
       await this.assertPackageUnchanged();
@@ -679,7 +698,7 @@ export class StageBController {
         );
       } catch (error) {
         if (this.options.signal?.aborted) {
-          return this.pause(phase, "Execution & Review was cancelled during Executor execution.", "ABORTED");
+          return this.pause(phase, this.abortPause("executor", "Execution & Review was cancelled during Executor execution."));
         }
         if (error instanceof WorkflowPauseError) throw error;
         throw new WorkflowPauseError(
@@ -712,7 +731,7 @@ export class StageBController {
       if (execution.status !== "complete" || evidenceError || outOfScope.length > 0 || !requiredAcceptancePassed(acceptance)) {
         feedback = this.feedbackForExecution(execution, acceptance, outOfScope, undefined, evidenceError);
         if (round >= this.maxReviewRounds) {
-          return this.pause(phase, `Phase did not pass deterministic validation after ${round} review rounds.`, "MAX_REVIEW_ROUNDS");
+          return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "acceptance", summary: `Phase did not pass deterministic validation after ${round} review rounds.` });
         }
         continue;
       }
@@ -749,7 +768,7 @@ export class StageBController {
         );
       } catch (error) {
         if (this.options.signal?.aborted) {
-          return this.pause(phase, "Execution & Review was cancelled during Reviewer execution.", "ABORTED");
+          return this.pause(phase, this.abortPause("reviewer", "Execution & Review was cancelled during Reviewer execution."));
         }
         if (error instanceof WorkflowPauseError) throw error;
         throw new WorkflowPauseError(
@@ -787,7 +806,7 @@ export class StageBController {
         });
         feedback = this.feedbackForExecution(execution, acceptance, [], review);
         if (round >= this.maxReviewRounds) {
-          return this.pause(phase, `Reviewer did not PASS after ${round} review rounds.`, "MAX_REVIEW_ROUNDS");
+          return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "reviewer", summary: `Reviewer did not PASS after ${round} review rounds.` });
         }
         continue;
       }
@@ -819,7 +838,7 @@ export class StageBController {
       if (!requiredAcceptancePassed(finalAcceptance) || finalOutOfScope.length > 0) {
         feedback = this.feedbackForExecution(execution, finalAcceptance, finalOutOfScope, review);
         if (round >= this.maxReviewRounds) {
-          return this.pause(phase, `Acceptance failed after reviewer PASS on round ${round}.`, "MAX_REVIEW_ROUNDS");
+          return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "acceptance", summary: `Acceptance failed after reviewer PASS on round ${round}.` });
         }
         continue;
       }
@@ -932,7 +951,7 @@ export class StageBController {
       return undefined;
     }
 
-    return this.pause(phase, `Phase reached max_review_rounds=${this.maxReviewRounds}.`, "MAX_REVIEW_ROUNDS");
+    return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "reviewer", summary: `Phase reached max_review_rounds=${this.maxReviewRounds}.` });
   }
 
   async run(): Promise<StageBRunResult> {
@@ -959,6 +978,7 @@ export class StageBController {
       this.state.status = "running";
       this.state.started_at ??= new Date().toISOString();
       delete this.state.pause_reason;
+      delete this.state.pause;
       await this.save();
       if (this.options.requireDedicatedWorktree !== false) await this.options.git.assertDedicatedIdentity();
       await this.assertPackageUnchanged();
@@ -973,11 +993,11 @@ export class StageBController {
       await this.save();
       return { status: "completed", state: this.state };
     } catch (error) {
-      if (this.options.signal?.aborted) return this.pause(currentPhase, "Execution & Review was cancelled.", "ABORTED");
-      if (error instanceof WorkflowPauseError) return this.pause(currentPhase, error.message, error.code);
-      if (error instanceof GitPolicyError) return this.pause(currentPhase, error.message, error.code);
+      if (this.options.signal?.aborted) return this.pause(currentPhase, this.abortPause("unknown", "Execution & Review was cancelled."));
+      if (error instanceof WorkflowPauseError) return this.pause(currentPhase, { code: error.code, stage: "unknown", summary: error.message });
+      if (error instanceof GitPolicyError) return this.pause(currentPhase, { code: error.code, stage: "unknown", summary: error.message });
       const message = error instanceof Error ? error.message : String(error);
-      return this.pause(currentPhase, message, "STAGE_B_ERROR");
+      return this.pause(currentPhase, { code: "STAGE_B_ERROR", stage: "unknown", summary: message });
     }
   }
 }

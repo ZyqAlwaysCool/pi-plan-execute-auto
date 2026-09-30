@@ -135,3 +135,34 @@ test("rendered lines never exceed the available width", () => {
     assert.ok(visibleWidth(line) <= 24);
   }
 });
+
+test("the whole-run budget renders as remaining time and warns near expiry", () => {
+  const { model, advance, now } = testClock();
+  model.startLive("run-1", "executor", "agent_thought_chunk");
+  model.setBudget(now(), 30 * 60 * 1000);
+  assert.equal(
+    formatActivityLines(model.snapshot(now()), theme, 200, now())[0],
+    " Execution & Review · run-1 <dim>· 30m left</dim>",
+  );
+  advance(26 * 60 * 1000);
+  assert.equal(
+    formatActivityLines(model.snapshot(now()), theme, 200, now())[0],
+    " Execution & Review · run-1 <warning>· 4m left</warning>",
+  );
+  model.stop();
+  assert.equal(
+    formatActivityLines(model.snapshot(now()), theme, 200, now())[0],
+    " Execution & Review · run-1",
+  );
+});
+
+test("no-timeout runs never render a budget readout", () => {
+  const { model, now } = testClock();
+  model.startLive("run-1", "executor", "agent_thought_chunk");
+  model.setBudget(now(), 0);
+  assert.equal(formatActivityLines(model.snapshot(now()), theme, 200, now())[0], " Execution & Review · run-1");
+  model.setBudget(now(), 30 * 60 * 1000);
+  assert.match(formatActivityLines(model.snapshot(now()), theme, 200, now())[0]!, /30m left/);
+  model.setBudget(now(), 0);
+  assert.equal(formatActivityLines(model.snapshot(now()), theme, 200, now())[0], " Execution & Review · run-1");
+});

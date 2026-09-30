@@ -3,11 +3,16 @@ import assert from "node:assert/strict";
 import type { WorkflowState } from "../src/types.js";
 import planExecuteAuto, {
   approvalStartsStageB,
+  budgetWarningEvent,
   buildFinalizePrompt,
   evaluateResumeEligibility,
+  linkedAbortSignal,
   parsePlanExecuteCommand,
   selectStageBReasoningEffort,
+  stageBStartDisposition,
+  workflowPausedEvent,
 } from "../extensions/index.js";
+import { createPauseRecord } from "../src/pause.js";
 
 test("Stage B accepts only explicit supported ACP reasoning levels", () => {
   assert.equal(selectStageBReasoningEffort(undefined), undefined);
@@ -102,7 +107,7 @@ test("safe resume accepts only execution-interruption checkpoints with remaining
     }],
   } as WorkflowState;
 
-  for (const code of ["ABORTED", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED"]) {
+  for (const code of ["ABORTED", "TIMEOUT", "HUMAN_STOP", "SESSION_ABORT", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED"]) {
     const state = { ...base, pause_reason: `[${code}] transient interruption`, phases: base.phases.map((phase) => ({ ...phase })) };
     const result = evaluateResumeEligibility(state);
     assert.equal(result.ok, true, code);
@@ -124,6 +129,143 @@ test("safe resume accepts only execution-interruption checkpoints with remaining
   const orphaned = { ...base, status: "running", pause_reason: undefined } as WorkflowState;
   assert.equal(evaluateResumeEligibility(orphaned).ok, false);
   assert.equal(evaluateResumeEligibility(orphaned, { allowOrphanedRunning: true }).ok, true);
+
+  // Structured pause records own resumability directly; the legacy string stays a fallback.
+  const structured = {
+    ...base,
+    pause: {
+      code: "TIMEOUT",
+      summary: "Stage B timed out after 30 minutes.",
+      stage: "executor",
+      resumable: true,
+      at: new Date(0).toISOString(),
+    },
+    phases: base.phases.map((phase) => ({ ...phase })),
+  } as WorkflowState;
+  assert.equal(evaluateResumeEligibility(structured).ok, true);
+  assert.equal(evaluateResumeEligibility({ ...structured, pause: { ...structured.pause!, code: "STARTUP_EVIDENCE", resumable: false } } as WorkflowState).ok, false);
+});
+
+test("the budget warning event fires once the run consumes 80% of its budget", () => {
+  assert.deepEqual(budgetWarningEvent("run-1", 30 * 60 * 1000), {
+    run_id: "run-1",
+    timeout_ms: 1_800_000,
+    warning_after_ms: 1_440_000,
+    message: "Execution & Review consumed 80% of its 30 minutes budget.",
+  });
+});
+
+test("explicit resume may start a paused run while the approval guard still blocks unapproved states", () => {
+  const basePhase = {
+    phase_id: "phase-01",
+    status: "pending" as const,
+    review_rounds: 0,
+    execution_report_paths: [],
+    review_report_paths: [],
+    unresolved_findings: [],
+  };
+  const state = (status: WorkflowState["status"], overrides: Partial<WorkflowState> = {}): WorkflowState => ({
+    version: 1,
+    run_id: "disposition-test",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/disposition-test",
+    status,
+    created_at: new Date(0).toISOString(),
+    phases: [basePhase],
+    ...overrides,
+  } as WorkflowState);
+
+  // Regression: a paused run with an approved, resumable checkpoint must reach Stage B.
+  assert.equal(stageBStartDisposition(state("paused"), true), "start");
+  assert.equal(stageBStartDisposition(state("paused"), false), "plan_not_approved");
+  assert.equal(stageBStartDisposition(state("running"), true), "start");
+  assert.equal(stageBStartDisposition(state("frozen"), false), "start");
+  const frozenWithEvidence = state("frozen", {
+    phases: [{ ...basePhase, status: "paused", review_rounds: 1 }],
+  });
+  assert.equal(stageBStartDisposition(frozenWithEvidence, false), "restart_required");
+  assert.equal(stageBStartDisposition(state("draft"), true), "plan_not_approved");
+});
+
+test("the workflow_paused event carries the structured cause for the timeline", () => {
+  const state = {
+    version: 1,
+    run_id: "run-1",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/run-1",
+    status: "paused",
+    created_at: new Date(0).toISOString(),
+    pause_reason: "[TIMEOUT] Stage B timed out after 30 minutes.",
+    phases: [{
+      phase_id: "phase-01",
+      status: "paused",
+      review_rounds: 2,
+      execution_report_paths: [],
+      review_report_paths: [],
+      unresolved_findings: [],
+      executor_session_id: "ses-1",
+      reviewer_session_id: "rev-1",
+    }],
+  } as WorkflowState;
+  const record = createPauseRecord({
+    code: "TIMEOUT",
+    summary: "Stage B timed out after 30 minutes.",
+    stage: "executor",
+    timeout_ms: 1_800_000,
+    elapsed_ms: 1_799_998,
+  });
+  assert.deepEqual(workflowPausedEvent(state, record), {
+    run_id: "run-1",
+    code: "TIMEOUT",
+    summary: "Stage B timed out after 30 minutes.",
+    detail: null,
+    stage: "executor",
+    resumable: true,
+    timeout_ms: 1_800_000,
+    elapsed_ms: 1_799_998,
+    reason: "[TIMEOUT] Stage B timed out after 30 minutes.",
+    phase_id: "phase-01",
+    review_rounds: 2,
+    executor_session_id: "ses-1",
+    reviewer_session_id: "rev-1",
+    execution_report_path: null,
+    review_report_path: null,
+    acceptance_report_path: null,
+  });
+});
+
+test("Stage B abort plumbing keeps timeout, human stop, and session interruption distinct", async () => {
+  const timeout = linkedAbortSignal(undefined, 30);
+  await new Promise<void>((resolve) => timeout.signal.addEventListener("abort", () => resolve(), { once: true }));
+  const timeoutReason = timeout.signal.reason as { kind: string; timeoutMs?: number; elapsedMs?: number };
+  assert.equal(timeoutReason.kind, "timeout");
+  assert.equal(timeoutReason.timeoutMs, 30);
+  assert.equal(typeof timeoutReason.elapsedMs, "number");
+  timeout.dispose();
+
+  const human = new AbortController();
+  const humanLinked = linkedAbortSignal(human.signal, 0);
+  human.abort({ kind: "human_stop", message: "Execution & Review stopped by human." });
+  assert.deepEqual(humanLinked.signal.reason, { kind: "human_stop", message: "Execution & Review stopped by human." });
+  humanLinked.dispose();
+
+  const external = new AbortController();
+  const sessionLinked = linkedAbortSignal(external.signal, 0);
+  external.abort(new Error("ctrl-c"));
+  assert.deepEqual(sessionLinked.signal.reason, { kind: "session_abort", message: "ctrl-c" });
+  sessionLinked.dispose();
+
+  const preAborted = new AbortController();
+  preAborted.abort(new Error("already gone"));
+  const preLinked = linkedAbortSignal(preAborted.signal, 60_000);
+  assert.equal(preLinked.signal.aborted, true);
+  assert.equal((preLinked.signal.reason as { kind: string }).kind, "session_abort");
+  preLinked.dispose();
+
+  const unlimited = linkedAbortSignal(undefined, 0);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(unlimited.signal.aborted, false);
+  unlimited.dispose();
 });
 
 

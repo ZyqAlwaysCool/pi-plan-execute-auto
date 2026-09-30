@@ -51,7 +51,7 @@ The normal command surface is intentionally small:
 ```
 
 - `/plan-execute` formalizes the current planning discussion into a draft and opens Review & Approval.
-- `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, and permission mode.
+- `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
 - `stop <run-id>` requests a safe stop of an active execution.
 - `status <run-id>` shows a compact status summary plus the workflow-timeline path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
@@ -123,14 +123,14 @@ Run:
 
 Setup is **project-scoped**, not Pi-session-scoped. A new Pi conversation in the same Git project automatically reuses the previously approved setup; you do not need to run setup again just because the conversation changed.
 
-If `/plan-execute setup` is run again and the existing project setup is valid, the plugin first shows the current Executor/Reviewer routes, reasoning levels, review limit, permission mode, and approval time, then offers:
+If `/plan-execute setup` is run again and the existing project setup is valid, the plugin first shows the current Executor/Reviewer routes, reasoning levels, review limit, permission mode, execution timeout, and approval time, then offers:
 
 - **Keep current setup** — exits immediately without CLI discovery, model probing, provider calls, or config writes;
 - **Run health check** — optionally sends the small potentially-billable READY probes through the currently saved routes; pass, failure, or skip never rewrites the saved setup;
 - **Reconfigure** — warns about frozen-run compatibility and only then enters the full setup wizard;
 - **Cancel** — leaves everything unchanged.
 
-Reconfiguration changes the project default for future plans/runs. Existing approved runs keep their own frozen settings and never silently switch to the newly selected agents; a frozen run with mismatched settings must use a matching setup again or be replaced by a new run.
+Reconfiguration changes the project default for future plans/runs. Existing approved runs keep their own frozen settings and never silently switch to the newly selected agents; a frozen run with mismatched settings must use a matching setup again or be replaced by a new run. The execution timeout is an operational policy rather than frozen provenance, so raising it takes effect the next time a paused run is started or resumed.
 
 Setup performs an environment preflight before saving configuration:
 
@@ -145,6 +145,7 @@ Setup performs an environment preflight before saving configuration:
 - an optional live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable; choosing **No** skips the check and setup still completes normally;
 - if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;
+- the whole-run execution timeout is selected from 5 minutes, 15 minutes, 30 minutes (recommended default), a custom 1–1440 minute value, or no timeout at all;
 - the final networking behavior is shown before consent is saved.
 
 ### Review-loop limit
@@ -163,6 +164,14 @@ Two modes are available:
 - **Ask me** — keeps the same CLI capabilities but pauses on each ACP permission request and displays the exact options advertised by that CLI in Pi. The user's selected option ID is returned unchanged.
 
 The selected permission mode and review limit are frozen into each approved run. Changing setup later cannot silently change an active/frozen run.
+
+### Execution timeout
+
+The execution timeout is the total Execution & Review budget for the whole run across every phase, including Executor, Reviewer, and acceptance work. The recommended default is **30 minutes**; setup also offers 5 minutes, 15 minutes, a custom 1–1440 minute value, and no timeout.
+
+When the budget expires, the run pauses as a resumable `TIMEOUT` checkpoint instead of running unattended without a bound. Raising the timeout through a new human-approved `/plan-execute setup` takes effect for the next start or resume of a paused run; it is an operational resource policy and is not part of the frozen artifact provenance. Headless runs without a project profile can set `PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS` explicitly (`0`, `none`, `unlimited`, or `off` mean no timeout).
+
+Every pause is classified in the persisted state and the `workflow_paused` run event: `TIMEOUT`, `HUMAN_STOP`, `SESSION_ABORT`, `PROCESS_RESTART`, `HARNESS_ERROR`, evidence/safety failures, and so on, together with `stage`, `round`, and whether the checkpoint is resumable. `/plan-execute status` and the Pi state entry show the code; the live widget also shows the remaining budget (`12m left`) so a timeout is visible before it fires.
 
 ## Isolation model
 

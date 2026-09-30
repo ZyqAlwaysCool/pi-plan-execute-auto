@@ -6,9 +6,9 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approvedSetup, chooseExistingSetupAction, frozenProfileMatches, runSetupWizard } from "../extensions/index.js";
+import { approvedSetup, chooseExistingSetupAction, frozenProfileMatches, frozenProfileMismatch, runSetupWizard, stageTimeoutMs } from "../extensions/index.js";
 import type { WorkflowState } from "../src/types.js";
-import { inspectClaudeNativeSandbox, loadProjectPluginProfile, normalizeSelectedModel, parseOpenCodeModels, parsePiModels, saveProjectPluginProfile } from "../src/plugin-config.js";
+import { inspectClaudeNativeSandbox, loadProjectPluginProfile, normalizeSelectedModel, parseOpenCodeModels, parsePiModels, saveProjectPluginProfile, type ProjectPluginProfile } from "../src/plugin-config.js";
 
 const execFile = promisify(callback);
 async function fixture(): Promise<{ root: string; project: string; agentDir: string }> {
@@ -92,10 +92,20 @@ test("per-repository human setup stores no secrets and overrides model-supplied 
       review_round_limit: saved.reviewRoundLimit,
     } as WorkflowState;
     assert.equal(frozenProfileMatches(frozen, saved), true);
+    assert.deepEqual(frozenProfileMismatch(frozen, saved), []);
     assert.equal(frozenProfileMatches(frozen, saved, "opencode/opencode/big-pickle"), false);
+    assert.deepEqual(frozenProfileMismatch(frozen, saved, "opencode/opencode/big-pickle"), [
+      "requested executor model: opencode/opencode/big-pickle ≠ setup opencode/deepseek-local/deepseek-flash",
+    ]);
+    const differentTimeout = { ...saved, stageTimeoutMs: 5 * 60 * 1000 } as ProjectPluginProfile;
+    assert.equal(frozenProfileMatches(frozen, differentTimeout), true);
+    assert.deepEqual(frozenProfileMismatch(frozen, differentTimeout), []);
     const missingEffort = { ...frozen };
     delete missingEffort.reasoning_effort;
     assert.equal(frozenProfileMatches(missingEffort, saved), false);
+    assert.deepEqual(frozenProfileMismatch(missingEffort, saved), [
+      "shared reasoning effort: run (unset) ≠ setup high",
+    ]);
     assert.equal((await approvedSetup(project, true, undefined, agentDir)).reasoningEffort, "high");
     await assert.rejects(approvedSetup(project, true, { executor_model: "opencode/opencode/big-pickle" }, agentDir), /Model-supplied ACP routes differ/);
   } finally {
@@ -241,6 +251,7 @@ test("reconfigure warns that existing approved runs keep frozen settings", async
     assert.match(warning, /future plans\/runs/);
     assert.match(warning, /Existing approved runs keep the settings frozen/);
     assert.match(warning, /will not silently switch agents/);
+    assert.match(warning, /execution timeout is an operational policy/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -275,6 +286,7 @@ test("interactive wizard records only a separate human network consent and confi
         if (title.startsWith("Executor:")) return choices[0];
         if (title.startsWith("Reviewer:")) return choices[1];
         if (title.startsWith("Maximum review rounds")) return choices[1];
+        if (title.startsWith("Execution timeout")) return choices[2];
         if (title.startsWith("Agent permission handling")) return choices[0];
         throw new Error(`Unexpected selection: ${title}`);
       },
@@ -316,6 +328,7 @@ test("interactive wizard records only a separate human network consent and confi
     assert.equal(configured?.reviewerReasoningEffort, "high");
     assert.equal(configured?.reviewRoundLimit, 5);
     assert.equal(configured?.permissionMode, "autonomous");
+    assert.equal(configured?.stageTimeoutMs, 30 * 60 * 1000);
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), configured);
     const fallback = await runSetupWizard(
       ctx,
@@ -352,6 +365,7 @@ test("live connectivity health check can be skipped without cancelling setup", a
         if (title.includes("model (candidates")) return choices[0];
         if (title.includes(": reasoning effort")) return "high";
         if (title.startsWith("Maximum review rounds")) return choices[1];
+        if (title.startsWith("Execution timeout")) return choices[1];
         if (title.startsWith("Agent permission handling")) return choices[0];
         throw new Error(`Unexpected selection: ${title}`);
       },
@@ -402,6 +416,7 @@ test("all four backend routes share one wizard; reasoning is chosen independentl
         if (title.startsWith("Executor: reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "max", "backend default", "Cancel"]); return "max"; }
         if (title.startsWith("Reviewer: reasoning effort")) { assert.deepEqual(choices, ["low", "medium", "high", "backend default", "Cancel"]); return "medium"; }
         if (title.startsWith("Maximum review rounds")) return choices[1];
+        if (title.startsWith("Execution timeout")) return choices[4];
         if (title.startsWith("Agent permission handling")) return choices[1];
         throw new Error(`Unexpected choice: ${title}`);
       },
@@ -425,6 +440,7 @@ test("all four backend routes share one wizard; reasoning is chosen independentl
     assert.equal(profile?.reasoningEffort, undefined);
     assert.equal(profile?.reviewRoundLimit, 5);
     assert.equal(profile?.permissionMode, "ask");
+    assert.equal(profile?.stageTimeoutMs, 0);
     assert.equal(JSON.parse(await readFile(join(project, ".pi-plan-execute-auto", "config.json"), "utf8")).reviewerReasoningEffort, "medium");
     assert.deepEqual(await loadProjectPluginProfile(project, agentDir), profile);
     const frozen = {
@@ -597,4 +613,88 @@ test("headless fallback remains explicit, not a hidden default", async () => {
     });
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("the setup wizard supports a validated custom timeout and an explicit no-timeout run", async () => {
+  const { root, project, agentDir } = await fixture();
+  let timeoutChoice = "Custom…";
+  const inputValues = ["not-a-number", "45"];
+  const inputs: string[] = [];
+  const warnings: string[] = [];
+  const ctx = {
+    cwd: project, hasUI: true, ui: {
+      notify(message: string, level?: string) { if (level === "warning") warnings.push(message); },
+      setStatus() {},
+      async select(title: string, choices: string[]) {
+        if (title.includes("model (candidates")) return choices[0];
+        if (title.includes(": reasoning effort")) return "medium";
+        if (title.startsWith("Executor:")) return choices[0];
+        if (title.startsWith("Reviewer:")) return choices[0];
+        if (title.startsWith("Maximum review rounds")) return choices[0];
+        if (title.startsWith("Execution timeout")) return timeoutChoice;
+        if (title.startsWith("Agent permission handling")) return choices[0];
+        throw new Error(`Unexpected selection: ${title}`);
+      },
+      async input(title: string) { inputs.push(title); return inputValues.shift(); },
+      async confirm(title: string) { return !title.includes("live Agent CLI connectivity"); },
+    },
+  } as unknown as Parameters<typeof runSetupWizard>[0];
+  const clis = [{ backend: "pi" as const, executable: "/bin/pi", version: "fixture", models: ["pi/openai-codex/gpt-5.5"] }];
+  try {
+    const custom = await runSetupWizard(ctx, clis, agentDir,
+      async () => ["pi/openai-codex/gpt-5.5"], async () => ["low", "medium", "high"], async () => {});
+    assert.equal(custom?.stageTimeoutMs, 45 * 60 * 1000);
+    assert.equal(inputs.length, 2);
+    assert.match(warnings.join("\n"), /whole number of minutes/);
+
+    timeoutChoice = "No timeout — run until it finishes";
+    const unlimited = await runSetupWizard(ctx, clis, agentDir,
+      async () => ["pi/openai-codex/gpt-5.5"], async () => ["low", "medium", "high"], async () => {});
+    assert.equal(unlimited?.stageTimeoutMs, 0);
+    assert.equal(JSON.parse(await readFile(join(project, ".pi-plan-execute-auto", "config.json"), "utf8")).stageTimeoutMs, 0);
+
+    timeoutChoice = "5 minutes";
+    const short = await runSetupWizard(ctx, clis, agentDir,
+      async () => ["pi/openai-codex/gpt-5.5"], async () => ["low", "medium", "high"], async () => {});
+    assert.equal(short?.stageTimeoutMs, 5 * 60 * 1000);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("saved execution timeouts are validated and covered by the human-approved cache and profile", async () => {
+  const { root, project, agentDir } = await fixture();
+  const models = { executorModel: "codex/gpt-6-luna", reviewerModel: "opencode/deepseek-local/deepseek-flash" };
+  try {
+    await assert.rejects(saveProjectPluginProfile(project, { ...models, stageTimeoutMs: 30_000 }, agentDir), /Execution timeout/);
+    await assert.rejects(saveProjectPluginProfile(project, { ...models, stageTimeoutMs: 86_400_001 }, agentDir), /Execution timeout/);
+    const saved = await saveProjectPluginProfile(project, { ...models, stageTimeoutMs: 45 * 60 * 1000 }, agentDir);
+    assert.equal(saved.stageTimeoutMs, 45 * 60 * 1000);
+    const cache = join(project, ".pi-plan-execute-auto", "config.json");
+    const cached = JSON.parse(await readFile(cache, "utf8"));
+    assert.equal(cached.stageTimeoutMs, 45 * 60 * 1000);
+    cached.stageTimeoutMs = 5 * 60 * 1000;
+    await writeFile(cache, `${JSON.stringify(cached, null, 2)}\n`);
+    await assert.rejects(loadProjectPluginProfile(project, agentDir), /differs from the human-approved selection/);
+
+    await saveProjectPluginProfile(project, { ...models, stageTimeoutMs: 45 * 60 * 1000 }, agentDir);
+    const profileDir = join(agentDir, "plan-execute-auto", "profiles");
+    const [profileFile] = await readdir(profileDir);
+    const profilePath = join(profileDir, profileFile!);
+    const profile = JSON.parse(await readFile(profilePath, "utf8"));
+    profile.stageTimeoutMs = 60;
+    await writeFile(profilePath, `${JSON.stringify(profile, null, 2)}\n`);
+    await assert.rejects(loadProjectPluginProfile(project, agentDir), /invalid/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("stage timeout resolution prefers the approved profile and the explicit headless env fallback", () => {
+  const profile = { stageTimeoutMs: 15 * 60 * 1000 } as ProjectPluginProfile;
+  assert.equal(stageTimeoutMs(profile, {} as NodeJS.ProcessEnv), 15 * 60 * 1000);
+  assert.equal(stageTimeoutMs(profile, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "60000" } as NodeJS.ProcessEnv), 15 * 60 * 1000);
+  assert.equal(stageTimeoutMs(undefined, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "60000" } as NodeJS.ProcessEnv), 60_000);
+  assert.equal(stageTimeoutMs(undefined, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "none" } as NodeJS.ProcessEnv), 0);
+  assert.equal(stageTimeoutMs(undefined, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "0" } as NodeJS.ProcessEnv), 0);
+  assert.equal(stageTimeoutMs(undefined, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "-5" } as NodeJS.ProcessEnv), 30 * 60 * 1000);
+  assert.equal(stageTimeoutMs(undefined, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "12" } as NodeJS.ProcessEnv), 30 * 60 * 1000);
+  assert.equal(stageTimeoutMs(undefined, {} as NodeJS.ProcessEnv), 30 * 60 * 1000);
+  assert.equal(stageTimeoutMs({ stageTimeoutMs: 0 } as ProjectPluginProfile, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "60000" } as NodeJS.ProcessEnv), 0);
 });

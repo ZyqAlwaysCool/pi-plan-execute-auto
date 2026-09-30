@@ -197,6 +197,63 @@ export interface PhaseState {
 export type ReasoningEffort = "low" | "medium" | "high" | "max";
 export type AgentPermissionMode = "autonomous" | "ask";
 
+/** Whole-run Execution & Review budget. `0` means no timeout. */
+export const DEFAULT_STAGE_TIMEOUT_MS = 30 * 60 * 1000;
+export const MIN_STAGE_TIMEOUT_MS = 60 * 1000;
+export const MAX_STAGE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+export function isValidStageTimeoutMs(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) &&
+    (value === 0 || (value >= MIN_STAGE_TIMEOUT_MS && value <= MAX_STAGE_TIMEOUT_MS));
+}
+
+/** Structured, resumability-aware classification of why a run is paused. */
+export type PauseCode = KnownPauseCode | (string & {});
+export type KnownPauseCode =
+  | "ABORTED" | "TIMEOUT" | "HUMAN_STOP" | "SESSION_ABORT"
+  | "HARNESS_ERROR" | "STAGE_B_ERROR" | "PROCESS_RESTART" | "PROCESS_RESTART_RECONCILED"
+  | "PROCESS_RESTART_EVIDENCE" | "STARTUP_EVIDENCE" | "WORKTREE_IDENTITY_MISMATCH"
+  | "COMPLETION_GIT_EVIDENCE" | "WORKTREE_SETUP" | "EXECUTION_UNHANDLED"
+  | "MAX_REVIEW_ROUNDS" | "ACCEPTANCE_FAILED";
+export type PauseStage =
+  | "executor" | "reviewer" | "acceptance" | "commit" | "phase" | "setup" | "preflight" | "unknown";
+
+/** Typed abort reason shared between the Stage B watchdog and the ACP harness signal. */
+export type StageBAbortKind = "timeout" | "human_stop" | "session_abort";
+export interface StageBAbortReason {
+  kind: StageBAbortKind;
+  message: string;
+  timeoutMs?: number;
+  elapsedMs?: number;
+}
+
+export interface PauseRecord {
+  code: PauseCode;
+  /** Human-facing one-line cause. */
+  summary: string;
+  /** Raw signal/error text when it adds information beyond the summary. */
+  detail?: string;
+  stage: PauseStage;
+  resumable: boolean;
+  phase_id?: string;
+  round?: number;
+  timeout_ms?: number;
+  elapsed_ms?: number;
+  at: string;
+}
+
+export interface PauseInput {
+  code: PauseCode;
+  summary: string;
+  detail?: string;
+  stage?: PauseStage;
+  resumable?: boolean;
+  phase_id?: string;
+  round?: number;
+  timeout_ms?: number;
+  elapsed_ms?: number;
+}
+
 export interface WorkflowState {
   version: 1;
   run_id: string;
@@ -223,6 +280,10 @@ export interface WorkflowState {
   controlled_environment_paths?: string[];
   phases: PhaseState[];
   pause_reason?: string | undefined;
+  /** Structured pause cause; `pause_reason` stays as the legacy human string. */
+  pause?: PauseRecord | undefined;
+  /** Effective whole-run Stage B budget for this run; `0` means no timeout. */
+  stage_timeout_ms?: number | undefined;
 }
 
 export interface WorkflowStatusSnapshot {
@@ -275,15 +336,18 @@ export interface HarnessPair {
 export interface StageBStatusEvent {
   phase_id: string;
   round: number;
-  executor_status: "pending" | "running" | "complete" | "failed";
-  reviewer_status: "pending" | "running" | "pass" | "rework" | "failed";
+  executor_status: "pending" | "running" | "complete" | "failed" | "interrupted";
+  reviewer_status: "pending" | "running" | "pass" | "rework" | "failed" | "interrupted";
   message: string;
+  /** Present on the terminal pause event so the timeline carries the structured cause. */
+  pause?: PauseRecord;
 }
 
 export interface StageBRunResult {
   status: "completed" | "paused" | "aborted" | "not_started";
   state: WorkflowState;
   reason?: string | undefined;
+  pause?: PauseRecord | undefined;
 }
 
 export function isWorkflowStatus(value: unknown): value is WorkflowStatus {

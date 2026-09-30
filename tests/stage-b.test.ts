@@ -12,7 +12,7 @@ import { createLocalGitOperations, ensureDedicatedWorktree, GitWorkspace, provis
 import { validatePhaseCompletionRecord } from "../src/completion.js";
 import { StageBController } from "../src/stage-b.js";
 import { readWorkflowState, validatePackageDirectory, writeValidatedPackage, writeWorkflowState } from "../src/package-validator.js";
-import type { AcceptanceCommandRunner, FinalizeInput, GitCommandResult, HarnessPair, ReviewReport, ExecutionReport, PhasePackage } from "../src/types.js";
+import type { AcceptanceCommandRunner, FinalizeInput, GitCommandResult, HarnessPair, ReviewReport, ExecutionReport, PhasePackage, StageBAbortReason, StageBStatusEvent } from "../src/types.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -1003,7 +1003,92 @@ test("cancelled Stage B pauses before commit", async () => {
       saveState: (next) => writeWorkflowState(setup.packageRoot, next),
     }).run();
     assert.equal(result.status, "paused");
-    assert.match(result.reason ?? "", /ABORTED/);
+    assert.match(result.reason ?? "", /\[ABORTED\]/);
+    assert.equal(result.state.pause?.code, "ABORTED");
+    assert.equal(result.state.pause?.resumable, true);
+    assert.equal(result.state.pause?.detail, "test cancellation");
+    assert.equal((await readWorkflowState(setup.packageRoot))?.pause?.code, "ABORTED");
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "1");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("Stage B aborts persist a precise, resumability-aware pause record", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const cases: Array<{ reason: StageBAbortReason | Error; code: string }> = [
+      { reason: { kind: "timeout", message: "Execution & Review timeout after 60000ms.", timeoutMs: 60_000, elapsedMs: 60_000 }, code: "TIMEOUT" },
+      { reason: { kind: "human_stop", message: "Execution & Review stopped by human." }, code: "HUMAN_STOP" },
+      { reason: { kind: "session_abort", message: "Pi session interrupted." }, code: "SESSION_ABORT" },
+      { reason: new Error("untyped legacy cancellation"), code: "ABORTED" },
+    ];
+    for (const item of cases) {
+      const controller = new AbortController();
+      controller.abort(item.reason);
+      const state = createDraftState(setup.pkg, "stage-b-test");
+      state.status = "frozen";
+      const result = await new StageBController({
+        package: setup.pkg,
+        state,
+        git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd, runtimeRoot: ".pi-plan-execute-auto/stage-b-test" }),
+        acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+        harness: new FakeHarness(setup.cwd, base),
+        signal: controller.signal,
+        requireDedicatedWorktree: false,
+        saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+      }).run();
+      assert.equal(result.status, "paused");
+      assert.equal(result.state.pause?.code, item.code, String(item.reason));
+      assert.equal(result.state.pause?.resumable, true, String(item.reason));
+      assert.equal(result.state.pause?.stage, "phase");
+      assert.match(result.reason ?? "", new RegExp(`\\[${item.code}\\]`));
+      assert.equal((await readWorkflowState(setup.packageRoot))?.pause_reason, result.reason);
+    }
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("a watchdog abort during Executor execution emits an interrupted status with the pause cause", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const controller = new AbortController();
+    const events: StageBStatusEvent[] = [];
+    const harness: HarnessPair = {
+      async execute() {
+        controller.abort({ kind: "timeout", message: "Execution & Review timeout after 60000ms.", timeoutMs: 60_000, elapsedMs: 60_000 } satisfies StageBAbortReason);
+        throw new Error("aborted by watchdog");
+      },
+      async rework() { throw new Error("unexpected rework"); },
+      async review() { throw new Error("unexpected review"); },
+      async close() {},
+    };
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "frozen";
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd, runtimeRoot: ".pi-plan-execute-auto/stage-b-test" }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      signal: controller.signal,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+      onStatus: (event) => events.push(event),
+    }).run();
+    assert.equal(result.status, "paused");
+    assert.equal(result.state.pause?.code, "TIMEOUT");
+    assert.equal(result.state.pause?.stage, "executor");
+    assert.equal(result.state.pause?.timeout_ms, 60_000);
+    assert.match(result.reason ?? "", /timed out after 1 minute/);
+    const terminal = events.at(-1)!;
+    assert.equal(terminal.executor_status, "interrupted");
+    assert.equal(terminal.reviewer_status, "interrupted");
+    assert.equal(terminal.pause?.code, "TIMEOUT");
+    assert.match(terminal.message, /\[TIMEOUT\]/);
     assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "1");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });

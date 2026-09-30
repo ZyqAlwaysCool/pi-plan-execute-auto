@@ -61,13 +61,30 @@ import { ensureSetupRepository } from "../src/setup-repository.js";
 import { agentSessionTranscriptRelativePath, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 import { StageBController } from "../src/stage-b.js";
 import { StageBActivityModel, StageBActivityWidget } from "../src/status-widget.js";
-import { DEFAULT_MAX_REVIEW_ROUNDS } from "../src/types.js";
+import {
+  createPauseRecord,
+  formatPauseDetails,
+  formatPauseHeadline,
+  formatPauseReason,
+  formatStageTimeout,
+  isStageBAbortReason,
+  parseStageTimeoutValue,
+  pauseResumable,
+} from "../src/pause.js";
+import {
+  DEFAULT_MAX_REVIEW_ROUNDS,
+  DEFAULT_STAGE_TIMEOUT_MS,
+  MAX_STAGE_TIMEOUT_MS,
+  MIN_STAGE_TIMEOUT_MS,
+} from "../src/types.js";
 import type {
   AcceptanceCommandRunner,
   AgentPermissionMode,
   FinalizeInput,
   Manifest,
+  PauseRecord,
   ReasoningEffort,
+  StageBAbortReason,
   StageBRunResult,
   StageBStatusEvent,
   WorkflowState,
@@ -76,9 +93,18 @@ import type {
 const execFile = promisify(execFileCallback);
 const WIDGET_KEY = "pi-plan-execute-auto";
 const STATE_ENTRY = "plan-execute-state";
-const DEFAULT_STAGE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120 * 1000;
+/** Persist a timeline warning once this fraction of the whole-run budget is consumed. */
+export const BUDGET_WARNING_RATIO = 0.8;
 const REVIEW_ROUND_CHOICES = [3, 5, 8, 12, 20] as const;
+/** Setup-stage whole-run Execution & Review budgets. `0` means no timeout. */
+const STAGE_TIMEOUT_CHOICES = [
+  { label: "5 minutes", ms: 5 * 60 * 1000 },
+  { label: "15 minutes", ms: 15 * 60 * 1000 },
+  { label: "30 minutes (recommended default)", ms: DEFAULT_STAGE_TIMEOUT_MS },
+  { label: "Custom…", ms: -1 },
+  { label: "No timeout — run until it finishes", ms: 0 },
+] as const;
 
 function validateControlledEnvironmentPaths(state: WorkflowState): void {
   const paths = state.controlled_environment_paths ?? [];
@@ -219,17 +245,23 @@ function clearWidget(ctx: ExtensionContext): void {
 function stateLines(state: WorkflowState): string[] {
   const completed = state.phases.filter((phase) => phase.status === "completed").length;
   const current = state.phases.find((phase) => phase.status !== "completed");
+  const pause = state.status === "paused" ? state.pause : undefined;
   return [
     `Execution & Review · ${state.status}`,
     `Run ${state.run_id} · ${completed}/${state.phases.length} phases`,
+    ...(state.stage_timeout_ms !== undefined ? [`Timeout ${formatStageTimeout(state.stage_timeout_ms)}`] : []),
     current ? `Current ${current.phase_id} · round ${current.review_rounds}` : "All phases complete",
-    ...(state.status === "paused" ? ["Needs attention · details saved in the run .runtime directory"] : []),
+    ...(pause
+      ? [
+          `Paused: ${formatPauseHeadline(pause)}`,
+          ...(pause.resumable
+            ? [`Resume: /plan-execute resume ${state.run_id}`]
+            : ["Resume is refused; repair the reported evidence first."]),
+        ]
+      : state.status === "paused"
+        ? ["Needs attention · details saved in the run .runtime directory"]
+        : []),
   ];
-}
-
-function compactReason(reason: string | undefined): string {
-  if (!reason) return "";
-  return reason.length <= 2000 ? reason : `${reason.slice(0, 2000)}…`;
 }
 
 function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
@@ -482,6 +514,7 @@ function setupProfileSummary(profile: ProjectPluginProfile): string {
     `Reviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})`,
     `Review loop limit: ${profile.reviewRoundLimit} round(s) per phase`,
     `Permissions: ${profile.permissionMode === "autonomous" ? "Autonomous" : "Ask me"}`,
+    `Execution timeout: ${formatStageTimeout(profile.stageTimeoutMs)}`,
     `Approved: ${profile.networkRiskApprovedAt}`,
   ].join("\n");
 }
@@ -541,10 +574,37 @@ export async function chooseExistingSetupAction(
       const approved = await ctx.ui.confirm(
         "Reconfigure this project?",
         "New selections become the default for future plans/runs. Existing approved runs keep the settings frozen into their own state; " +
-        "a frozen run whose settings differ from the new project setup will not silently switch agents and cannot be resumed until you restore matching setup or create a new run.",
+        "a frozen run whose settings differ from the new project setup will not silently switch agents and cannot be resumed until you restore matching setup or create a new run. " +
+        "The execution timeout is an operational policy: raising it here takes effect the next time a paused run is resumed.",
       );
       if (approved) return "reconfigure";
     }
+  }
+}
+
+export async function chooseStageTimeout(ctx: ExtensionCommandContext): Promise<number | undefined> {
+  notify(
+    ctx,
+    "The execution timeout is the total budget for the whole Execution & Review across every phase, including Executor, Reviewer, and acceptance runs. " +
+    "When it expires, the run pauses as a resumable TIMEOUT checkpoint instead of running unattended without a bound. " +
+    "Choose No timeout only if you accept that an unattended run may never return.",
+    "info",
+  );
+  const labels = STAGE_TIMEOUT_CHOICES.map((choice) => choice.label);
+  const choice = await ctx.ui.select("Execution timeout for the whole run", [...labels, "Cancel"]);
+  if (!choice || choice === "Cancel") return undefined;
+  const selected = STAGE_TIMEOUT_CHOICES.find((entry) => entry.label === choice);
+  if (!selected) return undefined;
+  if (selected.ms >= 0) return selected.ms;
+  const minMinutes = MIN_STAGE_TIMEOUT_MS / 60_000;
+  const maxMinutes = MAX_STAGE_TIMEOUT_MS / 60_000;
+  for (;;) {
+    const raw = await ctx.ui.input(`Custom execution timeout in minutes (${minMinutes}–${maxMinutes})`, "e.g. 45");
+    if (raw === undefined) return undefined;
+    const minutes = Number(raw.trim());
+    const ms = minutes * 60_000;
+    if (Number.isInteger(minutes) && ms >= MIN_STAGE_TIMEOUT_MS && ms <= MAX_STAGE_TIMEOUT_MS) return ms;
+    ctx.ui.notify(`Enter a whole number of minutes between ${minMinutes} and ${maxMinutes}, or cancel the dialog to abort setup.`, "warning");
   }
 }
 
@@ -641,6 +701,9 @@ export async function runSetupWizard(
   if (!permissionChoice || permissionChoice === "Cancel") return undefined;
   const permissionMode: AgentPermissionMode = permissionChoice === askLabel ? "ask" : "autonomous";
 
+  const configuredStageTimeoutMs = await chooseStageTimeout(ctx);
+  if (configuredStageTimeoutMs === undefined) return undefined;
+
   const selectedChecks = [[executorModel, executorReasoningEffort], [reviewerModel, reviewerReasoningEffort]] as const;
   const needsLiveCheck = [...new Set(selectedChecks.map(([route, effort]) => `${route} (${effort ?? "backend default"})`))];
   let liveConnectivity = "skipped";
@@ -663,7 +726,7 @@ export async function runSetupWizard(
   }
   const consent = await ctx.ui.confirm(
     "Confirm normal Agent CLI network access?",
-    `Executor: ${executorModel} (${executorReasoningEffort ?? "backend default"})\nReviewer: ${reviewerModel} (${reviewerReasoningEffort ?? "backend default"})\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\nLive connectivity: ${liveConnectivity}\n\n` +
+    `Executor: ${executorModel} (${executorReasoningEffort ?? "backend default"})\nReviewer: ${reviewerModel} (${reviewerReasoningEffort ?? "backend default"})\nReview loop limit: ${reviewRoundLimit}\nPermission mode: ${permissionMode}\nExecution timeout: ${formatStageTimeout(configuredStageTimeoutMs)}\nLive connectivity: ${liveConnectivity}\n\n` +
     "The selected Agent CLIs and their tools keep normal network access, matching a normal standalone CLI session. " +
     "The plugin still isolates the dedicated worktree and unrelated host files; this confirmation does not approve or start execution.",
   );
@@ -675,6 +738,7 @@ export async function runSetupWizard(
     ...(reviewerReasoningEffort ? { reviewerReasoningEffort } : {}),
     permissionMode,
     reviewRoundLimit,
+    stageTimeoutMs: configuredStageTimeoutMs,
   }, agentDir);
 }
 
@@ -729,7 +793,7 @@ async function commandConfig(ctx: ExtensionCommandContext): Promise<void> {
   try {
     const profile = await loadProjectPluginProfile(ctx.cwd);
     notify(ctx, profile
-      ? `Executor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReview loop limit: ${profile.reviewRoundLimit}\nPermissions: ${profile.permissionMode}\nNetwork consent: ${profile.networkRiskApprovedAt}`
+      ? `Executor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReview loop limit: ${profile.reviewRoundLimit}\nPermissions: ${profile.permissionMode}\nExecution timeout: ${formatStageTimeout(profile.stageTimeoutMs)}\nNetwork consent: ${profile.networkRiskApprovedAt}`
       : "No project configuration. Use /plan-execute setup.", profile ? "info" : "warning");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
@@ -769,26 +833,57 @@ export function selectStageBReasoningEffort(value: string | undefined): Reasonin
   return value;
 }
 
+export function frozenProfileMismatch(
+  state: WorkflowState,
+  profile: ProjectPluginProfile,
+  executorOverride?: string,
+  reviewerOverride?: string,
+): string[] {
+  const mismatches: string[] = [];
+  const compare = (label: string, frozen: unknown, setup: unknown): void => {
+    if (frozen !== setup) mismatches.push(`${label}: run ${show(frozen)} ≠ setup ${show(setup)}`);
+  };
+  compare("executor model", state.executor_model, profile.executorModel);
+  compare("reviewer model", state.reviewer_model, profile.reviewerModel);
+  compare("shared reasoning effort", state.reasoning_effort, profile.reasoningEffort);
+  compare("executor reasoning effort", state.executor_reasoning_effort, profile.executorReasoningEffort);
+  compare("reviewer reasoning effort", state.reviewer_reasoning_effort, profile.reviewerReasoningEffort);
+  compare("permission mode", state.permission_mode, profile.permissionMode);
+  compare("review round limit", state.review_round_limit, profile.reviewRoundLimit);
+  if (executorOverride && executorOverride !== profile.executorModel) {
+    mismatches.push(`requested executor model: ${executorOverride} ≠ setup ${profile.executorModel}`);
+  }
+  if (reviewerOverride && reviewerOverride !== profile.reviewerModel) {
+    mismatches.push(`requested reviewer model: ${reviewerOverride} ≠ setup ${profile.reviewerModel}`);
+  }
+  return mismatches;
+}
+
+function show(value: unknown): string {
+  return value === undefined ? "(unset)" : String(value);
+}
+
 export function frozenProfileMatches(
   state: WorkflowState,
   profile: ProjectPluginProfile,
   executorOverride?: string,
   reviewerOverride?: string,
 ): boolean {
-  return state.executor_model === profile.executorModel &&
-    state.reviewer_model === profile.reviewerModel &&
-    state.reasoning_effort === profile.reasoningEffort &&
-    state.executor_reasoning_effort === profile.executorReasoningEffort &&
-    state.reviewer_reasoning_effort === profile.reviewerReasoningEffort &&
-    state.permission_mode === profile.permissionMode &&
-    state.review_round_limit === profile.reviewRoundLimit &&
-    (!executorOverride || executorOverride === profile.executorModel) &&
-    (!reviewerOverride || reviewerOverride === profile.reviewerModel);
+  // The whole-run timeout is an operational resource policy, not artifact
+  // provenance: it may be raised through a new human-approved setup (for
+  // example after a TIMEOUT pause) without invalidating the frozen run.
+  return frozenProfileMismatch(state, profile, executorOverride, reviewerOverride).length === 0;
 }
 
-function stageTimeoutMs(): number {
-  const parsed = Number(process.env.PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS ?? DEFAULT_STAGE_TIMEOUT_MS);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STAGE_TIMEOUT_MS;
+/**
+ * Resolve the whole-run Stage B budget. The human-approved project profile owns
+ * the value when present; headless runs without a profile use the explicit env
+ * fallback. Malformed values fall back to the recommended default instead of
+ * silently disabling the watchdog.
+ */
+export function stageTimeoutMs(profile?: ProjectPluginProfile, env: NodeJS.ProcessEnv = process.env): number {
+  if (profile?.stageTimeoutMs !== undefined) return profile.stageTimeoutMs;
+  return parseStageTimeoutValue(env.PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS);
 }
 
 function acceptanceTimeoutMs(): number {
@@ -796,10 +891,34 @@ function acceptanceTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACCEPTANCE_TIMEOUT_MS;
 }
 
-function linkedAbortSignal(external: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; controller: AbortController; dispose: () => void } {
+/**
+ * Abort plumbing with a typed cause. The watchdog, `/plan-execute stop`, and
+ * the surrounding Pi session all abort the same controller, but their reasons
+ * stay distinguishable so a persisted pause can say WHY it happened.
+ */
+export function linkedAbortSignal(
+  external: AbortSignal | undefined,
+  timeoutMs: number,
+  startedAt = Date.now(),
+): { signal: AbortSignal; controller: AbortController; dispose: () => void } {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`Execution & Review timeout after ${timeoutMs}ms.`)), timeoutMs);
-  const abort = () => controller.abort(external?.reason ?? new Error("Execution & Review cancelled."));
+  const timer = timeoutMs > 0
+    ? setTimeout(() => controller.abort({
+        kind: "timeout",
+        message: `Stage B timed out after ${formatStageTimeout(timeoutMs)}.`,
+        timeoutMs,
+        elapsedMs: Date.now() - startedAt,
+      } satisfies StageBAbortReason), timeoutMs)
+    : undefined;
+  const abort = () => {
+    const reason = external?.reason;
+    controller.abort(isStageBAbortReason(reason)
+      ? reason
+      : {
+          kind: "session_abort",
+          message: reason instanceof Error ? reason.message : "Pi session interrupted Execution & Review.",
+        } satisfies StageBAbortReason);
+  };
   if (external) {
     if (external.aborted) abort();
     else external.addEventListener("abort", abort, { once: true });
@@ -822,13 +941,6 @@ type StartResult =
       reason: string;
     };
 
-const RESUMABLE_PAUSE_CODES = new Set([
-  "ABORTED",
-  "HARNESS_ERROR",
-  "PROCESS_RESTART",
-  "PROCESS_RESTART_RECONCILED",
-]);
-
 function pauseCode(reason: string | undefined): string | undefined {
   return reason?.match(/^\[([A-Z0-9_]+)\]/u)?.[1];
 }
@@ -849,8 +961,9 @@ export function evaluateResumeEligibility(
   if (current.review_rounds >= limit) {
     return { ok: false, reason: `Current phase already consumed review_round_limit=${limit}; resume cannot create extra hidden review rounds.` };
   }
-  const code = state.status === "running" ? "PROCESS_RESTART" : pauseCode(state.pause_reason);
-  if (!code || !RESUMABLE_PAUSE_CODES.has(code)) {
+  const code = state.status === "running" ? "PROCESS_RESTART" : state.pause?.code ?? pauseCode(state.pause_reason);
+  const resumable = state.status === "paused" && state.pause ? state.pause.resumable : pauseResumable(code);
+  if (!code || !resumable) {
     return {
       ok: false,
       reason: `Pause reason ${state.pause_reason ?? "(missing)"} is not an execution-interruption checkpoint. Safety/evidence failures require human repair or a new reviewed run.`,
@@ -899,47 +1012,65 @@ async function verifyResumeCheckpoint(
   }
 }
 
-function escalationDetails(state: WorkflowState, reason: string | undefined): Record<string, unknown> {
+/** Human-facing pause summary used for the notification and timeline. */
+function escalationSummary(state: WorkflowState, pause: PauseRecord): string {
   const phase = state.phases.find((entry) => entry.status !== "completed");
+  const findings = phase?.unresolved_findings.map((finding) => finding.id).join(", ") || "none";
+  const acceptanceFailures = phase?.acceptance_results
+    ?.filter((result) => result.required && !result.passed)
+    .map((result) => result.id).join(", ") || "none";
+  return [
+    `pi-plan-execute-auto paused run ${state.run_id} · ${pause.resumable ? "resumable interruption" : "requires human repair"}`,
+    ...formatPauseDetails(pause),
+    `Phase: ${phase?.phase_id ?? "none"} · round ${phase?.review_rounds ?? 0}`,
+    `Unresolved findings: ${findings}`,
+    `Acceptance failures: ${acceptanceFailures}`,
+    ...(pause.resumable
+      ? [`Resume: /plan-execute resume ${state.run_id}`]
+      : ["Resume is refused for this pause; restore the reported evidence first."]),
+    `Diagnostics: ${pkgDiagnosticsPath(state)}`,
+  ].join("\n");
+}
+
+function pkgDiagnosticsPath(state: WorkflowState): string {
+  return join(state.package_dir, ".runtime", "events.jsonl");
+}
+
+/** Stable payload for the one-shot budget warning on the workflow timeline. */
+export function budgetWarningEvent(runId: string, timeoutMs: number): Record<string, unknown> {
   return {
-    run_id: state.run_id,
-    reason,
-    phase_id: phase?.phase_id,
-    base_commit_sha: phase?.base_commit_sha,
-    review_rounds: phase?.review_rounds,
-    unresolved_findings: phase?.unresolved_findings ?? [],
-    executor_session_id: phase?.executor_session_id,
-    reviewer_session_id: phase?.reviewer_session_id,
-    execution_report_paths: phase?.execution_report_paths ?? [],
-    review_report_paths: phase?.review_report_paths ?? [],
-    acceptance_results: phase?.acceptance_results ?? [],
-    branch_name: state.branch_name,
-    worktree_path: state.worktree_path,
+    run_id: runId,
+    timeout_ms: timeoutMs,
+    warning_after_ms: Math.round(timeoutMs * BUDGET_WARNING_RATIO),
+    message: `Execution & Review consumed ${Math.round(BUDGET_WARNING_RATIO * 100)}% of its ${formatStageTimeout(timeoutMs)} budget.`,
   };
 }
 
-function escalationSummary(details: Record<string, unknown>): string {
-  const findings = Array.isArray(details.unresolved_findings)
-    ? details.unresolved_findings.map((finding) => (finding as { id?: string }).id ?? "unknown").join(", ") || "none"
-    : "none";
-  const acceptanceFailures = Array.isArray(details.acceptance_results)
-    ? details.acceptance_results
-        .filter((result) => (result as { required?: boolean; passed?: boolean }).required && !(result as { passed?: boolean }).passed)
-        .map((result) => (result as { id?: string }).id ?? "unknown")
-        .join(", ") || "none"
-    : "none";
-  return [
-    `pi-plan-execute-auto paused run ${String(details.run_id)}.`,
-    compactReason(typeof details.reason === "string" ? details.reason : undefined),
-    `Phase: ${String(details.phase_id ?? "none")} · round ${String(details.review_rounds ?? 0)}`,
-    `Executor session: ${String(details.executor_session_id ?? "unknown")}`,
-    `Reviewer session: ${String(details.reviewer_session_id ?? "unknown")}`,
-    `Review reports: ${Array.isArray(details.review_report_paths) ? details.review_report_paths.join(", ") || "none" : "none"}`,
-    `Execution reports: ${Array.isArray(details.execution_report_paths) ? details.execution_report_paths.join(", ") || "none" : "none"}`,
-    `Unresolved findings: ${findings}`,
-    `Acceptance failures: ${acceptanceFailures}`,
-    "Inspect the persisted reports and decide the next step with the human.",
-  ].filter(Boolean).join("\n");
+/**
+ * Stable schema for the persisted pause event. Kept pure so the timeline
+ * contract (code/stage/resumability/elapsed budget) is unit-testable without a
+ * full Stage B run.
+ */
+export function workflowPausedEvent(state: WorkflowState, pause: PauseRecord): Record<string, unknown> {
+  const current = state.phases.find((phase) => phase.status !== "completed");
+  return {
+    run_id: state.run_id,
+    code: pause.code,
+    summary: pause.summary,
+    detail: pause.detail ?? null,
+    stage: pause.stage,
+    resumable: pause.resumable,
+    timeout_ms: pause.timeout_ms ?? null,
+    elapsed_ms: pause.elapsed_ms ?? null,
+    reason: state.pause_reason,
+    phase_id: current?.phase_id ?? pause.phase_id ?? null,
+    review_rounds: current?.review_rounds ?? pause.round ?? 0,
+    executor_session_id: current?.executor_session_id ?? null,
+    reviewer_session_id: current?.reviewer_session_id ?? null,
+    execution_report_path: current?.execution_report_path ?? null,
+    review_report_path: current?.review_report_path ?? null,
+    acceptance_report_path: current?.acceptance_report_path ?? null,
+  };
 }
 
 async function persistAndEscalatePause(
@@ -947,36 +1078,23 @@ async function persistAndEscalatePause(
   ctx: ExtensionContext,
   pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
   state: WorkflowState,
-  reason: string,
+  pause: PauseRecord,
 ): Promise<StageBRunResult> {
   state.status = "paused";
-  state.pause_reason = reason;
+  state.pause = pause;
+  state.pause_reason = formatPauseReason(pause);
   const current = state.phases.find((phase) => phase.status !== "completed");
   if (current) {
     current.status = "paused";
-    current.last_error = reason;
+    current.last_error = state.pause_reason;
   }
   await writeWorkflowState(pkg.root, state);
-  await appendRunEvent(pkg.root, "workflow_paused", {
-    run_id: state.run_id,
-    reason,
-    phase_id: current?.phase_id ?? null,
-    review_rounds: current?.review_rounds ?? 0,
-    executor_session_id: current?.executor_session_id ?? null,
-    reviewer_session_id: current?.reviewer_session_id ?? null,
-    execution_report_path: current?.execution_report_path ?? null,
-    review_report_path: current?.review_report_path ?? null,
-    acceptance_report_path: current?.acceptance_report_path ?? null,
-  }).catch(() => undefined);
+  await appendRunEvent(pkg.root, "workflow_paused", workflowPausedEvent(state, pause)).catch(() => undefined);
   await captureCurrentMainPiSession(ctx, pkg.root);
   showWidget(ctx, stateLines(state));
   pi.appendEntry(STATE_ENTRY, state);
-  notify(
-    ctx,
-    `Execution & Review paused for ${state.run_id}. Details are saved under ${pkg.root}/.runtime/; inspect them when you want to diagnose the run.`,
-    "warning",
-  );
-  return { status: "paused", state, reason };
+  notify(ctx, escalationSummary(state, pause), pause.resumable ? "warning" : "error");
+  return { status: "paused", state, reason: state.pause_reason, pause };
 }
 
 export async function reconcilePersistedCompletions(
@@ -1087,8 +1205,33 @@ export async function reconcilePersistedCompletions(
     ctx,
     pkg,
     state,
-    "[PROCESS_RESTART_RECONCILED] Immutable completion evidence was reconciled, but the next phase cannot safely resume without its original AgentPrism session.",
+    createPauseRecord({
+      code: "PROCESS_RESTART_RECONCILED",
+      stage: "setup",
+      summary: "Immutable completion evidence was reconciled, but the next phase cannot safely resume without its original AgentPrism session.",
+    }),
   );
+}
+
+/**
+ * Decide whether Execution & Review may start for this persisted state.
+ *
+ * A paused (or orphaned running) run may continue ONLY through an explicit,
+ * eligibility-checked resume: the plan-approval guard was written for
+ * `/plan-execute start` and must not reject a valid resume checkpoint. A frozen
+ * run that already carries execution evidence still requires the explicit
+ * resume path instead of silently restarting.
+ */
+export function stageBStartDisposition(
+  state: WorkflowState,
+  resumeApproved: boolean,
+): "start" | "restart_required" | "plan_not_approved" {
+  if (resumeApproved && (state.status === "paused" || state.status === "running")) return "start";
+  if (state.status !== "frozen") return "plan_not_approved";
+  const hasExecutionEvidence = state.phases.some(
+    (phase) => phase.status === "running" || phase.review_rounds > 0 || Boolean(phase.executor_session_id),
+  );
+  return hasExecutionEvidence ? "restart_required" : "start";
 }
 
 async function startStageB(
@@ -1117,7 +1260,12 @@ async function startStageB(
           ctx,
           validation.package,
           persisted,
-          `[STARTUP_EVIDENCE] ${error instanceof Error ? error.message : String(error)}`,
+          createPauseRecord({
+            code: "STARTUP_EVIDENCE",
+            stage: "setup",
+            summary: "Startup evidence validation failed.",
+            ...(error instanceof Error ? { detail: error.message } : {}),
+          }),
         );
       }
     } catch {
@@ -1138,7 +1286,11 @@ async function startStageB(
       ctx,
       pkg,
       state,
-      "[WORKTREE_IDENTITY_MISMATCH] Persisted dedicated worktree identity is not the run-scoped plugin identity.",
+      createPauseRecord({
+        code: "WORKTREE_IDENTITY_MISMATCH",
+        stage: "setup",
+        summary: "Persisted dedicated worktree identity is not the run-scoped plugin identity.",
+      }),
     );
   }
   if (state.status === "completed") {
@@ -1152,7 +1304,12 @@ async function startStageB(
         ctx,
         pkg,
         state,
-        `[COMPLETION_GIT_EVIDENCE] ${error instanceof Error ? error.message : String(error)}`,
+        createPauseRecord({
+          code: "COMPLETION_GIT_EVIDENCE",
+          stage: "commit",
+          summary: "Completed workflow has no verifiable dedicated worktree completion chain.",
+          ...(error instanceof Error ? { detail: error.message } : {}),
+        }),
       );
     }
   }
@@ -1170,11 +1327,21 @@ async function startStageB(
       const reconciled = await reconcilePersistedCompletions(pi, ctx, pkg, state);
       if (reconciled) return reconciled;
     } catch (error) {
-      return persistAndEscalatePause(pi, ctx, pkg, state, `[PROCESS_RESTART_EVIDENCE] ${error instanceof Error ? error.message : String(error)}`);
+      return persistAndEscalatePause(pi, ctx, pkg, state, createPauseRecord({
+        code: "PROCESS_RESTART_EVIDENCE",
+        stage: "commit",
+        summary: "Completion evidence could not be reconciled after a process restart.",
+        ...(error instanceof Error ? { detail: error.message } : {}),
+      }));
     }
-    const reason = "[PROCESS_RESTART] The previous Pi process ended while this run was active. Use /plan-execute resume " + runId + " to rebuild fresh ACP sessions from the persisted checkpoint.";
-    return persistAndEscalatePause(pi, ctx, pkg, state, reason);
+    return persistAndEscalatePause(pi, ctx, pkg, state, createPauseRecord({
+      code: "PROCESS_RESTART",
+      stage: "setup",
+      summary: "The previous Pi process ended while this run was active.",
+      detail: `Use /plan-execute resume ${runId} to rebuild fresh ACP sessions from the persisted checkpoint.`,
+    }));
   }
+  let resumeApproved = false;
   if (resumeRequested) {
     if (activeRuns.has(runId)) return { status: "not_started", state, reason: `Run ${runId} is already active.` };
     try {
@@ -1203,20 +1370,24 @@ async function startStageB(
       }).catch(() => undefined);
       return { status: "not_started", state, reason: `Resume refused: ${eligibility.reason}` };
     }
+    resumeApproved = true;
   }
-  if (
-    state.status === "frozen" &&
-    state.phases.some((phase) => phase.status === "running" || phase.review_rounds > 0 || Boolean(phase.executor_session_id))
-  ) {
+  const disposition = stageBStartDisposition(state, resumeApproved);
+  if (disposition === "restart_required") {
     return persistAndEscalatePause(
       pi,
       ctx,
       pkg,
       state,
-      `[PROCESS_RESTART] Frozen run ${runId} contains persisted execution evidence from an interrupted process. Use /plan-execute resume ${runId} after it is marked paused.`,
+      createPauseRecord({
+        code: "PROCESS_RESTART",
+        stage: "setup",
+        summary: `Frozen run ${runId} contains persisted execution evidence from an interrupted process.`,
+        detail: `Use /plan-execute resume ${runId} after it is marked paused.`,
+      }),
     );
   }
-  if (state.status !== "frozen") {
+  if (disposition === "plan_not_approved") {
     return { status: "not_started", state, reason: `Run is ${state.status}; its plan must be approved before Execution & Review can start.` };
   }
 
@@ -1234,8 +1405,16 @@ async function startStageB(
   let configuredPermissionMode: AgentPermissionMode;
   let configuredReviewRoundLimit: number;
   if (profile) {
-    if (!frozenProfileMatches(state, profile, options?.executorModel, options?.reviewerModel)) {
-      return { status: "not_started", state, reason: "Frozen run settings differ from the human-approved project setup; use a new run or restore the approved setup." };
+    const mismatches = frozenProfileMismatch(state, profile, options?.executorModel, options?.reviewerModel);
+    if (mismatches.length > 0) {
+      return {
+        status: "not_started",
+        state,
+        reason: [
+          "Frozen run settings differ from the human-approved project setup; use a new run or restore the approved setup.",
+          ...mismatches.map((entry) => `- ${entry}`),
+        ].join("\n"),
+      };
     }
     executorModel = profile.executorModel;
     reviewerModel = profile.reviewerModel;
@@ -1295,6 +1474,9 @@ async function startStageB(
   } catch (error) {
     return { status: "not_started", state, reason: `[SANDBOX_UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}` };
   }
+  const effectiveStageTimeoutMs = stageTimeoutMs(profile);
+  // Git/worktree provisioning must still have a bound when the whole run is unlimited.
+  const operationTimeoutMs = effectiveStageTimeoutMs > 0 ? effectiveStageTimeoutMs : DEFAULT_STAGE_TIMEOUT_MS;
   state.executor_model = executorModel;
   state.reviewer_model = reviewerModel;
   if (configuredReasoningEffort) state.reasoning_effort = configuredReasoningEffort;
@@ -1302,15 +1484,26 @@ async function startStageB(
   if (configuredReviewerEffort) state.reviewer_reasoning_effort = configuredReviewerEffort;
   state.permission_mode = configuredPermissionMode;
   state.review_round_limit = configuredReviewRoundLimit;
+  state.stage_timeout_ms = effectiveStageTimeoutMs;
 
-  const linked = linkedAbortSignal(options?.signal ?? ctx.signal, stageTimeoutMs());
+  const linked = linkedAbortSignal(options?.signal ?? ctx.signal, effectiveStageTimeoutMs);
   const active: ActiveRun = { controller: new AbortController(), startedAt: new Date().toISOString() };
-  const relay = () => linked.controller.abort(active.controller.signal.reason ?? new Error("Execution & Review stopped by human."));
+  const relay = () => linked.controller.abort(active.controller.signal.reason ?? {
+    kind: "session_abort",
+    message: "Execution & Review was interrupted while stopping the run.",
+  } satisfies StageBAbortReason);
   active.controller.signal.addEventListener("abort", relay, { once: true });
   activeRuns.set(runId, active);
   let harness: AgentPrismSessionPair | undefined;
   // Animated Stage B activity widget: spinner + real ACP stream liveness.
   const activity = new StageBActivityModel();
+  activity.setBudget(Date.now(), effectiveStageTimeoutMs);
+  const budgetWarning = effectiveStageTimeoutMs > 0
+    ? setTimeout(() => {
+        void appendRunEvent(pkg.root, "stage_budget_warning", budgetWarningEvent(runId, effectiveStageTimeoutMs)).catch(() => undefined);
+      }, Math.round(effectiveStageTimeoutMs * BUDGET_WARNING_RATIO))
+    : undefined;
+  budgetWarning?.unref();
   try {
     validateControlledEnvironmentPaths(state);
     const sourceGit = createPiGitOperations(pi, ctx.cwd);
@@ -1326,7 +1519,7 @@ async function startStageB(
       targetGit,
       ...((state.worktree_path && state.branch_name) ? { existing: { path: state.worktree_path, branchName: state.branch_name } } : {}),
       signal: linked.signal,
-      timeout: stageTimeoutMs(),
+      timeout: operationTimeoutMs,
     });
     state.branch_name = dedicated.branchName;
     state.worktree_path = dedicated.path;
@@ -1334,7 +1527,7 @@ async function startStageB(
       ctx.cwd,
       dedicated.path,
       undefined,
-      { signal: linked.signal, timeout: stageTimeoutMs() },
+      { signal: linked.signal, timeout: operationTimeoutMs },
     );
     await writeWorkflowState(pkg.root, state);
 
@@ -1462,11 +1655,26 @@ async function startStageB(
         ctx,
         pkg,
         state,
-        `[EXECUTION_UNHANDLED] ${error instanceof Error ? error.message : String(error)}`,
+        createPauseRecord({
+          code: "EXECUTION_UNHANDLED",
+          stage: "unknown",
+          summary: "Execution & Review stopped with an unhandled error.",
+          ...(error instanceof Error ? { detail: error.message } : {}),
+        }),
       );
     }
     if (result.status === "paused") {
-      return persistAndEscalatePause(pi, ctx, pkg, result.state, result.reason ?? result.state.pause_reason ?? "Execution & Review paused.");
+      return persistAndEscalatePause(
+        pi,
+        ctx,
+        pkg,
+        result.state,
+        result.pause ?? result.state.pause ?? createPauseRecord({
+          code: "ABORTED",
+          stage: "unknown",
+          summary: result.reason ?? "Execution & Review paused.",
+        }),
+      );
     }
     showWidget(ctx, stateLines(result.state));
     pi.appendEntry(STATE_ENTRY, result.state);
@@ -1483,9 +1691,15 @@ async function startStageB(
       showWidget(ctx, stateLines(state));
       return { status: "not_started", state, reason };
     }
-    return persistAndEscalatePause(pi, ctx, pkg, state, `[WORKTREE_SETUP] ${error instanceof Error ? error.message : String(error)}`);
+    return persistAndEscalatePause(pi, ctx, pkg, state, createPauseRecord({
+      code: "WORKTREE_SETUP",
+      stage: "setup",
+      summary: "Dedicated worktree/environment setup failed.",
+      ...(error instanceof Error ? { detail: error.message } : {}),
+    }));
   } finally {
     activity.stop();
+    clearTimeout(budgetWarning);
     activeRuns.delete(runId);
     active.controller.abort();
     active.controller.signal.removeEventListener("abort", relay);
@@ -2002,6 +2216,9 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
       ctx,
       [
         `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`,
+        ...(state?.status === "paused"
+          ? [state.pause ? `Pause: ${formatPauseHeadline(state.pause)}` : `Pause: ${status.pause_reason ?? "reason unavailable"}`]
+          : []),
         `Workflow timeline: ${eventDisplay}`,
         ...(state?.status === "paused" || state?.status === "running"
           ? [resume?.ok
@@ -2040,7 +2257,7 @@ async function commandStop(ctx: ExtensionCommandContext, runId: string): Promise
     notify(ctx, `Run ${runId} has no active Execution & Review session.`, "warning");
     return;
   }
-  active.controller.abort(new Error("Execution & Review stopped by human."));
+  active.controller.abort({ kind: "human_stop", message: "Execution & Review stopped by human." } satisfies StageBAbortReason);
   notify(ctx, `Stop requested for ${runId}; the workflow will pause without committing.`, "info");
 }
 
@@ -2105,7 +2322,12 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     const data = entry.data as Partial<WorkflowState>;
     const status = data.status ?? "unknown";
     const runId = data.run_id ?? "unknown";
-    return new Text(theme.fg(status === "completed" ? "success" : status === "paused" ? "warning" : "accent", `plan-execute ${runId}: ${status}`), 0, 0);
+    const pause = status === "paused" ? data.pause : undefined;
+    const label = pause
+      ? `${status} · ${pause.code}${pause.resumable ? " (resumable)" : " (needs repair)"}`
+      : status;
+    const color = status === "completed" ? "success" : status === "paused" ? (pause && !pause.resumable ? "error" : "warning") : "accent";
+    return new Text(theme.fg(color, `plan-execute ${runId}: ${label}`), 0, 0);
   });
 
   pi.on("session_start", (_event, ctx) => {

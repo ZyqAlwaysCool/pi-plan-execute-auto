@@ -18,6 +18,7 @@
  */
 import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { formatDurationShort } from "./pause.js";
 import type { StageBStatusEvent } from "./types.js";
 
 /**
@@ -29,6 +30,9 @@ export const SPINNER_INTERVAL_MS = 80;
 
 /** ACP silence after which a nominally running turn is shown as stalled. */
 export const STALL_AFTER_MS = 20_000;
+
+/** Remaining whole-run budget under which the header switches to a warning color. */
+export const BUDGET_WARN_MS = 5 * 60 * 1000;
 
 /** Rolling window for the `evt/s` readout. */
 const RATE_WINDOW_MS = 1_000;
@@ -45,6 +49,8 @@ export interface StageBActivitySnapshot {
   lastEventAt: number;
   /** ACP events in the last second (real stream liveness, not the spinner timer). */
   eventsInWindow: number;
+  /** Whole-run watchdog budget; absent for no-timeout runs. */
+  budget?: { startedAt: number; timeoutMs: number };
 }
 
 /** Spinner frame for a point in time; wall-clock based so re-renders stay in sync. */
@@ -58,6 +64,20 @@ export function stalledFor(snapshot: StageBActivitySnapshot, now: number): numbe
   return Math.max(0, now - snapshot.lastEventAt);
 }
 
+/**
+ * Remaining whole-run budget for the header line. Hidden when no watchdog is
+ * configured or the run is no longer live, so a paused/completed widget keeps
+ * its final informative line instead of a stale countdown.
+ */
+function budgetSuffix(snapshot: StageBActivitySnapshot, theme: StatusWidgetTheme, now: number): string {
+  if (!snapshot.running || !snapshot.budget) return "";
+  const remaining = snapshot.budget.timeoutMs - (now - snapshot.budget.startedAt);
+  const label = remaining <= 0 ? "timeout now" : `${formatDurationShort(remaining)} left`;
+  return remaining <= BUDGET_WARN_MS
+    ? ` ${theme.fg("warning", `· ${label}`)}`
+    : ` ${theme.fg("dim", `· ${label}`)}`;
+}
+
 export function formatActivityLines(
   snapshot: StageBActivitySnapshot,
   theme: StatusWidgetTheme,
@@ -65,7 +85,7 @@ export function formatActivityLines(
   now: number,
 ): string[] {
   if (!snapshot.header && !snapshot.primary) return [];
-  const lines = [truncateToWidth(` ${snapshot.header}`, width, "")];
+  const lines = [truncateToWidth(` ${snapshot.header}${budgetSuffix(snapshot, theme, now)}`, width, "")];
   const silence = stalledFor(snapshot, now);
   if (silence >= STALL_AFTER_MS) {
     const seconds = Math.round(silence / 1_000);
@@ -102,6 +122,7 @@ export class StageBActivityModel {
   private message = "";
   private running = false;
   private lastEventAt = 0;
+  private budget: { startedAt: number; timeoutMs: number } | undefined;
   private readonly eventTimes: number[] = [];
   private readonly listeners = new Set<() => void>();
 
@@ -147,6 +168,12 @@ export class StageBActivityModel {
     this.notify();
   }
 
+  /** Configure the whole-run watchdog budget; `timeoutMs <= 0` disables the readout. */
+  setBudget(startedAt: number, timeoutMs: number): void {
+    this.budget = timeoutMs > 0 ? { startedAt, timeoutMs } : undefined;
+    this.notify();
+  }
+
   snapshot(now: number = this.clock()): StageBActivitySnapshot {
     this.prune(now);
     return {
@@ -156,6 +183,7 @@ export class StageBActivityModel {
       running: this.running,
       lastEventAt: this.lastEventAt,
       eventsInWindow: this.eventTimes.length,
+      ...(this.budget ? { budget: this.budget } : {}),
     };
   }
 

@@ -9,7 +9,7 @@ import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { AcpAgent } from "@automatalabs/workflows";
 import { createSandboxedBackend, supportedBackendForModel, verifySandboxBoundary } from "./sandbox.js";
-import { DEFAULT_MAX_REVIEW_ROUNDS, type AgentPermissionMode, type ReasoningEffort } from "./types.js";
+import { DEFAULT_MAX_REVIEW_ROUNDS, isValidStageTimeoutMs, type AgentPermissionMode, type ReasoningEffort } from "./types.js";
 
 const execFile = promisify(execFileCallback);
 const MAX_PROFILE_BYTES = 16 * 1024;
@@ -28,6 +28,8 @@ export interface ProjectPluginProfile {
   reviewerReasoningEffort?: ReasoningEffort;
   permissionMode: AgentPermissionMode;
   reviewRoundLimit: number;
+  /** Whole-run Execution & Review budget in ms; `0` means no timeout. Absent keeps the recommended default. */
+  stageTimeoutMs?: number;
   /** Digest of the project-local, untrusted preference cache approved by the human. */
   configSha256: string;
   networkRiskApprovedAt: string;
@@ -309,6 +311,7 @@ function validateProfile(value: unknown, identity: { projectRoot: string; gitEnt
     (value.reviewerReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reviewerReasoningEffort as string)) ||
     (value.reasoningEffort !== undefined && (value.executorReasoningEffort !== undefined || value.reviewerReasoningEffort !== undefined)) ||
     (value.permissionMode !== "autonomous" && value.permissionMode !== "ask") ||
+    (value.stageTimeoutMs !== undefined && !isValidStageTimeoutMs(value.stageTimeoutMs)) ||
     !Number.isInteger(value.reviewRoundLimit) || (value.reviewRoundLimit as number) < 1 || (value.reviewRoundLimit as number) > 100) {
     throw new Error("Saved plan-execute configuration is invalid or belongs to a different Git repository. Run /plan-execute setup again.");
   }
@@ -334,6 +337,7 @@ function approvedCache(profile: ProjectPluginProfile): Record<string, unknown> {
     ...(profile.reviewerReasoningEffort ? { reviewerReasoningEffort: profile.reviewerReasoningEffort } : {}),
     permissionMode: profile.permissionMode,
     reviewRoundLimit: profile.reviewRoundLimit,
+    ...(profile.stageTimeoutMs !== undefined ? { stageTimeoutMs: profile.stageTimeoutMs } : {}),
   };
 }
 
@@ -395,10 +399,13 @@ export async function loadProjectPluginProfile(cwd: string, agentDir = getAgentD
 export async function saveProjectPluginProfile(
   cwd: string,
   selected: Pick<ProjectPluginProfile, "executorModel" | "reviewerModel"> &
-    Partial<Pick<ProjectPluginProfile, "reasoningEffort" | "executorReasoningEffort" | "reviewerReasoningEffort" | "permissionMode" | "reviewRoundLimit">>,
+    Partial<Pick<ProjectPluginProfile, "reasoningEffort" | "executorReasoningEffort" | "reviewerReasoningEffort" | "permissionMode" | "reviewRoundLimit" | "stageTimeoutMs">>,
   agentDir = getAgentDir(),
 ): Promise<ProjectPluginProfile> {
   const identity = await projectIdentity(cwd);
+  if (selected.stageTimeoutMs !== undefined && !isValidStageTimeoutMs(selected.stageTimeoutMs)) {
+    throw new Error("Execution timeout must be 0 (no timeout) or an integer number of milliseconds from 1 minute to 24 hours.");
+  }
   const approved = {
     version: 1, ...identity,
     executorModel: selected.executorModel,
@@ -408,6 +415,7 @@ export async function saveProjectPluginProfile(
     ...(selected.reviewerReasoningEffort ? { reviewerReasoningEffort: selected.reviewerReasoningEffort } : {}),
     permissionMode: selected.permissionMode ?? "autonomous",
     reviewRoundLimit: selected.reviewRoundLimit ?? DEFAULT_MAX_REVIEW_ROUNDS,
+    ...(selected.stageTimeoutMs !== undefined ? { stageTimeoutMs: selected.stageTimeoutMs } : {}),
   };
   const profile: ProjectPluginProfile = validateProfile({
     ...approved, configSha256: cacheHash(approved), networkRiskApprovedAt: new Date().toISOString(),
