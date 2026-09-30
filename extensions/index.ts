@@ -60,6 +60,7 @@ import { isPathAllowed } from "../src/glob.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
 import { agentSessionTranscriptRelativePath, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 import { StageBController } from "../src/stage-b.js";
+import { StageBActivityModel, StageBActivityWidget } from "../src/status-widget.js";
 import { DEFAULT_MAX_REVIEW_ROUNDS } from "../src/types.js";
 import type {
   AcceptanceCommandRunner,
@@ -68,6 +69,7 @@ import type {
   Manifest,
   ReasoningEffort,
   StageBRunResult,
+  StageBStatusEvent,
   WorkflowState,
 } from "../src/types.js";
 
@@ -1307,6 +1309,8 @@ async function startStageB(
   active.controller.signal.addEventListener("abort", relay, { once: true });
   activeRuns.set(runId, active);
   let harness: AgentPrismSessionPair | undefined;
+  // Animated Stage B activity widget: spinner + real ACP stream liveness.
+  const activity = new StageBActivityModel();
   try {
     validateControlledEnvironmentPaths(state);
     const sourceGit = createPiGitOperations(pi, ctx.cwd);
@@ -1366,6 +1370,34 @@ async function startStageB(
         completed_phases: state.phases.filter((phase) => phase.status === "completed").length,
       }).catch(() => undefined);
     }
+    // Some hosts (for example RPC mode) accept only string-array widgets and
+    // ignore component factories; keep the previous static widget as fallback.
+    let activityWidgetCreated = false;
+    if (ctx.hasUI) {
+      try {
+        ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
+          const widget = new StageBActivityWidget(tui, theme, activity);
+          activityWidgetCreated = true;
+          return widget;
+        });
+      } catch {
+        activityWidgetCreated = false;
+      }
+    }
+    const publishLiveEvent = (role: "executor" | "reviewer", event: string): void => {
+      activity.startLive(runId, role, event);
+      if (!activityWidgetCreated) showWidget(ctx, [`Execution & Review · ${runId}`, `${role} · ${event}`]);
+    };
+    const publishStatus = (event: StageBStatusEvent): void => {
+      activity.applyStatus(event);
+      if (!activityWidgetCreated) {
+        showWidget(ctx, [
+          `Execution & Review · ${event.phase_id} · round ${event.round}`,
+          `Executor ${event.executor_status} · Reviewer ${event.reviewer_status}`,
+          event.message,
+        ]);
+      }
+    };
     const sessionPair = new AgentPrismSessionPair({
       cwd: dedicated.path,
       sourceRoot: ctx.cwd,
@@ -1400,7 +1432,7 @@ async function startStageB(
         return index >= 0 ? request.options[index]?.optionId : undefined;
       },
       onLiveEvent: (role, event) => {
-        showWidget(ctx, [`Execution & Review · ${runId}`, `${role} · ${event}`]);
+        publishLiveEvent(role, event);
       },
     });
     harness = sessionPair;
@@ -1416,11 +1448,7 @@ async function startStageB(
       resumePaused: resumeRequested,
       saveState: (next) => writeWorkflowState(pkg.root, next),
       onStatus: (event) => {
-        showWidget(ctx, [
-          `Execution & Review · ${event.phase_id} · round ${event.round}`,
-          `Executor ${event.executor_status} · Reviewer ${event.reviewer_status}`,
-          event.message,
-        ]);
+        publishStatus(event);
         void appendRunEvent(pkg.root, "workflow_status", event as unknown as Record<string, unknown>).catch(() => undefined);
       },
     });
@@ -1457,6 +1485,7 @@ async function startStageB(
     }
     return persistAndEscalatePause(pi, ctx, pkg, state, `[WORKTREE_SETUP] ${error instanceof Error ? error.message : String(error)}`);
   } finally {
+    activity.stop();
     activeRuns.delete(runId);
     active.controller.abort();
     active.controller.signal.removeEventListener("abort", relay);
