@@ -125,3 +125,25 @@ test("safe resume accepts only execution-interruption checkpoints with remaining
   assert.equal(evaluateResumeEligibility(orphaned).ok, false);
   assert.equal(evaluateResumeEligibility(orphaned, { allowOrphanedRunning: true }).ok, true);
 });
+
+
+test("plan_execute_finalize cannot accept a model-supplied run_id", () => {
+  let finalizeTool: { name?: string; parameters?: unknown; promptGuidelines?: string[] } | undefined;
+  const fakePi = {
+    registerTool(tool: { name?: string; parameters?: unknown; promptGuidelines?: string[] }) {
+      if (tool.name === "plan_execute_finalize") finalizeTool = tool;
+    },
+    registerCommand() {},
+    registerEntryRenderer() {},
+    on() { return () => {}; },
+  };
+  planExecuteAuto(fakePi as unknown as Parameters<typeof planExecuteAuto>[0]);
+  assert.ok(finalizeTool);
+  const schema = finalizeTool.parameters as {
+    properties?: Record<string, unknown>;
+    additionalProperties?: boolean;
+  };
+  assert.equal(Object.prototype.hasOwnProperty.call(schema.properties ?? {}, "run_id"), false);
+  assert.equal(schema.additionalProperties, false);
+  assert.match((finalizeTool.promptGuidelines ?? []).join("\n"), /plugin exclusively allocates the execution identity/u);
+});

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   access,
   cp,
@@ -94,9 +94,15 @@ export function assertSafeRunId(value: string): void {
   }
 }
 
-export function makeRunId(now = new Date()): string {
+export function makeRunId(
+  now = new Date(),
+  randomSuffix = randomBytes(8).toString("hex"),
+): string {
+  if (!/^[0-9a-f]{16}$/iu.test(randomSuffix)) {
+    throw new Error("run id random suffix must be exactly 16 hexadecimal characters.");
+  }
   const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-  return `run-${stamp.toLowerCase()}`;
+  return `run-${stamp.toLowerCase()}-${randomSuffix.toLowerCase()}`;
 }
 
 function parseYaml(content: string, source: string, errors: PackageValidationIssue[]): unknown {

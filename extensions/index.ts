@@ -12,6 +12,7 @@ import { Text } from "@earendil-works/pi-tui";
 import {
   formatPackageSummary,
   formatValidationIssues,
+  makeRunId,
   PackageInputError,
   PackageValidationError,
   readWorkflowState,
@@ -171,14 +172,13 @@ const FILE_SCHEMA = Type.Object({
 });
 
 const FINALIZE_SCHEMA = Type.Object({
-  run_id: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
   manifest: MANIFEST_SCHEMA,
   files: Type.Array(FILE_SCHEMA),
   // Human approval is collected only by native UI or an explicit human command.
   approval: Type.Optional(Type.Union([Type.Literal("ask"), Type.Literal("cancel")])),
   executor_model: Type.Optional(Type.String({ minLength: 1 })),
   reviewer_model: Type.Optional(Type.String({ minLength: 1 })),
-});
+}, { additionalProperties: false });
 
 type FinalizeParams = Static<typeof FINALIZE_SCHEMA>;
 
@@ -187,7 +187,7 @@ const REVISE_SCHEMA = Type.Object({
   previous_package_hash: Type.String({ minLength: 64, maxLength: 64 }),
   manifest: MANIFEST_SCHEMA,
   files: Type.Array(FILE_SCHEMA),
-});
+}, { additionalProperties: false });
 
 type ReviseParams = Static<typeof REVISE_SCHEMA>;
 
@@ -1473,7 +1473,6 @@ function packageInput(params: FinalizeParams, reviewRoundLimit?: number): Finali
   };
   manifest.max_review_rounds = reviewRoundLimit ?? params.manifest.max_review_rounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
   return {
-    ...(params.run_id ? { run_id: params.run_id } : {}),
     manifest,
     files: params.files,
     ...(params.approval ? { approval: params.approval } : {}),
@@ -1635,7 +1634,10 @@ async function handleFinalize(
   try {
     const selection = await approvedSetup(ctx.cwd, ctx.hasUI, params);
     const input = packageInput(params, selection.reviewRoundLimit);
-    const runId = input.run_id ?? `run-${Date.now().toString(36)}`;
+    // Execution identity belongs to the plugin, never to Main Pi/model output.
+    // The timestamp keeps the id sortable; 64 bits of cryptographic entropy make
+    // same-second and concurrent finalizations independent.
+    const runId = makeRunId();
     const written = await writeValidatedPackage(ctx.cwd, input, runId);
     const draft = createDraftState(written.package, runId);
     await writeWorkflowState(written.package.root, draft);
@@ -2021,6 +2023,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     promptSnippet: "Create a validated phased draft plan for human review",
     promptGuidelines: [
       "Use plan_execute_finalize only after the human explicitly invokes /plan-execute; it must contain at least one ordered phase.",
+      "Do not invent, request, or provide a run_id. The plugin exclusively allocates the execution identity after validation.",
       "Each phase needs an independent spec file, acceptance YAML contract, and required plugin-owned completion commit.",
       "Do not approve/freeze the package or implement project code; the plugin owns the human revision/approval loop.",
       "After a successful finalize, keep the Main Pi handoff brief and do not restate the draft or ask for approval in chat.",

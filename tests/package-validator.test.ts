@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   formatValidationIssues,
+  makeRunId,
   readWorkflowState,
   replaceValidatedDraftPackage,
   serializeManifest,
@@ -293,4 +294,16 @@ test("runtime state and reports do not change the Golden Docs hash", async () =>
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+
+test("plugin-owned run ids are stable-format and include independent entropy", () => {
+  const at = new Date("2026-09-30T07:05:12.345Z");
+  const first = makeRunId(at, "0011223344556677");
+  const second = makeRunId(at, "8899aabbccddeeff");
+  assert.equal(first, "run-20260930t070512z-0011223344556677");
+  assert.equal(second, "run-20260930t070512z-8899aabbccddeeff");
+  assert.notEqual(first, second);
+  assert.match(first, /^run-[0-9]{8}t[0-9]{6}z-[0-9a-f]{16}$/u);
+  assert.throws(() => makeRunId(at, "not-random"), /16 hexadecimal/);
 });
