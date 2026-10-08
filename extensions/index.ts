@@ -60,7 +60,7 @@ import { isPathAllowed } from "../src/glob.js";
 import { ensureSetupRepository } from "../src/setup-repository.js";
 import { agentSessionTranscriptRelativePath, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
 import { StageBController } from "../src/stage-b.js";
-import { StageBActivityModel, StageBActivityWidget } from "../src/status-widget.js";
+import { StageBActivityModel, StageBActivityWidget, formatPlanChecklist } from "../src/status-widget.js";
 import {
   createPauseRecord,
   formatPauseDetails,
@@ -85,6 +85,7 @@ import type {
   PauseRecord,
   ReasoningEffort,
   StageBAbortReason,
+  StageBPlanSnapshot,
   StageBRunResult,
   StageBStatusEvent,
   WorkflowState,
@@ -93,6 +94,7 @@ import type {
 const execFile = promisify(execFileCallback);
 const WIDGET_KEY = "pi-plan-execute-auto";
 const STATE_ENTRY = "plan-execute-state";
+const PHASE_ENTRY = "plan-execute-phase";
 const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120 * 1000;
 /** Persist a timeline warning once this fraction of the whole-run budget is consumed. */
 export const BUDGET_WARNING_RATIO = 0.8;
@@ -227,6 +229,69 @@ interface ActiveRun {
 const activeRuns = new Map<string, ActiveRun>();
 const pendingHumanReviews = new Set<string>();
 
+/** Stop key advertised in messages; registered as an extension shortcut too. */
+export const STOP_SHORTCUT = "ctrl+shift+x";
+export const STOP_SHORTCUT_LABEL = "Ctrl+Shift+X";
+
+export function humanStopReason(): StageBAbortReason {
+  return { kind: "human_stop", message: "Execution & Review stopped by human." };
+}
+
+/** Register a live Stage B run in this Pi process. */
+export function trackActiveRun(runId: string, active: ActiveRun): void {
+  activeRuns.set(runId, active);
+}
+
+export function untrackActiveRun(runId: string): void {
+  activeRuns.delete(runId);
+}
+
+export function activeRunIds(): string[] {
+  return [...activeRuns.keys()];
+}
+
+/** Abort one active run; `false` when this process has no live session for the id. */
+export function requestRunStop(runId: string, reason: StageBAbortReason): boolean {
+  const active = activeRuns.get(runId);
+  if (!active) return false;
+  active.controller.abort(reason);
+  return true;
+}
+
+/** Abort every active run and return the affected run ids (stop shortcut and session shutdown). */
+export function stopAllActiveRuns(reason: StageBAbortReason): string[] {
+  const stopped = activeRunIds();
+  for (const runId of stopped) requestRunStop(runId, reason);
+  return stopped;
+}
+
+/**
+ * Launch Stage B without blocking Pi's interactive input loop.
+ *
+ * Pi's main loop awaits a typed command handler; a handler that awaits the whole
+ * run makes every later input (chat or `/plan-execute stop`) wait until the run
+ * ends. Detaching keeps `/plan-execute stop` and the stop shortcut usable while
+ * the run is live; results are reported through `notify` instead of the return
+ * value.
+ */
+export function startStageBInBackground(options: {
+  start: () => Promise<StartResult>;
+  notify: (message: string, type: "info" | "warning" | "error") => void;
+  notStarted?: (reason: string | undefined) => string;
+  completed?: (status: StartResult["status"]) => string;
+}): void {
+  void options.start().then((result) => {
+    if (result.status === "not_started") {
+      options.notify(options.notStarted?.(result.reason) ?? (result.reason ?? "Execution & Review did not start."), "warning");
+      return;
+    }
+    if (result.status === "paused") return; // persistAndEscalatePause already reported the cause
+    options.notify(options.completed?.(result.status) ?? `Execution & Review ${result.status}.`, "info");
+  }).catch((error) => {
+    options.notify(error instanceof Error ? error.message : String(error), "error");
+  });
+}
+
 function textResult(text: string, details: Record<string, unknown> = {}) {
   return {
     content: [{ type: "text" as const, text }],
@@ -244,16 +309,23 @@ function clearWidget(ctx: ExtensionContext): void {
 
 function stateLines(state: WorkflowState): string[] {
   const completed = state.phases.filter((phase) => phase.status === "completed").length;
-  const current = state.phases.find((phase) => phase.status !== "completed");
   const pause = state.status === "paused" ? state.pause : undefined;
+  const plan: StageBPlanSnapshot = {
+    phase_ids: state.phases.map((phase) => phase.phase_id),
+    phase_statuses: state.phases.map((phase) => phase.status),
+    current_index: state.phases.findIndex((phase) => phase.status !== "completed"),
+    review_round_limit: state.review_round_limit ?? DEFAULT_MAX_REVIEW_ROUNDS,
+  };
+  const currentRound = plan.current_index >= 0
+    ? Math.min((state.phases[plan.current_index]?.review_rounds ?? 0) + 1, plan.review_round_limit)
+    : undefined;
   return [
-    `Execution & Review · ${state.status}`,
-    `Run ${state.run_id} · ${completed}/${state.phases.length} phases`,
-    ...(state.stage_timeout_ms !== undefined ? [`Timeout ${formatStageTimeout(state.stage_timeout_ms)}`] : []),
-    current ? `Current ${current.phase_id} · round ${current.review_rounds}` : "All phases complete",
+    `Execution & Review · ${state.run_id} · ${state.status} · ${completed}/${state.phases.length} phases` +
+      (state.stage_timeout_ms !== undefined ? ` · timeout ${formatStageTimeout(state.stage_timeout_ms)}` : ""),
+    `  ${formatPlanChecklist(plan, 240, currentRound !== undefined ? { round: currentRound } : {})}`,
     ...(pause
       ? [
-          `Paused: ${formatPauseHeadline(pause)}`,
+          formatPauseHeadline(pause),
           ...(pause.resumable
             ? [`Resume: /plan-execute resume ${state.run_id}`]
             : ["Resume is refused; repair the reported evidence first."]),
@@ -1073,6 +1145,31 @@ export function workflowPausedEvent(state: WorkflowState, pause: PauseRecord): R
   };
 }
 
+/**
+ * Durable phase-completion entry payload. Emitted once per `reviewer_status:
+ * "pass"` status event (the commit emit) so the session history records
+ * `Phase 2/4 finished` even when the live widget is missed. Start transitions
+ * stay widget-only to avoid transcript noise.
+ */
+export function phaseCompletedEntry(
+  event: StageBStatusEvent,
+  state: WorkflowState,
+): Record<string, unknown> | undefined {
+  if (event.reviewer_status !== "pass" || !event.plan) return undefined;
+  const index = event.plan.phase_ids.indexOf(event.phase_id);
+  if (index < 0) return undefined;
+  const phase = state.phases.find((entry) => entry.phase_id === event.phase_id);
+  return {
+    run_id: state.run_id,
+    phase_id: event.phase_id,
+    phase_index: index + 1,
+    phase_total: event.plan.phase_ids.length,
+    review_rounds: phase?.review_rounds ?? event.round,
+    commit: phase?.phase_commit_sha ?? null,
+    committed_at: phase?.committed_at ?? new Date().toISOString(),
+  };
+}
+
 async function persistAndEscalatePause(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1493,10 +1590,17 @@ async function startStageB(
     message: "Execution & Review was interrupted while stopping the run.",
   } satisfies StageBAbortReason);
   active.controller.signal.addEventListener("abort", relay, { once: true });
-  activeRuns.set(runId, active);
+  trackActiveRun(runId, active);
   let harness: AgentPrismSessionPair | undefined;
   // Animated Stage B activity widget: spinner + real ACP stream liveness.
   const activity = new StageBActivityModel();
+  activity.setRunId(runId);
+  activity.setPlan({
+    phase_ids: pkg.phases.map((entry) => entry.phase.id),
+    phase_statuses: state.phases.map((phase) => phase.status),
+    current_index: state.phases.findIndex((phase) => phase.status !== "completed"),
+    review_round_limit: state.review_round_limit ?? DEFAULT_MAX_REVIEW_ROUNDS,
+  });
   activity.setBudget(Date.now(), effectiveStageTimeoutMs);
   const budgetWarning = effectiveStageTimeoutMs > 0
     ? setTimeout(() => {
@@ -1583,10 +1687,17 @@ async function startStageB(
     };
     const publishStatus = (event: StageBStatusEvent): void => {
       activity.applyStatus(event);
+      const completed = phaseCompletedEntry(event, state);
+      if (completed) pi.appendEntry(PHASE_ENTRY, completed);
       if (!activityWidgetCreated) {
+        const progress = event.plan
+          ? `${event.plan.phase_statuses.filter((status) => status === "completed").length}/${event.plan.phase_ids.length} phases · `
+          : "";
         showWidget(ctx, [
-          `Execution & Review · ${event.phase_id} · round ${event.round}`,
-          `Executor ${event.executor_status} · Reviewer ${event.reviewer_status}`,
+          `Execution & Review · ${progress}${event.phase_id} · round ${event.round}`,
+          ...(event.plan
+            ? [formatPlanChecklist(event.plan, 160, { round: event.round, paused: Boolean(event.pause) })]
+            : []),
           event.message,
         ]);
       }
@@ -1700,7 +1811,7 @@ async function startStageB(
   } finally {
     activity.stop();
     clearTimeout(budgetWarning);
-    activeRuns.delete(runId);
+    untrackActiveRun(runId);
     active.controller.abort();
     active.controller.signal.removeEventListener("abort", relay);
     linked.dispose();
@@ -1804,6 +1915,7 @@ export async function approvedSetup(
 
 type DraftReviewResult =
   | StartResult
+  | { status: "started"; state: WorkflowState }
   | { status: "awaiting_approval"; state: WorkflowState }
   | { status: "revision_requested"; state: WorkflowState }
   | { status: "cancelled"; state: WorkflowState };
@@ -1814,6 +1926,7 @@ async function reviewDraftAndStart(
   pkg: Awaited<ReturnType<typeof loadValidatedRun>>["package"],
   selection: Awaited<ReturnType<typeof approvedSetup>>,
   explicitStartCommand = false,
+  options?: { detach?: boolean },
 ): Promise<DraftReviewResult> {
   const current = await readWorkflowState(pkg.root);
   if (!current || current.status !== "draft") {
@@ -1865,7 +1978,16 @@ async function reviewDraftAndStart(
   await captureCurrentMainPiSession(ctx, pkg.root);
   showWidget(ctx, stateLines(frozen));
   pi.appendEntry(STATE_ENTRY, frozen);
-  return startStageB(pi, ctx, current.run_id, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
+  const launch = () => startStageB(pi, ctx, current.run_id, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
+  if (options?.detach) {
+    startStageBInBackground({
+      start: launch,
+      notify: (message, type) => notify(ctx, message, type),
+      notStarted: (reason) => `Execution has not started: ${reason ?? "unknown reason"}\nFix the prerequisite and run /plan-execute start ${current.run_id} again.`,
+    });
+    return { status: "started", state: frozen };
+  }
+  return launch();
 }
 
 async function handleFinalize(
@@ -2093,9 +2215,14 @@ async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runI
     let result: DraftReviewResult | StartResult;
     if (loaded.state.status === "draft") {
       const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
-      result = await reviewDraftAndStart(pi, ctx, loaded.package, selection, true);
+      result = await reviewDraftAndStart(pi, ctx, loaded.package, selection, true, { detach: true });
     } else {
-      result = await startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
+      result = { status: "started", state: loaded.state };
+      startStageBInBackground({
+        start: () => startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) }),
+        notify: (message, type) => notify(ctx, message, type),
+        notStarted: (reason) => `Execution has not started: ${reason ?? "unknown reason"}\nFix the prerequisite and run /plan-execute start ${runId} again.`,
+      });
     }
 
     if (result.status === "revision_requested") {
@@ -2108,6 +2235,10 @@ async function commandStart(pi: ExtensionAPI, ctx: ExtensionCommandContext, runI
     }
     if (result.status === "cancelled") {
       notify(ctx, `Run ${runId} was cancelled before execution.`, "info");
+      return;
+    }
+    if (result.status === "started") {
+      notify(ctx, `Execution & Review is running in the background for ${runId}. Stop with /plan-execute stop ${runId} or ${STOP_SHORTCUT_LABEL}.`, "info");
       return;
     }
     if (result.status === "not_started") {
@@ -2142,22 +2273,18 @@ async function commandResume(pi: ExtensionAPI, ctx: ExtensionCommandContext, run
     }).catch(() => undefined);
     notify(
       ctx,
-      `Resuming ${runId} from persisted checkpoint at ${eligibility.currentPhase}. Completed phases will be re-verified and skipped; fresh Executor/Reviewer ACP sessions will be created for unfinished work.`,
+      `Resuming ${runId} from persisted checkpoint at ${eligibility.currentPhase}. Completed phases will be re-verified and skipped; fresh Executor/Reviewer ACP sessions will be created for unfinished work. Stop with /plan-execute stop ${runId} or ${STOP_SHORTCUT_LABEL}.`,
       "info",
     );
-    const result = await startStageB(pi, ctx, runId, {
-      resume: true,
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    startStageBInBackground({
+      start: () => startStageB(pi, ctx, runId, {
+        resume: true,
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
+      }),
+      notify: (message, type) => notify(ctx, message, type),
+      notStarted: (reason) => reason ?? "Resume did not start.",
+      completed: (status) => `Execution & Review ${status} after resume.`,
     });
-    if (result.status === "not_started") {
-      notify(ctx, result.reason ?? "Resume did not start.", "warning");
-      return;
-    }
-    if (result.status === "paused") {
-      // Newly-paused execution is already reported by persistAndEscalatePause.
-      return;
-    }
-    notify(ctx, `Execution & Review ${result.status} after resume.`, "info");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -2252,12 +2379,10 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
 }
 
 async function commandStop(ctx: ExtensionCommandContext, runId: string): Promise<void> {
-  const active = activeRuns.get(runId);
-  if (!active) {
+  if (!requestRunStop(runId, humanStopReason())) {
     notify(ctx, `Run ${runId} has no active Execution & Review session.`, "warning");
     return;
   }
-  active.controller.abort({ kind: "human_stop", message: "Execution & Review stopped by human." } satisfies StageBAbortReason);
   notify(ctx, `Stop requested for ${runId}; the workflow will pause without committing.`, "info");
 }
 
@@ -2318,6 +2443,33 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     },
   });
 
+  // Emergency stop that works even while Pi's input loop is busy with a typed
+  // start/resume command. Extension shortcuts are handled by the editor key
+  // handler, not by the prompt queue.
+  pi.registerShortcut(STOP_SHORTCUT, {
+    description: "Stop the active plan-execute Execution & Review run",
+    handler: (ctx) => {
+      const stopped = stopAllActiveRuns(humanStopReason());
+      notify(
+        ctx,
+        stopped.length > 0
+          ? `Stop requested for ${stopped.join(", ")}; the workflow will pause without committing.`
+          : "No active plan-execute Execution & Review run to stop.",
+        stopped.length > 0 ? "info" : "warning",
+      );
+    },
+  });
+
+  pi.registerEntryRenderer(PHASE_ENTRY, (entry, _options, theme) => {
+    const data = entry.data as Partial<{ phase_index: number; phase_total: number; phase_id: string; commit: string | null }>;
+    const commit = typeof data.commit === "string" && data.commit ? ` · ${data.commit.slice(0, 8)}` : "";
+    return new Text(
+      theme.fg("success", `✓ Phase ${data.phase_index ?? "?"}/${data.phase_total ?? "?"} ${data.phase_id ?? "unknown"} committed${commit}`),
+      0,
+      0,
+    );
+  });
+
   pi.registerEntryRenderer(STATE_ENTRY, (entry, _options, theme) => {
     const data = entry.data as Partial<WorkflowState>;
     const status = data.status ?? "unknown";
@@ -2351,8 +2503,18 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     }, 0);
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     pendingHumanReviews.clear();
     clearWidget(ctx);
+    const stopped = stopAllActiveRuns({ kind: "session_abort", message: "Pi session is shutting down." });
+    if (stopped.length > 0) {
+      // Pi awaits this handler, so give the in-flight pause persistence a short,
+      // bounded chance to land. Without it a hard quit can leave the run marked
+      // running for the next-start reconciliation instead of a clean pause.
+      const deadline = Date.now() + 2_000;
+      while (activeRunIds().length > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   });
 }

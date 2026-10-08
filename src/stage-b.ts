@@ -43,6 +43,7 @@ import {
   type PhasePackage,
   type PhaseState,
   type ReviewReport,
+  type StageBPlanSnapshot,
   type StageBRunResult,
   type StageBStatusEvent,
   type ValidatedPackage,
@@ -597,6 +598,7 @@ export class StageBController {
         reviewer_status: "interrupted",
         message: this.state.pause_reason,
         pause: record,
+        plan: this.planSnapshot(),
       });
     }
     await this.save();
@@ -607,6 +609,18 @@ export class StageBController {
   /** Classify the Stage B abort signal into a precise, resumability-aware pause cause. */
   private abortPause(stage: PauseStage, summary: string): PauseInput {
     return abortPauseInput(this.options.signal?.reason, { stage, summary });
+  }
+
+  /** Cheap plan progress snapshot shared by every status event and the live widget. */
+  private planSnapshot(): StageBPlanSnapshot {
+    const phases = this.options.package.phases;
+    const phaseStatuses = phases.map((phase) => this.phaseState(phase).status);
+    return {
+      phase_ids: phases.map((phase) => phase.phase.id),
+      phase_statuses: phaseStatuses,
+      current_index: phaseStatuses.findIndex((status) => status !== "completed"),
+      review_round_limit: this.maxReviewRounds,
+    };
   }
 
   private async phase(phase: PhasePackage): Promise<StageBRunResult | undefined> {
@@ -668,6 +682,7 @@ export class StageBController {
           : feedback
             ? "Executor resuming same session after feedback."
             : "Executor implementing current phase.",
+        plan: this.planSnapshot(),
       });
 
       const harnessOptions = {
@@ -749,6 +764,7 @@ export class StageBController {
         executor_status: "complete",
         reviewer_status: "running",
         message: "Independent reviewer inspecting current phase diff.",
+        plan: this.planSnapshot(),
       });
       let review: ReviewReport;
       try {
@@ -803,6 +819,7 @@ export class StageBController {
           executor_status: "complete",
           reviewer_status: "rework",
           message: `Reviewer requested rework: ${review.summary}`,
+          plan: this.planSnapshot(),
         });
         feedback = this.feedbackForExecution(execution, acceptance, [], review);
         if (round >= this.maxReviewRounds) {
@@ -947,6 +964,7 @@ export class StageBController {
         executor_status: "complete",
         reviewer_status: "pass",
         message: `Phase committed at ${phaseCommit}.`,
+        plan: this.planSnapshot(),
       });
       return undefined;
     }

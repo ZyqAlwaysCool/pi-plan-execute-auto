@@ -333,6 +333,17 @@ export interface HarnessPair {
   close(): Promise<void>;
 }
 
+export interface StageBPlanSnapshot {
+  /** Ordered phase ids exactly as the frozen manifest declares them. */
+  phase_ids: string[];
+  phase_statuses: PhaseRuntimeStatus[];
+  /** 0-based index of the first incomplete phase; -1 when every phase is completed. */
+  current_index: number;
+  review_round_limit: number;
+}
+
+export type PhaseRuntimeStatus = "pending" | "running" | "paused" | "completed";
+
 export interface StageBStatusEvent {
   phase_id: string;
   round: number;
@@ -341,6 +352,8 @@ export interface StageBStatusEvent {
   message: string;
   /** Present on the terminal pause event so the timeline carries the structured cause. */
   pause?: PauseRecord;
+  /** Live plan progress; absent only in older persisted/test events. */
+  plan?: StageBPlanSnapshot;
 }
 
 export interface StageBRunResult {

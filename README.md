@@ -53,8 +53,11 @@ The normal command surface is intentionally small:
 - `/plan-execute` formalizes the current planning discussion into a draft and opens Review & Approval.
 - `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
-- `stop <run-id>` requests a safe stop of an active execution.
+- `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint.
+- `stop <run-id>` (or the `Ctrl+Shift+X` shortcut) requests a safe stop of an active execution and pauses without committing.
 - `status <run-id>` shows a compact status summary plus the workflow-timeline path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
+
+`start` and `resume` run Execution & Review in the background instead of holding Pi's input loop, so chat, `/plan-execute status`, and the stop command/shortcut stay usable while a run is live. Stopping, timing out, or quitting Pi aborts the active harness and records a resumable pause (session shutdown gets a short bounded drain to persist it).
 
 Structural validation, approval hashing, commit validation, and configuration integrity checks are automatic; they are not separate day-to-day commands.
 
@@ -96,7 +99,7 @@ Each Executor/Reviewer session has a small transcript under `.runtime/sessions/e
 
 Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
 
-The main UI is deliberately compact: current run/phase/round and high-level state stay visible, while detailed diagnostics live in the run directory. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
+The main UI is deliberately compact: the live widget keeps the run id, `N/M phases` progress, a full phase-name checklist (`✓` completed, `▶` current, `⏸` paused, `○` pending) with the current review round, the whole-run budget, the latest ACP activity (spinner + `evt/s`), and the latest status message, while detailed diagnostics live in the run directory. Each completed phase also appends a durable `Phase N/M … committed` entry to the session, so progress survives even when the live widget is missed. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
 
 ## Full native Agent CLI sessions
 

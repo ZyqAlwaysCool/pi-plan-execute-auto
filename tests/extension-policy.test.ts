@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { WorkflowState } from "../src/types.js";
+import type { StageBStatusEvent, WorkflowState } from "../src/types.js";
 import planExecuteAuto, {
   approvalStartsStageB,
   budgetWarningEvent,
@@ -8,6 +8,7 @@ import planExecuteAuto, {
   evaluateResumeEligibility,
   linkedAbortSignal,
   parsePlanExecuteCommand,
+  phaseCompletedEntry,
   selectStageBReasoningEffort,
   stageBStartDisposition,
   workflowPausedEvent,
@@ -69,6 +70,7 @@ test("queued human review waits for full agent settlement and never blocks turn_
   const fakePi = {
     registerTool() {},
     registerCommand() {},
+    registerShortcut() {},
     registerEntryRenderer() {},
     on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
       handlers.set(event, handler);
@@ -187,6 +189,47 @@ test("explicit resume may start a paused run while the approval guard still bloc
   assert.equal(stageBStartDisposition(state("draft"), true), "plan_not_approved");
 });
 
+test("phase completion entries are emitted only for PASS and carry the commit", () => {
+  const state = {
+    version: 1,
+    run_id: "run-1",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/run-1",
+    status: "running",
+    created_at: new Date(0).toISOString(),
+    phases: [{
+      phase_id: "phase-01",
+      status: "completed",
+      review_rounds: 2,
+      phase_commit_sha: "b".repeat(40),
+      committed_at: "2026-01-01T00:00:00.000Z",
+      execution_report_paths: [],
+      review_report_paths: [],
+      unresolved_findings: [],
+    }],
+  } as WorkflowState;
+  const event: StageBStatusEvent = {
+    phase_id: "phase-01",
+    round: 2,
+    executor_status: "complete",
+    reviewer_status: "pass",
+    message: "Phase committed at bbb.",
+    plan: { phase_ids: ["phase-01", "phase-02"], phase_statuses: ["completed", "pending"], current_index: 1, review_round_limit: 5 },
+  };
+  assert.deepEqual(phaseCompletedEntry(event, state), {
+    run_id: "run-1",
+    phase_id: "phase-01",
+    phase_index: 1,
+    phase_total: 2,
+    review_rounds: 2,
+    commit: "b".repeat(40),
+    committed_at: "2026-01-01T00:00:00.000Z",
+  });
+  assert.equal(phaseCompletedEntry({ ...event, reviewer_status: "rework" }, state), undefined);
+  const { plan: _plan, ...withoutPlan } = event;
+  assert.equal(phaseCompletedEntry(withoutPlan, state), undefined);
+});
+
 test("the workflow_paused event carries the structured cause for the timeline", () => {
   const state = {
     version: 1,
@@ -276,6 +319,7 @@ test("plan_execute_finalize cannot accept a model-supplied run_id", () => {
       if (tool.name === "plan_execute_finalize") finalizeTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     registerEntryRenderer() {},
     on() { return () => {}; },
   };

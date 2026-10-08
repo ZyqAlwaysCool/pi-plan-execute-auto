@@ -1089,6 +1089,10 @@ test("a watchdog abort during Executor execution emits an interrupted status wit
     assert.equal(terminal.reviewer_status, "interrupted");
     assert.equal(terminal.pause?.code, "TIMEOUT");
     assert.match(terminal.message, /\[TIMEOUT\]/);
+    assert.deepEqual(terminal.plan?.phase_ids, ["phase-01"]);
+    assert.deepEqual(terminal.plan?.phase_statuses, ["paused"]);
+    assert.equal(terminal.plan?.current_index, 0);
+    assert.equal(typeof terminal.plan?.review_round_limit, "number");
     assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "1");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
