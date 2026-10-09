@@ -208,6 +208,33 @@ test("very narrow widths degrade to the current phase only", () => {
   assert.ok(visibleWidth(parts[0]!.text) <= 23);
 });
 
+test("many phases degrade to a window around the current phase", () => {
+  const ids = Array.from({ length: 12 }, (_, index) => `phase-${index + 1}-name`);
+  const statuses = ids.map((_, index) =>
+    (index < 5 ? "completed" : index === 5 ? "running" : "pending") as PhaseRuntimeStatus);
+  const snapshot = plan(ids, statuses, 5);
+  const parts = layoutPlanChecklist(snapshot, 100, { round: 1 });
+  const line = parts.map((part) => part.text).join(CHECKLIST_SEPARATOR);
+  assert.ok(visibleWidth(line) <= 99, `"${line}" exceeds width`);
+  assert.ok(parts.length < 12, "window must elide distant phases");
+  assert.match(line, /▶ phase-6/);
+  assert.match(line, /…/);
+  assert.ok(!line.includes("phase-1-"), "leading hidden phases are elided");
+  assert.ok(!line.includes("phase-12-"), "trailing hidden phases are elided");
+});
+
+test("windowed checklist keeps the current phase readable at narrow widths", () => {
+  const ids = Array.from({ length: 10 }, (_, index) => `phase-${index + 1}-component`);
+  const statuses = ids.map((_, index) =>
+    (index < 6 ? "completed" : index === 6 ? "running" : "pending") as PhaseRuntimeStatus);
+  const snapshot = plan(ids, statuses, 6);
+  const parts = layoutPlanChecklist(snapshot, 60, { round: 3 });
+  const line = parts.map((part) => part.text).join(CHECKLIST_SEPARATOR);
+  assert.ok(visibleWidth(line) <= 59, `"${line}" exceeds width`);
+  assert.match(line, /▶ phase-7-com… \(r3\/5\)/);
+  assert.match(line, /…/);
+});
+
 test("widget spins while live and stops on stall, stop, and dispose", () => {
   const { model, advance } = testClock();
   const tui = { requestRender: () => {} } as unknown as TUI;

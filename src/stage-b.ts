@@ -7,6 +7,7 @@ import {
   phaseCommitMessage,
   phaseCompletionPayloadSha256,
   phaseEvidenceHashesForRecord,
+  type GitHistorySnapshot,
   type PhaseEvidenceHashes,
   type WorkspaceSnapshot,
 } from "./git.js";
@@ -96,8 +97,25 @@ function snapshotsEqual(left: WorkspaceSnapshot, right: WorkspaceSnapshot): bool
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function historyAndIndexEqual(left: WorkspaceSnapshot, right: WorkspaceSnapshot): boolean {
-  return left.head === right.head && left.branch === right.branch && left.refs === right.refs && left.reflog === right.reflog && left.unreachable === right.unreachable && left.ignored === right.ignored && left.index === right.index;
+const GIT_HISTORY_FIELDS = ["head", "branch", "refs", "reflog", "unreachable", "index"] as const;
+
+function changedGitHistoryFields(left: GitHistorySnapshot, right: GitHistorySnapshot): string[] {
+  return GIT_HISTORY_FIELDS.filter((field) => left[field] !== right[field]);
+}
+
+/**
+ * Gitignored dependency/build artifacts are outside the phase commit boundary. They may change
+ * freely while the Executor installs or builds, but the Reviewer is told when they changed so
+ * acceptance poisoning stays visible instead of silent.
+ */
+function ignoredChangeNote(before: string, after: string): string | undefined {
+  if (before === after) return undefined;
+  return [
+    "The Executor changed gitignored dependency/build artifacts.",
+    `ignored top-level entries before: ${before}`,
+    `ignored top-level entries after: ${after}`,
+    "Ignored artifacts never enter the phase commit; inspect them only if they could influence acceptance or hide unreviewed behavior.",
+  ].join("\n");
 }
 
 function deliverableSnapshotsEqual(left: WorkspaceSnapshot, right: WorkspaceSnapshot): boolean {
@@ -216,12 +234,13 @@ export class StageBController {
     return changed.filter((path) => !isPathAllowed(path, phase.acceptance.scope.allowed_paths));
   }
 
-  private async assertNoHistoryOrIndexMutation(before: WorkspaceSnapshot, actor: string): Promise<WorkspaceSnapshot> {
-    const after = await this.options.git.snapshot(this.gitOptions());
-    if (!historyAndIndexEqual(before, after)) {
+  private async assertNoHistoryOrIndexMutation(before: GitHistorySnapshot, actor: string): Promise<GitHistorySnapshot> {
+    const after = await this.options.git.historySnapshot(this.gitOptions());
+    const changed = changedGitHistoryFields(before, after);
+    if (changed.length > 0) {
       throw new WorkflowPauseError(
         "HARNESS_CHANGED_HISTORY",
-        `${actor} changed Git HEAD, branch refs, reflog, unreachable objects, ignored files, or index; no reset was attempted.`,
+        `${actor} changed Git ${changed.join(", ")}; no reset was attempted.`,
       );
     }
     return after;
@@ -379,10 +398,13 @@ export class StageBController {
         phase.acceptance,
       );
       const head = await this.options.git.head(this.gitOptions());
-      if (head !== evidence.record.phase_commit_sha) {
+      if (
+        head !== evidence.record.phase_commit_sha &&
+        !(await this.options.git.isAncestor(evidence.record.phase_commit_sha, head, this.gitOptions()))
+      ) {
         throw new WorkflowPauseError(
           "COMPLETION_HEAD_MISMATCH",
-          `Completion record expects HEAD ${evidence.record.phase_commit_sha}, but worktree is at ${head}.`,
+          `Completion record commit ${evidence.record.phase_commit_sha} is not an ancestor of worktree HEAD ${head}; the plugin did not reset anything.`,
         );
       }
       try {
@@ -469,6 +491,7 @@ export class StageBController {
     execution: ExecutionReport,
     acceptance: AcceptanceResult[],
     history: ReviewReport[],
+    workspaceNote?: string,
   ): string {
     const previousFindings = history.flatMap((report) => report.findings).map((finding) => ({
       id: finding.id,
@@ -517,6 +540,7 @@ export class StageBController {
       promptSection("CURRENT PHASE SPEC", phase.spec, 20_000),
       promptSection("CURRENT PHASE ACCEPTANCE CONTRACT", JSON.stringify(phase.acceptance, null, 2), 12_000),
       promptSection("ACTUAL DIFF PREVIEW (the full immutable patch is at complete_canonical_diff_path)", diff || "(no tracked or untracked changes)", 24_000),
+      ...(workspaceNote ? [promptSection("EXECUTOR WORKSPACE NOTE (advisory; ignored artifacts are outside the phase commit boundary)", workspaceNote, 4_000)] : []),
       promptSection("EXECUTOR REPORT (evidence to verify, not authority)", JSON.stringify(execution, null, 2), 12_000),
       promptSection("PLUGIN ACCEPTANCE RESULTS", JSON.stringify(acceptance, null, 2), 10_000),
       promptSection("PREVIOUS REVIEW REPORT PATHS (all must remain in scope)", JSON.stringify(reportPaths, null, 2), 8_000),
@@ -671,7 +695,8 @@ export class StageBController {
       await this.options.git.assertNoCachedChanges(this.gitOptions());
       const initialDiff = await this.options.git.diffFrom(baseCommit, this.gitOptions());
       const beforeExecutorReports = await this.captureReportHashes(phase);
-      const beforeExecutorSnapshot = await this.options.git.snapshot(this.gitOptions());
+      const beforeExecutorHistory = await this.options.git.historySnapshot(this.gitOptions());
+      const beforeExecutorIgnored = await this.options.git.ignoredSummary(this.gitOptions());
       this.emit({
         phase_id: phase.phase.id,
         round,
@@ -722,7 +747,11 @@ export class StageBController {
         );
       }
       freshResumeTurn = false;
-      await this.assertNoHistoryOrIndexMutation(beforeExecutorSnapshot, "Executor");
+      await this.assertNoHistoryOrIndexMutation(beforeExecutorHistory, "Executor");
+      const executorWorkspaceNote = ignoredChangeNote(
+        beforeExecutorIgnored,
+        await this.options.git.ignoredSummary(this.gitOptions()),
+      );
       await this.assertReportHashes(beforeExecutorReports, "Executor");
       await this.assertPackageUnchanged();
       await this.assertCompletedEvidence();
@@ -736,9 +765,9 @@ export class StageBController {
       const evidenceError = validateExecutionEvidence(execution, phase.acceptance, actualChanged);
       const outOfScope = await this.assertScope(phase);
       const beforeAcceptanceReports = await this.captureReportHashes(phase);
-      const beforeAcceptanceSnapshot = await this.options.git.snapshot(this.gitOptions());
+      const beforeAcceptanceHistory = await this.options.git.historySnapshot(this.gitOptions());
       const acceptance = await runAcceptance(phase.acceptance, this.options.acceptanceRunner, this.acceptanceOptions());
-      await this.assertNoHistoryOrIndexMutation(beforeAcceptanceSnapshot, "Deterministic acceptance");
+      await this.assertNoHistoryOrIndexMutation(beforeAcceptanceHistory, "Deterministic acceptance");
       await this.assertReportHashes(beforeAcceptanceReports, "Deterministic acceptance");
       await this.assertCompletedEvidence();
       await this.writeAcceptanceResults(phase, round, acceptance);
@@ -769,7 +798,7 @@ export class StageBController {
       let review: ReviewReport;
       try {
         const raw = await this.options.harness.review(
-          this.reviewerPrompt(phase, baseCommit, round, reviewDiff, reviewDiffAbsolute, reviewDiffSha256, execution, acceptance, history),
+          this.reviewerPrompt(phase, baseCommit, round, reviewDiff, reviewDiffAbsolute, reviewDiffSha256, execution, acceptance, history, executorWorkspaceNote),
           round,
           harnessOptions,
         );

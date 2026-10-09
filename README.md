@@ -38,6 +38,8 @@ The process continues until all phases have development, self-test, independent 
 
 Only integrity/execution failures that genuinely require human attention are persisted as `paused`—for example package/evidence tampering, worktree identity mismatch, broken completion evidence, or an execution process restart that would violate the same-session invariant. Ordinary start prerequisites remain retryable with `/plan-execute start <run-id>`.
 
+Gitignored dependency and build artifacts (for example `node_modules/` and `dist/`) are outside the phase commit boundary. Executor installs/builds and deterministic acceptance may create or update them without pausing the run, and the Executor's ignored-tree summary is surfaced to the Reviewer as advisory evidence. Git history, branch refs, reflogs, unreachable objects, the index, and every Reviewer workspace byte (including ignored files) remain fail-closed.
+
 ## Commands
 
 The normal command surface is intentionally small:
@@ -45,13 +47,15 @@ The normal command surface is intentionally small:
 ```text
 /plan-execute
 /plan-execute setup
+/plan-execute settings [run-id]
 /plan-execute start <run-id>
 /plan-execute stop <run-id>
 /plan-execute status <run-id>
 ```
 
 - `/plan-execute` formalizes the current planning discussion into a draft and opens Review & Approval.
-- `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout.
+- `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout in one full wizard.
+- `settings [run-id]` reopens only the individual settings as a menu, without repeating the whole wizard. With no run id it targets project defaults; with a run id it also syncs that frozen run's persisted settings so an explicit resume stays allowed. Model/effort changes apply to sessions created after the next resume; the timeout is operational and never invalidates a frozen run.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
 - `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint.
 - `stop <run-id>` (or the `Ctrl+Shift+X` shortcut) requests a safe stop of an active execution and pauses without committing.
@@ -99,7 +103,7 @@ Each Executor/Reviewer session has a small transcript under `.runtime/sessions/e
 
 Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
 
-The main UI is deliberately compact: the live widget keeps the run id, `N/M phases` progress, a full phase-name checklist (`✓` completed, `▶` current, `⏸` paused, `○` pending) with the current review round, the whole-run budget, the latest ACP activity (spinner + `evt/s`), and the latest status message, while detailed diagnostics live in the run directory. Each completed phase also appends a durable `Phase N/M … committed` entry to the session, so progress survives even when the live widget is missed. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
+The main UI is deliberately compact: the live widget keeps the run id, `N/M phases` progress, a full phase-name checklist (`✓` completed, `▶` current, `⏸` paused, `○` pending) with the current review round, the whole-run budget, the latest ACP activity (spinner + `evt/s`), and the latest status message, while detailed diagnostics live in the run directory. Each completed phase also appends a durable `Phase N/M … committed` entry to the session, so progress survives even when the live widget is missed. The pinned widget only exists while a run is actionable (running or paused); a completed or cancelled run releases it and leaves a chat summary with the run id, phase count, and branch, so the same Main Pi session stays clean for the next plan. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
 
 ## Full native Agent CLI sessions
 

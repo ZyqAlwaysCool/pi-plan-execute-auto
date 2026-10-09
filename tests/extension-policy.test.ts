@@ -2,24 +2,126 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { StageBStatusEvent, WorkflowState } from "../src/types.js";
 import planExecuteAuto, {
+  applyProfileToFrozenState,
   approvalStartsStageB,
   budgetWarningEvent,
   buildFinalizePrompt,
   evaluateResumeEligibility,
+  frozenProfileMismatch,
   linkedAbortSignal,
   parsePlanExecuteCommand,
   phaseCompletedEntry,
+  presentRunState,
   selectStageBReasoningEffort,
   stageBStartDisposition,
+  startStageBInBackground,
   workflowPausedEvent,
 } from "../extensions/index.js";
 import { createPauseRecord } from "../src/pause.js";
+import type { ProjectPluginProfile } from "../src/plugin-config.js";
 
 test("Stage B accepts only explicit supported ACP reasoning levels", () => {
   assert.equal(selectStageBReasoningEffort(undefined), undefined);
   assert.equal(selectStageBReasoningEffort(""), undefined);
   for (const effort of ["low", "medium", "high", "max"]) assert.equal(selectStageBReasoningEffort(effort), effort);
   assert.throws(() => selectStageBReasoningEffort("ultra"), /accepts only low, medium, high, or max/);
+});
+
+test("settings sync keeps a frozen run identical to the approved profile", () => {
+  const state = {
+    version: 1,
+    run_id: "run-1",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/run-1",
+    status: "paused",
+    created_at: new Date().toISOString(),
+    phases: [],
+    executor_model: "opencode/old",
+    reviewer_model: "codex/old-sol",
+    reasoning_effort: "low",
+    executor_reasoning_effort: "medium",
+    permission_mode: "ask",
+    review_round_limit: 3,
+    stage_timeout_ms: 1_000,
+  } as unknown as WorkflowState;
+  const profile = {
+    version: 1,
+    projectRoot: "/tmp/project",
+    gitEntry: "1:2",
+    executorModel: "opencode/deepseek-local/deepseek-flash",
+    reviewerModel: "pi/deepseek-local/deepseek-flash",
+    executorReasoningEffort: "high",
+    reviewerReasoningEffort: "max",
+    permissionMode: "autonomous",
+    reviewRoundLimit: 12,
+    stageTimeoutMs: 0,
+    configSha256: "b".repeat(64),
+    networkRiskApprovedAt: new Date().toISOString(),
+  } as ProjectPluginProfile;
+  const changed = applyProfileToFrozenState(state, profile);
+  assert.deepEqual(frozenProfileMismatch(state, profile), []);
+  assert.ok(changed.includes("reviewer_model"));
+  assert.ok(changed.includes("reasoning_effort"), "legacy shared effort must be cleared");
+  assert.equal((state as unknown as Record<string, unknown>).reasoning_effort, undefined);
+  assert.equal(state.executor_reasoning_effort, "high");
+  assert.equal(state.reviewer_reasoning_effort, "max");
+  assert.equal(state.permission_mode, "autonomous");
+  assert.equal(state.review_round_limit, 12);
+  assert.equal(state.stage_timeout_ms, 0);
+});
+
+function widgetState(status: WorkflowState["status"], phaseStatuses: Array<"completed" | "paused" | "pending" | "running">): WorkflowState {
+  return {
+    version: 1,
+    run_id: "run-widget",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/run-widget",
+    status,
+    created_at: new Date().toISOString(),
+    phases: phaseStatuses.map((phaseStatus, index) => ({
+      phase_id: `phase-0${index + 1}`,
+      status: phaseStatus,
+      review_rounds: 1,
+      execution_report_paths: [],
+      review_report_paths: [],
+      unresolved_findings: [],
+    })),
+    review_round_limit: 5,
+    branch_name: "pi-plan-execute-auto/run-widget",
+  } as unknown as WorkflowState;
+}
+
+test("completed runs release the Main Pi widget while paused runs stay pinned", () => {
+  const calls: Array<[string, unknown]> = [];
+  const ctx = {
+    hasUI: true,
+    ui: { setWidget: (key: string, value: unknown) => { calls.push([key, value]); } },
+  } as unknown as Parameters<typeof presentRunState>[0];
+
+  presentRunState(ctx, widgetState("completed", ["completed", "completed"]));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]![1], undefined, "completed runs clear the widget");
+
+  calls.length = 0;
+  const paused = widgetState("paused", ["completed", "paused"]);
+  paused.pause = createPauseRecord({ code: "HARNESS_ERROR", stage: "unknown", summary: "boom" });
+  presentRunState(ctx, paused);
+  assert.equal(calls.length, 1);
+  assert.ok(Array.isArray(calls[0]![1]), "paused runs keep the static widget");
+});
+
+test("background completion reports run, phases, and branch after releasing the widget", async () => {
+  const messages: string[] = [];
+  startStageBInBackground({
+    start: async () => ({ status: "completed", state: widgetState("completed", ["completed", "completed"]) }),
+    notify: (message) => { messages.push(message); },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(messages.length, 1);
+  assert.match(messages[0]!, /completed/);
+  assert.match(messages[0]!, /run-widget/);
+  assert.match(messages[0]!, /2\/2 phases/);
+  assert.match(messages[0]!, /branch pi-plan-execute-auto\/run-widget/);
 });
 
 test("only the human Approve & Start decision authorizes Stage B", () => {
@@ -45,6 +147,9 @@ test("plan-execute accepts an inline natural-language directive without confusin
 
 test("plan-execute reserves only explicit control commands and validates their arity", () => {
   assert.deepEqual(parsePlanExecuteCommand("setup"), { kind: "setup" });
+  assert.deepEqual(parsePlanExecuteCommand("settings"), { kind: "settings" });
+  assert.deepEqual(parsePlanExecuteCommand("settings run-123"), { kind: "settings", runId: "run-123" });
+  assert.deepEqual(parsePlanExecuteCommand("settings run-123 extra"), { kind: "usage" });
   assert.deepEqual(parsePlanExecuteCommand("start run-123"), { kind: "start", runId: "run-123" });
   assert.deepEqual(parsePlanExecuteCommand("resume run-123"), { kind: "resume", runId: "run-123" });
   assert.deepEqual(parsePlanExecuteCommand("stop run-123"), { kind: "stop", runId: "run-123" });

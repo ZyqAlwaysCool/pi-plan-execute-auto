@@ -51,6 +51,10 @@ const RATE_WINDOW_MS = 1_000;
 export const CHECKLIST_SEPARATOR = " · ";
 export const CHECKLIST_MARKERS = { completed: "✓", current: "▶", paused: "⏸", pending: "○" } as const;
 const MIN_PHASE_NAME_WIDTH = 6;
+/** Plans with at least this many phases use the windowed fallback before collapsing to one line. */
+const WINDOW_MIN_PHASES = 8;
+/** Window radii tried around the current phase, largest first. */
+const WINDOW_RADII = [2, 1] as const;
 
 export type StatusWidgetRole = "executor" | "reviewer";
 export type StatusWidgetTheme = Pick<Theme, "fg">;
@@ -101,7 +105,9 @@ export function stalledFor(snapshot: StageBActivitySnapshot, now: number): numbe
  *
  * Full phase names are the default. When the full line does not fit, names are
  * truncated proportionally (the current phase keeps the remainder so it stays
- * readable); when even that is impossible the list degrades to a single
+ * readable). With many phases (usually 10+ on an ordinary terminal) that still
+ * cannot fit, the list windows around the current phase and elides hidden spans
+ * with `…`. Only at extreme widths does it degrade to a single
  * `▶ 2/4 phase-2-render` entry. All measurements use terminal cell width, so
  * CJK phase names truncate on character boundaries instead of byte counts.
  */
@@ -130,39 +136,111 @@ export function layoutPlanChecklist(
     return { id, marker, suffix, kind };
   });
 
-  const full = parts.map((part) => `${part.marker} ${part.id}${part.suffix}`).join(CHECKLIST_SEPARATOR);
+  const full = parts.map(renderChecklistPart).join(CHECKLIST_SEPARATOR);
   if (visibleWidth(full) <= available) {
-    return parts.map((part) => ({ text: `${part.marker} ${part.id}${part.suffix}`, kind: part.kind }));
+    return parts.map((part) => ({ text: renderChecklistPart(part), kind: part.kind }));
   }
 
-  const separatorWidth = visibleWidth(CHECKLIST_SEPARATOR);
-  const fixedWidth = parts.reduce((sum, part) => sum + visibleWidth(part.marker) + 1 + visibleWidth(part.suffix), 0) +
-    separatorWidth * (total - 1);
-  const nameBudgetTotal = available - fixedWidth;
   const currentIndex = parts.findIndex((part) => part.kind === "current");
-
-  if (nameBudgetTotal >= total * MIN_PHASE_NAME_WIDTH) {
-    const equalShare = Math.floor(nameBudgetTotal / total);
-    const shortIndices: number[] = [];
-    const longIndices: number[] = [];
-    parts.forEach((part, index) => (visibleWidth(part.id) <= equalShare ? shortIndices : longIndices).push(index));
-    const shortWidth = shortIndices.reduce((sum, index) => sum + visibleWidth(parts[index]!.id), 0);
-    const longSpace = nameBudgetTotal - shortWidth;
-    const longBase = longIndices.length > 0 ? Math.floor(longSpace / longIndices.length) : 0;
-    const longRemainder = longIndices.length > 0 ? longSpace - longBase * longIndices.length : 0;
-    return parts.map((part, index) => {
-      if (shortIndices.includes(index)) return { text: `${part.marker} ${part.id}${part.suffix}`, kind: part.kind };
-      const budget = Math.max(2, longBase + (index === currentIndex ? longRemainder : 0));
-      return { text: `${part.marker} ${stripTerminalSequences(truncateToWidth(part.id, budget, "…"))}${part.suffix}`, kind: part.kind };
-    });
-  }
+  const truncated = layoutTruncatedChecklist(parts, available, currentIndex);
+  if (truncated) return truncated;
 
   const focusIndex = currentIndex >= 0 ? currentIndex : total - 1;
+  if (total >= WINDOW_MIN_PHASES) {
+    const windowed = layoutWindowChecklist(parts, focusIndex, available);
+    if (windowed) return windowed;
+  }
+
   const focus = parts[focusIndex]!;
   return [{
     text: stripTerminalSequences(truncateToWidth(`${focus.marker} ${focusIndex + 1}/${total} ${focus.id}${focus.suffix}`, available, "…")),
     kind: focus.kind,
   }];
+}
+
+interface InternalChecklistPart {
+  id: string;
+  marker: string;
+  suffix: string;
+  kind: ChecklistPartKind;
+}
+
+function renderChecklistPart(part: InternalChecklistPart): string {
+  return `${part.marker} ${part.id}${part.suffix}`;
+}
+
+/** Proportional name truncation for a fixed list of phases; undefined when even the minimum per-name width cannot fit. */
+function layoutTruncatedChecklist(
+  parts: readonly InternalChecklistPart[],
+  available: number,
+  currentIndex: number,
+): ChecklistPart[] | undefined {
+  const total = parts.length;
+  const separatorWidth = visibleWidth(CHECKLIST_SEPARATOR);
+  const fixedWidth = parts.reduce((sum, part) => sum + visibleWidth(part.marker) + 1 + visibleWidth(part.suffix), 0) +
+    separatorWidth * (total - 1);
+  const nameBudgetTotal = available - fixedWidth;
+  if (nameBudgetTotal < total * MIN_PHASE_NAME_WIDTH) return undefined;
+  const equalShare = Math.floor(nameBudgetTotal / total);
+  const shortIndices: number[] = [];
+  const longIndices: number[] = [];
+  parts.forEach((part, index) => (visibleWidth(part.id) <= equalShare ? shortIndices : longIndices).push(index));
+  const shortWidth = shortIndices.reduce((sum, index) => sum + visibleWidth(parts[index]!.id), 0);
+  const longSpace = nameBudgetTotal - shortWidth;
+  const longBase = longIndices.length > 0 ? Math.floor(longSpace / longIndices.length) : 0;
+  const longRemainder = longIndices.length > 0 ? longSpace - longBase * longIndices.length : 0;
+  return parts.map((part, index) => {
+    if (shortIndices.includes(index)) return { text: renderChecklistPart(part), kind: part.kind };
+    const budget = Math.max(2, longBase + (index === currentIndex ? longRemainder : 0));
+    return { text: `${part.marker} ${stripTerminalSequences(truncateToWidth(part.id, budget, "…"))}${part.suffix}`, kind: part.kind };
+  });
+}
+
+/** Windowed fallback: keep the current phase readable, elide hidden spans with `…`, never exceed the width. */
+function layoutWindowChecklist(
+  parts: readonly InternalChecklistPart[],
+  focusIndex: number,
+  available: number,
+): ChecklistPart[] | undefined {
+  const total = parts.length;
+  const separatorWidth = visibleWidth(CHECKLIST_SEPARATOR);
+  for (const radius of WINDOW_RADII) {
+    const start = Math.max(0, focusIndex - radius);
+    const end = Math.min(total - 1, focusIndex + radius);
+    const entries: Array<{ part?: InternalChecklistPart; ellipsis?: boolean }> = [];
+    if (start > 0) entries.push({ ellipsis: true });
+    for (let index = start; index <= end; index += 1) entries.push({ part: parts[index]! });
+    if (end < total - 1) entries.push({ ellipsis: true });
+
+    const fixedWidth = entries.reduce(
+      (sum, entry) => sum + (entry.ellipsis ? visibleWidth("…") : visibleWidth(entry.part!.marker) + 1 + visibleWidth(entry.part!.suffix)),
+      0,
+    ) + separatorWidth * (entries.length - 1);
+    const realIndices = entries.map((entry, index) => (entry.part ? index : -1)).filter((index) => index >= 0);
+    if (realIndices.length === 0) continue;
+    const nameBudgetTotal = available - fixedWidth;
+    if (nameBudgetTotal < realIndices.length * MIN_PHASE_NAME_WIDTH) continue;
+
+    const equalShare = Math.floor(nameBudgetTotal / realIndices.length);
+    const shortIndices: number[] = [];
+    const longIndices: number[] = [];
+    for (const index of realIndices) {
+      (visibleWidth(entries[index]!.part!.id) <= equalShare ? shortIndices : longIndices).push(index);
+    }
+    const shortWidth = shortIndices.reduce((sum, index) => sum + visibleWidth(entries[index]!.part!.id), 0);
+    const longSpace = nameBudgetTotal - shortWidth;
+    const longBase = longIndices.length > 0 ? Math.floor(longSpace / longIndices.length) : 0;
+    const longRemainder = longIndices.length > 0 ? longSpace - longBase * longIndices.length : 0;
+    const currentEntry = entries.findIndex((entry) => entry.part?.kind === "current");
+    return entries.map((entry, index) => {
+      if (entry.ellipsis) return { text: "…", kind: "pending" as const };
+      const part = entry.part!;
+      if (shortIndices.includes(index)) return { text: renderChecklistPart(part), kind: part.kind };
+      const budget = Math.max(2, longBase + (index === currentEntry ? longRemainder : 0));
+      return { text: `${part.marker} ${stripTerminalSequences(truncateToWidth(part.id, budget, "…"))}${part.suffix}`, kind: part.kind };
+    });
+  }
+  return undefined;
 }
 
 /** Plain checklist text for static summaries; see {@link layoutPlanChecklist}. */

@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import type {
@@ -144,6 +144,7 @@ export function buildFinalizePrompt(directive?: string): string {
 export type PlanExecuteCommand =
   | { kind: "finalize"; directive?: string }
   | { kind: "setup" }
+  | { kind: "settings"; runId?: string }
   | { kind: "start"; runId: string }
   | { kind: "resume"; runId: string }
   | { kind: "stop"; runId: string }
@@ -161,6 +162,11 @@ export function parsePlanExecuteCommand(args: string): PlanExecuteCommand {
     return directive ? { kind: "finalize", directive } : { kind: "finalize" };
   }
   if (action === "setup") return tokens.length === 1 ? { kind: "setup" } : { kind: "usage" };
+  if (action === "settings") {
+    if (tokens.length === 1) return { kind: "settings" };
+    if (tokens.length === 2) return { kind: "settings", runId: tokens[1]! };
+    return { kind: "usage" };
+  }
   if (action === "start") return tokens.length === 2 ? { kind: "start", runId: tokens[1]! } : { kind: "usage" };
   if (action === "resume") return tokens.length === 2 ? { kind: "resume", runId: tokens[1]! } : { kind: "usage" };
   if (action === "stop") return tokens.length === 2 ? { kind: "stop", runId: tokens[1]! } : { kind: "usage" };
@@ -278,7 +284,7 @@ export function startStageBInBackground(options: {
   start: () => Promise<StartResult>;
   notify: (message: string, type: "info" | "warning" | "error") => void;
   notStarted?: (reason: string | undefined) => string;
-  completed?: (status: StartResult["status"]) => string;
+  completed?: (result: StageBRunResult) => string;
 }): void {
   void options.start().then((result) => {
     if (result.status === "not_started") {
@@ -286,7 +292,17 @@ export function startStageBInBackground(options: {
       return;
     }
     if (result.status === "paused") return; // persistAndEscalatePause already reported the cause
-    options.notify(options.completed?.(result.status) ?? `Execution & Review ${result.status}.`, "info");
+    if (result.status !== "completed") {
+      options.notify(`Execution & Review ${result.status}.`, "warning");
+      return;
+    }
+    const state = result.state;
+    const completed = state.phases.filter((phase) => phase.status === "completed").length;
+    const branch = state.branch_name ? ` · branch ${state.branch_name}` : "";
+    options.notify(
+      options.completed?.(result as StageBRunResult) ?? `Execution & Review completed · ${state.run_id} · ${completed}/${state.phases.length} phases${branch}.`,
+      "info",
+    );
   }).catch((error) => {
     options.notify(error instanceof Error ? error.message : String(error), "error");
   });
@@ -305,6 +321,19 @@ function showWidget(ctx: ExtensionContext, lines: string[]): void {
 
 function clearWidget(ctx: ExtensionContext): void {
   if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
+}
+
+/**
+ * Terminal runs must not pin a widget in the Main Pi session: after a completed/cancelled run the
+ * user keeps chatting and may start another plan. Paused and running states stay visible because
+ * they are actionable. The completion summary is reported through notify/transcript entries instead.
+ */
+export function presentRunState(ctx: ExtensionContext, state: WorkflowState): void {
+  if (state.status === "completed" || state.status === "cancelled") {
+    clearWidget(ctx);
+    return;
+  }
+  showWidget(ctx, stateLines(state));
 }
 
 function stateLines(state: WorkflowState): string[] {
@@ -856,6 +885,243 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
     notify(ctx, saved
       ? `Project configured: Executor ${saved.executorModel} (${saved.executorReasoningEffort ?? saved.reasoningEffort ?? "backend default"}) → Reviewer ${saved.reviewerModel} (${saved.reviewerReasoningEffort ?? saved.reasoningEffort ?? "backend default"}); review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}. Run /plan-execute when the plan is ready for human review.`
       : "Setup cancelled; the previous project setup (if any) was left unchanged.", saved ? "info" : "warning");
+  } catch (error) {
+    notify(ctx, error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+interface EditableSettings {
+  executorModel: string;
+  reviewerModel: string;
+  executorReasoningEffort: ReasoningEffort | undefined;
+  reviewerReasoningEffort: ReasoningEffort | undefined;
+  permissionMode: AgentPermissionMode;
+  reviewRoundLimit: number;
+  stageTimeoutMs: number | undefined;
+}
+
+/**
+ * Keep a frozen run's persisted settings identical to the approved project profile so an explicit
+ * resume is not refused by `frozenProfileMismatch`. Timeout is synced for status display only; it is
+ * an operational policy and never invalidates a frozen run. Exported for tests.
+ */
+export function applyProfileToFrozenState(state: WorkflowState, profile: ProjectPluginProfile): string[] {
+  const record = state as unknown as Record<string, unknown>;
+  const changed: string[] = [];
+  const set = (key: string, value: unknown): void => {
+    if (record[key] !== value) {
+      record[key] = value;
+      changed.push(key);
+    }
+  };
+  const unset = (key: string): void => {
+    if (record[key] !== undefined) {
+      delete record[key];
+      changed.push(key);
+    }
+  };
+  set("executor_model", profile.executorModel);
+  set("reviewer_model", profile.reviewerModel);
+  if (profile.reasoningEffort) set("reasoning_effort", profile.reasoningEffort); else unset("reasoning_effort");
+  if (profile.executorReasoningEffort) set("executor_reasoning_effort", profile.executorReasoningEffort); else unset("executor_reasoning_effort");
+  if (profile.reviewerReasoningEffort) set("reviewer_reasoning_effort", profile.reviewerReasoningEffort); else unset("reviewer_reasoning_effort");
+  set("permission_mode", profile.permissionMode);
+  set("review_round_limit", profile.reviewRoundLimit);
+  set("stage_timeout_ms", stageTimeoutMs(profile));
+  return changed;
+}
+
+async function discoverRunIds(cwd: string): Promise<string[]> {
+  const root = join(cwd, ".pi-plan-execute-auto");
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return [];
+  }
+  const runs: string[] = [];
+  for (const entry of entries) {
+    if (!entry.startsWith("run-")) continue;
+    try {
+      await access(join(root, entry, ".state.json"));
+      runs.push(entry);
+    } catch {
+      // Not a persisted run directory.
+    }
+  }
+  return runs.sort();
+}
+
+async function persistSettings(
+  ctx: ExtensionCommandContext,
+  settings: EditableSettings,
+  loaded: Awaited<ReturnType<typeof loadValidatedRun>> | undefined,
+): Promise<ProjectPluginProfile> {
+  const profile = await saveProjectPluginProfile(ctx.cwd, {
+    executorModel: settings.executorModel,
+    reviewerModel: settings.reviewerModel,
+    ...(settings.executorReasoningEffort ? { executorReasoningEffort: settings.executorReasoningEffort } : {}),
+    ...(settings.reviewerReasoningEffort ? { reviewerReasoningEffort: settings.reviewerReasoningEffort } : {}),
+    permissionMode: settings.permissionMode,
+    reviewRoundLimit: settings.reviewRoundLimit,
+    ...(settings.stageTimeoutMs !== undefined ? { stageTimeoutMs: settings.stageTimeoutMs } : {}),
+  });
+  if (loaded) {
+    const changed = applyProfileToFrozenState(loaded.state, profile);
+    if (changed.length > 0) {
+      await writeWorkflowState(loaded.package.root, loaded.state);
+      await appendRunEvent(loaded.package.root, "workflow_settings_changed", {
+        run_id: loaded.state.run_id,
+        changed,
+        executor_model: profile.executorModel,
+        reviewer_model: profile.reviewerModel,
+        permission_mode: profile.permissionMode,
+        review_round_limit: profile.reviewRoundLimit,
+        stage_timeout_ms: stageTimeoutMs(profile),
+      }).catch(() => undefined);
+    }
+  }
+  return profile;
+}
+
+async function commandSettings(ctx: ExtensionCommandContext, runIdArg?: string): Promise<void> {
+  if (!ctx.hasUI) {
+    notify(ctx, "Settings requires Pi's interactive UI. Use /plan-execute setup for the full wizard.", "warning");
+    return;
+  }
+  try {
+    let runId = runIdArg;
+    if (!runId) {
+      const candidates = await discoverRunIds(ctx.cwd);
+      if (candidates.length > 0) {
+        const choice = await ctx.ui.select("Apply settings to", [
+          "Project defaults (new runs and resumes)",
+          ...candidates.map((id) => `Run: ${id}`),
+          "Cancel",
+        ]);
+        if (!choice || choice === "Cancel") return;
+        if (choice.startsWith("Run: ")) runId = choice.slice("Run: ".length);
+      }
+    }
+    let loaded: Awaited<ReturnType<typeof loadValidatedRun>> | undefined;
+    if (runId) {
+      if (activeRuns.has(runId)) {
+        notify(ctx, `Run ${runId} is executing. Stop it first with /plan-execute stop ${runId}; changed settings only apply to sessions created after a resume.`, "warning");
+        return;
+      }
+      try {
+        loaded = await loadValidatedRun(ctx.cwd, runId);
+      } catch (error) {
+        notify(ctx, `Cannot load ${runId}: ${error instanceof Error ? error.message : String(error)}`, "error");
+        return;
+      }
+      if (loaded.state.status === "completed" || loaded.state.status === "cancelled") {
+        notify(ctx, `Run ${runId} is ${loaded.state.status}; settings no longer affect it.`, "warning");
+        return;
+      }
+    }
+    let profile: ProjectPluginProfile | undefined;
+    try {
+      profile = await loadProjectPluginProfile(ctx.cwd);
+    } catch (error) {
+      notify(ctx, `Existing project setup could not be validated: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+    if (!profile && !loaded) {
+      notify(ctx, "No project configuration. Run /plan-execute setup first.", "warning");
+      return;
+    }
+
+    const settings: EditableSettings = {
+      executorModel: loaded?.state.executor_model ?? profile!.executorModel,
+      reviewerModel: loaded?.state.reviewer_model ?? profile!.reviewerModel,
+      executorReasoningEffort: loaded?.state.executor_reasoning_effort ?? loaded?.state.reasoning_effort ?? profile!.executorReasoningEffort ?? profile!.reasoningEffort,
+      reviewerReasoningEffort: loaded?.state.reviewer_reasoning_effort ?? loaded?.state.reasoning_effort ?? profile!.reviewerReasoningEffort ?? profile!.reasoningEffort,
+      permissionMode: loaded?.state.permission_mode ?? profile!.permissionMode,
+      reviewRoundLimit: loaded?.state.review_round_limit ?? profile!.reviewRoundLimit,
+      stageTimeoutMs: loaded?.state.stage_timeout_ms ?? profile!.stageTimeoutMs,
+    };
+
+    let clis: DetectedCli[] | undefined;
+    const detected = async (): Promise<DetectedCli[]> => {
+      clis ??= await withSetupProgress(ctx, "Detecting local Agent CLIs", discoverAcpClis);
+      return clis;
+    };
+    const catalogs = new Map<AcpBackend, Promise<string[]>>();
+    const catalog = (backend: AcpBackend): Promise<string[]> => {
+      let pending = catalogs.get(backend);
+      if (!pending) {
+        pending = probeAcpModels(ctx.cwd, backend);
+        catalogs.set(backend, pending);
+      }
+      return pending;
+    };
+    const effortCatalog = (model: string): Promise<ReasoningEffort[]> =>
+      probeAcpConfiguration(ctx.cwd, supportedBackendForModel(model), model).then((result) => result.efforts);
+
+    const autonomousLabel = "Autonomous — automatically approve agent tool permission requests";
+    const askLabel = "Ask me — pause and show each agent permission request in Pi";
+    const target = runId ? `run ${runId}` : "project defaults";
+
+    for (;;) {
+      const labels = [
+        `Executor model: ${settings.executorModel}`,
+        `Executor reasoning effort: ${settings.executorReasoningEffort ?? "backend default"}`,
+        `Reviewer model: ${settings.reviewerModel}`,
+        `Reviewer reasoning effort: ${settings.reviewerReasoningEffort ?? "backend default"}`,
+        `Agent permission mode: ${settings.permissionMode === "ask" ? "Ask me" : "Autonomous"}`,
+        `Review round limit: ${settings.reviewRoundLimit}`,
+        `Execution timeout: ${formatStageTimeout(settings.stageTimeoutMs)}`,
+        "Done",
+      ];
+      const choice = await ctx.ui.select(`Plan-execute settings · ${target}`, [...labels, "Cancel"]);
+      if (!choice || choice === "Cancel") return;
+      if (choice === "Done") break;
+
+      if (choice.startsWith("Executor model: ")) {
+        const model = await chooseConfiguredModel(ctx, "Executor", await detected(), catalog);
+        if (!model) continue;
+        settings.executorModel = model;
+        const effort = await chooseRoleEffort(ctx, "Executor", model, () => effortCatalog(model));
+        if (effort !== undefined) settings.executorReasoningEffort = effort === "default" ? undefined : effort;
+      } else if (choice.startsWith("Executor reasoning effort: ")) {
+        const effort = await chooseRoleEffort(ctx, "Executor", settings.executorModel, () => effortCatalog(settings.executorModel));
+        if (effort !== undefined) settings.executorReasoningEffort = effort === "default" ? undefined : effort;
+      } else if (choice.startsWith("Reviewer model: ")) {
+        const model = await chooseConfiguredModel(ctx, "Reviewer", await detected(), catalog);
+        if (!model) continue;
+        settings.reviewerModel = model;
+        const effort = await chooseRoleEffort(ctx, "Reviewer", model, () => effortCatalog(model));
+        if (effort !== undefined) settings.reviewerReasoningEffort = effort === "default" ? undefined : effort;
+      } else if (choice.startsWith("Reviewer reasoning effort: ")) {
+        const effort = await chooseRoleEffort(ctx, "Reviewer", settings.reviewerModel, () => effortCatalog(settings.reviewerModel));
+        if (effort !== undefined) settings.reviewerReasoningEffort = effort === "default" ? undefined : effort;
+      } else if (choice.startsWith("Agent permission mode: ")) {
+        const chosen = await ctx.ui.select("Agent permission handling during Execution & Review", [autonomousLabel, askLabel, "Cancel"]);
+        if (!chosen || chosen === "Cancel") continue;
+        settings.permissionMode = chosen === askLabel ? "ask" : "autonomous";
+      } else if (choice.startsWith("Review round limit: ")) {
+        const roundLabels = REVIEW_ROUND_CHOICES.map((value) => `${value} rounds${value === DEFAULT_MAX_REVIEW_ROUNDS ? " (recommended default)" : ""}`);
+        const chosen = await ctx.ui.select("Maximum review rounds per phase", [...roundLabels, "Cancel"]);
+        if (!chosen || chosen === "Cancel") continue;
+        const limit = REVIEW_ROUND_CHOICES[roundLabels.indexOf(chosen)];
+        if (!limit) continue;
+        settings.reviewRoundLimit = limit;
+      } else if (choice.startsWith("Execution timeout: ")) {
+        const ms = await chooseStageTimeout(ctx);
+        if (ms !== undefined) settings.stageTimeoutMs = ms;
+      } else {
+        continue;
+      }
+
+      const saved = await persistSettings(ctx, settings, loaded);
+      notify(ctx, [
+        `Settings saved${runId ? ` for ${runId}` : ""}.`,
+        `Executor: ${saved.executorModel} (${saved.executorReasoningEffort ?? saved.reasoningEffort ?? "backend default"})`,
+        `Reviewer: ${saved.reviewerModel} (${saved.reviewerReasoningEffort ?? saved.reasoningEffort ?? "backend default"})`,
+        `Review limit ${saved.reviewRoundLimit}; permissions ${saved.permissionMode}; timeout ${formatStageTimeout(saved.stageTimeoutMs)}`,
+        runId ? "Model/effort changes apply to sessions created after the next resume." : "",
+      ].filter(Boolean).join("\n"), "info");
+    }
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -1444,7 +1710,7 @@ async function startStageB(
     try {
       const reconciled = await reconcilePersistedCompletions(pi, ctx, pkg, state, { continueAfterRecovery: true });
       if (reconciled) {
-        showWidget(ctx, stateLines(reconciled.state));
+        presentRunState(ctx, reconciled.state);
         pi.appendEntry(STATE_ENTRY, reconciled.state);
         return reconciled;
       }
@@ -1787,7 +2053,7 @@ async function startStageB(
         }),
       );
     }
-    showWidget(ctx, stateLines(result.state));
+    presentRunState(ctx, result.state);
     pi.appendEntry(STATE_ENTRY, result.state);
     return result;
   } catch (error) {
@@ -2283,7 +2549,7 @@ async function commandResume(pi: ExtensionAPI, ctx: ExtensionCommandContext, run
       }),
       notify: (message, type) => notify(ctx, message, type),
       notStarted: (reason) => reason ?? "Resume did not start.",
-      completed: (status) => `Execution & Review ${status} after resume.`,
+      completed: (result) => `Execution & Review completed after resume · ${result.state.run_id}${result.state.branch_name ? ` · branch ${result.state.branch_name}` : ""}.`,
     });
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
@@ -2431,13 +2697,14 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       const command = parsePlanExecuteCommand(args);
       if (command.kind === "finalize") return commandFinalize(pi, ctx, command.directive);
       if (command.kind === "setup") return commandSetup(ctx);
+      if (command.kind === "settings") return commandSettings(ctx, command.runId);
       if (command.kind === "start") return commandStart(pi, ctx, command.runId);
       if (command.kind === "resume") return commandResume(pi, ctx, command.runId);
       if (command.kind === "stop") return commandStop(ctx, command.runId);
       if (command.kind === "status") return commandStatus(ctx, command.runId);
       notify(
         ctx,
-        "Usage: /plan-execute [自然语言指令] | finalize [指令] | setup | start <run-id> | resume <run-id> | stop <run-id> | status <run-id>",
+        "Usage: /plan-execute [自然语言指令] | finalize [指令] | setup | settings [run-id] | start <run-id> | resume <run-id> | stop <run-id> | status <run-id>",
         "info",
       );
     },
@@ -2488,7 +2755,10 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
       .find((entry) => entry.type === "custom" && entry.customType === STATE_ENTRY);
     if (latest && latest.type === "custom") {
       const state = latest.data as WorkflowState;
-      if (state && typeof state.run_id === "string") showWidget(ctx, stateLines(state));
+      // Completed/cancelled runs must not resurrect a pinned widget after a reload or restart.
+      if (state && typeof state.run_id === "string" && (state.status === "paused" || state.status === "running")) {
+        showWidget(ctx, stateLines(state));
+      }
     }
   });
 

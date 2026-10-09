@@ -36,7 +36,7 @@ test("background Stage B returns immediately and reports terminal results", asyn
   startStageBInBackground({
     start: () => pending,
     notify: (message, type) => notices.push({ message, type }),
-    completed: (status) => `done:${status}`,
+    completed: (result) => `done:${result.status}`,
   });
   // The launcher must not await; the caller (a typed command handler) has already returned.
   assert.deepEqual(notices, []);

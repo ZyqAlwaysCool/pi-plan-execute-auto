@@ -640,6 +640,7 @@ test("Executor commit followed by reset is detected from refs and reflog", async
     const result = await runController(setup, harness);
     assert.equal(result.status, "paused");
     assert.match(result.reason ?? "", /HARNESS_CHANGED_HISTORY/);
+    assert.match(result.reason ?? "", /Executor changed Git reflog, unreachable/);
     assert.equal((await git(setup.cwd, ["log", "-1", "--pretty=%s"])).stdout.trim(), "initial");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
@@ -788,27 +789,65 @@ test("Reviewer dependency-tree writes are detected and pause before commit", asy
   }
 });
 
-test("acceptance dependency-tree writes fail closed", async () => {
+test("acceptance dependency and build writes do not pause the phase", async () => {
   const setup = await setupRepo();
   try {
-    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\nnode_modules/\n", "utf8");
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\nnode_modules/\ndist/\n", "utf8");
     await git(setup.cwd, ["add", ".gitignore"]);
-    await git(setup.cwd, ["commit", "-qm", "ignore dependencies"]);
+    await git(setup.cwd, ["commit", "-qm", "ignore dependencies and build output"]);
     await mkdir(join(setup.cwd, "node_modules"), { recursive: true });
     const dependencyFile = join(setup.cwd, "node_modules", "dependency.js");
     await writeFile(dependencyFile, "original\n", "utf8");
     const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    let acceptanceCalls = 0;
     const result = await runController(setup, new FakeHarness(setup.cwd, base), 3, {
       acceptanceRunner: {
         async run() {
-          await writeFile(dependencyFile, "acceptance\n", "utf8");
+          acceptanceCalls += 1;
+          await mkdir(join(setup.cwd, "dist"), { recursive: true });
+          await writeFile(dependencyFile, `acceptance-${acceptanceCalls}\n`, "utf8");
+          await writeFile(join(setup.cwd, "dist", "app.js"), `built-${acceptanceCalls}\n`, "utf8");
           return { stdout: "", stderr: "", code: 0 };
         },
       },
     });
-    assert.equal(result.status, "paused");
-    assert.match(result.reason ?? "", /HARNESS_CHANGED_HISTORY/);
-    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "2");
+    assert.equal(result.status, "completed");
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "3");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("Executor dependency and build writes complete the phase and are surfaced to the Reviewer", async () => {
+  const setup = await setupRepo();
+  try {
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\nnode_modules/\ndist/\n", "utf8");
+    await git(setup.cwd, ["add", ".gitignore"]);
+    await git(setup.cwd, ["commit", "-qm", "ignore dependencies and build output"]);
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    let reviewPrompt = "";
+    const harness: HarnessPair = {
+      async execute() {
+        await mkdir(join(setup.cwd, "node_modules", "dependency"), { recursive: true });
+        await writeFile(join(setup.cwd, "node_modules", "dependency", "index.js"), "installed\n", "utf8");
+        await mkdir(join(setup.cwd, "dist"), { recursive: true });
+        await writeFile(join(setup.cwd, "dist", "app.js"), "built\n", "utf8");
+        await writeFile(join(setup.cwd, "src", "change.txt"), "executor\n", "utf8");
+        return execution(base);
+      },
+      async rework() { return execution(base); },
+      async review(prompt) {
+        reviewPrompt = prompt;
+        return review(base);
+      },
+      async close() {},
+    };
+    const result = await runController(setup, harness);
+    assert.equal(result.status, "completed");
+    assert.match(reviewPrompt, /EXECUTOR WORKSPACE NOTE/);
+    assert.match(reviewPrompt, /node_modules=1/);
+    assert.match(reviewPrompt, /dist=1/);
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "3");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
   }
@@ -1532,6 +1571,151 @@ test("resume reconciliation accepts a committed phase whose completion record la
     assert.equal(stale.status, "completed");
     assert.equal(stale.phases[0]?.status, "completed");
     assert.equal(stale.phases[0]?.phase_commit_sha, committedSha);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("resume after multiple completed phases accepts HEAD descending from earlier phase commits", async () => {
+  const setup = await setupRepo();
+  try {
+    const phaseIds = ["phase-01", "phase-02", "phase-03"] as const;
+    const runId = "three-phase-resume-test";
+    const input: FinalizeInput = {
+      run_id: runId,
+      manifest: {
+        version: 1,
+        documents: [],
+        phases: phaseIds.map((id, index) => ({
+          id,
+          order: index + 1,
+          spec: `phases/${id}.md`,
+          acceptance: `acceptance/${id}.yaml`,
+          commit: { required: true, message: `complete ${id}` },
+        })),
+      },
+      files: [
+        ...phaseIds.map((id) => ({ path: `phases/${id}.md`, content: `${id}\n` })),
+        ...phaseIds.map((id) => ({
+          path: `acceptance/${id}.yaml`,
+          content: [
+            "version: 1",
+            `phase_id: ${id}`,
+            "scope:",
+            "  allowed_paths:",
+            "    - src/**",
+            "self_tests:",
+            "  - id: unit",
+            "    command: \"true\"",
+            "    required: true",
+            "review:",
+            "  require_no_blocking_findings: true",
+            "commit:",
+            "  required: true",
+            "  allow_empty: false",
+            "",
+          ].join("\n"),
+        })),
+      ],
+    };
+    const written = await writeValidatedPackage(setup.cwd, input, runId);
+    const validation = await validatePackageDirectory(written.package.root);
+    assert.ok(validation.package);
+    const pkg = validation.package;
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+
+    const phaseInfo = (prompt: string): { phaseId: string; baseCommit: string } => ({
+      phaseId: /\nphase_id: (phase-\d\d)\n/.exec(prompt)?.[1] ?? "phase-01",
+      baseCommit: /\nphase_base_commit: ([0-9a-f]{40})\n/.exec(prompt)?.[1] ?? base,
+    });
+    const executionFor = (phaseId: string, baseCommit: string): ExecutionReport => ({
+      phase_id: phaseId,
+      round: 1,
+      base_commit: baseCommit,
+      status: "complete",
+      summary: "done",
+      changed_files: [`src/${phaseId}.txt`],
+      self_tests: [{ id: "unit", command: "true", status: "passed" }],
+      resolved_findings: [],
+      known_issues: [],
+    });
+    const reviewFor = (phaseId: string, baseCommit: string): ReviewReport => ({
+      phase_id: phaseId,
+      round: 1,
+      base_commit: baseCommit,
+      verdict: "PASS",
+      summary: "green",
+      findings: [],
+      evidence: ["checked"],
+      acceptance_assessment: "pass",
+      out_of_scope_changes: [],
+    });
+    const completePhase = async (prompt: string): Promise<ExecutionReport> => {
+      const { phaseId, baseCommit } = phaseInfo(prompt);
+      await writeFile(join(setup.cwd, "src", `${phaseId}.txt`), phaseId, "utf8");
+      return executionFor(phaseId, baseCommit);
+    };
+    const workspace = () => new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, {
+      cwd: setup.cwd,
+      runtimeRoot: `.pi-plan-execute-auto/${runId}`,
+    });
+    const acceptanceRunner: AcceptanceCommandRunner = { run: async () => ({ stdout: "", stderr: "", code: 0 }) };
+    const saveState = (next: Parameters<typeof writeWorkflowState>[1]) => writeWorkflowState(written.package.root, next);
+
+    // First run completes phase-01 and phase-02, then the phase-03 executor fails.
+    const first = createDraftState(pkg, runId);
+    first.status = "frozen";
+    const firstResult = await new StageBController({
+      package: pkg,
+      state: first,
+      git: workspace(),
+      acceptanceRunner,
+      harness: {
+        async execute(prompt) {
+          if (phaseInfo(prompt).phaseId === "phase-03") throw new Error("simulated executor backend failure");
+          return completePhase(prompt);
+        },
+        async rework() { throw new Error("unexpected rework"); },
+        async review(prompt, round) {
+          const { phaseId, baseCommit } = phaseInfo(prompt);
+          return { ...reviewFor(phaseId, baseCommit), round };
+        },
+        async close() {},
+      },
+      maxReviewRounds: 3,
+      requireDedicatedWorktree: false,
+      saveState,
+    }).run();
+    assert.equal(firstResult.status, "paused");
+    assert.match(firstResult.reason ?? "", /HARNESS_ERROR/);
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "3");
+
+    // Second run resumes with HEAD at phase-02's commit while phase-01 is already history.
+    const persisted = await readWorkflowState(written.package.root);
+    assert.ok(persisted);
+    assert.equal(persisted.phases[0]?.status, "completed");
+    assert.equal(persisted.phases[1]?.status, "completed");
+    const secondResult = await new StageBController({
+      package: pkg,
+      state: persisted,
+      git: workspace(),
+      acceptanceRunner,
+      harness: {
+        async execute(prompt) { return completePhase(prompt); },
+        async rework(prompt) { return completePhase(prompt); },
+        async review(prompt, round) {
+          const { phaseId, baseCommit } = phaseInfo(prompt);
+          return { ...reviewFor(phaseId, baseCommit), round };
+        },
+        async close() {},
+      },
+      maxReviewRounds: 3,
+      requireDedicatedWorktree: false,
+      resumePaused: true,
+      saveState,
+    }).run();
+    assert.equal(secondResult.status, "completed");
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "4");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
   }

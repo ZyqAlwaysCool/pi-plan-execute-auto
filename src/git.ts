@@ -42,16 +42,24 @@ export interface GitWorkspaceOptions {
   dedicatedWorktreePath?: string;
 }
 
-export interface WorkspaceSnapshot {
+/**
+ * Git commit/ref/reflog/index identity. This evidence is the plugin's commit-boundary guard and
+ * deliberately excludes gitignored dependency/build artifacts: those never enter a phase commit,
+ * so `npm install`/build output must not be mistaken for a history rewrite.
+ */
+export interface GitHistorySnapshot {
   head: string;
   branch: string;
   refs: string;
   reflog: string;
   unreachable: string;
+  index: string;
+}
+
+export interface WorkspaceSnapshot extends GitHistorySnapshot {
   status: string;
   ignored: string;
   workingTreeDiff: string;
-  index: string;
   fileHashes: string;
 }
 
@@ -325,6 +333,21 @@ function uniqueSorted(values: readonly string[]): string[] {
   return [...new Set(values)].sort();
 }
 
+/** Bounded, byte-free summary of gitignored entries grouped by their top-level path segment. */
+function summarizeIgnoredPaths(paths: readonly string[]): string {
+  if (paths.length === 0) return "(none)";
+  const counts = new Map<string, number>();
+  for (const path of paths) {
+    const separator = path.indexOf("/");
+    const topLevel = separator === -1 ? path : path.slice(0, separator);
+    counts.set(topLevel, (counts.get(topLevel) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([name, count]) => `${name}=${count}`)
+    .join(", ");
+}
+
 /**
  * Git adapter with the policy-sensitive operations kept in one place. Commands are passed as
  * argv, never through a shell, so file names and commit messages cannot become shell syntax.
@@ -361,6 +384,20 @@ export class GitWorkspace {
       throw new GitPolicyError("git rev-parse HEAD returned an invalid commit SHA.", "GIT_HEAD_INVALID");
     }
     return value;
+  }
+
+  /**
+   * True when `ancestor` is reachable from `descendant`; an equal commit counts as an ancestor.
+   * Completed-phase evidence stays valid while later phase commits advance HEAD, so this is the
+   * correct containment check for already-committed phases. HEAD being behind or unrelated still
+   * fails closed.
+   */
+  async isAncestor(ancestor: string, descendant: string, options?: { signal?: AbortSignal; timeout?: number }): Promise<boolean> {
+    const args = ["merge-base", "--is-ancestor", ancestor, descendant];
+    const result = await this.git.run(args, options);
+    if (result.code === 0) return true;
+    if (result.code === 1) return false;
+    throw commandError(args, result);
   }
 
   async status(options?: { signal?: AbortSignal; timeout?: number }): Promise<GitFileStatus[]> {
@@ -464,7 +501,12 @@ export class GitWorkspace {
     }
   }
 
-  async snapshot(options?: { signal?: AbortSignal; timeout?: number }): Promise<WorkspaceSnapshot> {
+  /**
+   * Capture Git commit/ref/reflog/index identity without reading workspace bytes. Used for the
+   * history/index immutability guard so that dependency installs and build output are never
+   * reported as history tampering. Reviewer read-only enforcement uses the full snapshot below.
+   */
+  async historySnapshot(options?: { signal?: AbortSignal; timeout?: number }): Promise<GitHistorySnapshot> {
     const commandOptions = options;
     const head = await this.head(commandOptions);
     const branchResult = await this.git.run(["symbolic-ref", "--short", "-q", "HEAD"], commandOptions);
@@ -474,6 +516,30 @@ export class GitWorkspace {
     if (refsResult.code !== 0 || reflogResult.code !== 0 || unreachableResult.code !== 0) {
       throw new GitPolicyError("Unable to capture Git refs/reflog evidence.", "GIT_HISTORY_EVIDENCE_FAILED");
     }
+    const indexArgs = ["ls-files", "--stage", "-z", "--", ...this.pathspecs()];
+    const indexResult = await this.git.run(indexArgs, commandOptions);
+    if (indexResult.code !== 0) throw commandError(indexArgs, indexResult);
+    return {
+      head,
+      branch: branchResult.code === 0 ? branchResult.stdout.trim() : "(detached)",
+      refs: createHash("sha256").update(refsResult.stdout).digest("hex"),
+      reflog: createHash("sha256").update(reflogResult.stdout).digest("hex"),
+      unreachable: createHash("sha256").update(unreachableResult.stdout).digest("hex"),
+      index: createHash("sha256").update(indexResult.stdout).digest("hex"),
+    };
+  }
+
+  /** Cheap gitignored-entry summary that never reads file bytes; advisory evidence for the Reviewer. */
+  async ignoredSummary(options?: { signal?: AbortSignal; timeout?: number }): Promise<string> {
+    const args = ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...this.pathspecs()];
+    const result = await this.git.run(args, options);
+    if (result.code !== 0) throw commandError(args, result);
+    return summarizeIgnoredPaths(parseNullSeparatedNames(result.stdout));
+  }
+
+  async snapshot(options?: { signal?: AbortSignal; timeout?: number }): Promise<WorkspaceSnapshot> {
+    const commandOptions = options;
+    const history = await this.historySnapshot(commandOptions);
     const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...this.pathspecs()];
     const statusResult = await this.git.run(statusArgs, commandOptions);
     if (statusResult.code !== 0) throw commandError(statusArgs, statusResult);
@@ -486,9 +552,6 @@ export class GitWorkspace {
     const diffArgs = ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--", ...this.pathspecs()];
     const diffResult = await this.git.run(diffArgs, commandOptions);
     if (diffResult.code !== 0) throw commandError(diffArgs, diffResult);
-    const indexArgs = ["ls-files", "--stage", "-z", "--", ...this.pathspecs()];
-    const indexResult = await this.git.run(indexArgs, commandOptions);
-    if (indexResult.code !== 0) throw commandError(indexArgs, indexResult);
 
     const entries = parseStatus(statusResult.stdout);
     const fileHash = createHash("sha256");
@@ -529,15 +592,10 @@ export class GitWorkspace {
       ignoredBytesHash.update("\0");
     }
     return {
-      head,
-      branch: branchResult.code === 0 ? branchResult.stdout.trim() : "(detached)",
-      refs: createHash("sha256").update(refsResult.stdout).digest("hex"),
-      reflog: createHash("sha256").update(reflogResult.stdout).digest("hex"),
-      unreachable: createHash("sha256").update(unreachableResult.stdout).digest("hex"),
+      ...history,
       status: createHash("sha256").update(statusResult.stdout).digest("hex"),
       ignored: ignoredBytesHash.digest("hex"),
       workingTreeDiff: createHash("sha256").update(diffResult.stdout).digest("hex"),
-      index: createHash("sha256").update(indexResult.stdout).digest("hex"),
       fileHashes: fileHash.digest("hex"),
     };
   }
@@ -744,18 +802,20 @@ export function createLocalGitOperations(cwd: string): GitOperations {
   };
 }
 
+/**
+ * Git operations bound to a working directory.
+ *
+ * Do not delegate this to Pi's extension `exec`: its `execCommand` concatenates
+ * `Buffer.toString()` per pipe chunk, so a UTF-8 code point that straddles a chunk
+ * boundary becomes U+FFFD. Diff evidence is hash-compared against the reviewed
+ * patch, so that corruption produced spurious `CACHED_DIFF_MISMATCH` pauses. Node's
+ * `execFile` decodes streams correctly. `_pi` is retained only for API compatibility.
+ */
 export function createPiGitOperations(
-  pi: { exec(command: string, args: string[], options?: { signal?: AbortSignal | undefined; timeout?: number | undefined; cwd?: string | undefined }): Promise<GitCommandResult> },
+  _pi: { exec(command: string, args: string[], options?: { signal?: AbortSignal | undefined; timeout?: number | undefined; cwd?: string | undefined }): Promise<GitCommandResult> },
   cwd?: string,
 ): GitOperations {
-  return {
-    run(args, options) {
-      return pi.exec("git", args, {
-        ...options,
-        ...(cwd ? { cwd } : {}),
-      });
-    },
-  };
+  return createLocalGitOperations(cwd ?? process.cwd());
 }
 
 export async function ensureDedicatedWorktree(
