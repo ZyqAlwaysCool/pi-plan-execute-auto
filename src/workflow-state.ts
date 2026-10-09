@@ -250,18 +250,4 @@ export async function readRunStatus(cwd: string, runId: string): Promise<Workflo
   };
 }
 
-export function formatStatus(status: WorkflowStatusSnapshot): string {
-  return [
-    `Run: ${status.run_id}`,
-    `Status: ${status.status}`,
-    `Progress: ${status.completed_phases}/${status.total_phases}`,
-    `Current phase: ${status.current_phase ?? "none"}`,
-    `Package: ${status.package_dir}`,
-    `Golden hash: ${status.package_hash}`,
-    ...(status.branch_name ? [`Branch: ${status.branch_name}`] : []),
-    ...(status.worktree_path ? [`Worktree: ${status.worktree_path}`] : []),
-    ...(status.pause_reason ? [`Pause reason: ${status.pause_reason}`] : []),
-  ].join("\n");
-}
-
 export { join };

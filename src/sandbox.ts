@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import {
   chmod,
@@ -398,7 +398,6 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
     const nodeModules = realpathSync(outerNodeModulesRoot(entry));
     const nodeEntry = join(RUNTIME_NODE_MODULES, relative(nodeModules, entry));
     const nodeBinary = realpathSync(process.execPath);
-    const nodeBinDir = dirname(nodeBinary);
     const nodePath = join(RUNTIME_NODE_BIN, basename(nodeBinary));
     const codexHome = resolve(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"));
     return {

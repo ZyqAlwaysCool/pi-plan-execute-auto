@@ -280,10 +280,6 @@ export async function verifyAcpModelCall(
     reasoningEffort ? { reasoningEffort } : {});
 }
 
-export async function probeCodexAcpModels(projectRoot: string): Promise<string[]> {
-  return probeAcpModels(projectRoot, "codex");
-}
-
 async function projectIdentity(cwd: string): Promise<{ projectRoot: string; gitEntry: string }> {
   const projectRoot = await realpath(cwd);
   const git = join(projectRoot, ".git");

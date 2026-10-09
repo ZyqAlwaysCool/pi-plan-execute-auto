@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_MAIN_PI_SESSION_BYTES, agentSessionTranscriptRelativePath, appendAgentSessionEvent, appendRunEvent, captureMainPiSession } from "../src/run-log.js";
+import { MAX_MAIN_PI_SESSION_BYTES, agentSessionTranscriptRelativePath, appendAgentSessionEvent, appendRunEvent, captureMainPiSession, summarizeAgentPrompt, summarizeAgentTurn } from "../src/run-log.js";
 
 test("agent session diagnostics are split into safe per-session transcript files", async () => {
   const root = await mkdtemp(join(tmpdir(), "peac-session-log-"));
@@ -74,6 +74,31 @@ test("Main Pi session capture keeps only a bounded recent diagnostic snapshot", 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("agent prompt diagnostics keep a digest and bounded head/tail instead of the full prompt", () => {
+  const prompt = `HEAD-${"x".repeat(4_000)}-TAIL`;
+  const summary = summarizeAgentPrompt(prompt);
+  assert.equal(summary.prompt_bytes, Buffer.byteLength(prompt, "utf8"));
+  assert.equal((summary.prompt_sha256 as string).length, 64);
+  assert.ok((summary.prompt_head as string).startsWith("HEAD-"));
+  assert.ok((summary.prompt_head as string).length < prompt.length);
+  assert.ok((summary.prompt_tail as string).endsWith("-TAIL"));
+  assert.ok(!JSON.stringify(summary).includes("x".repeat(3_000)), "full prompt body must not be stored");
+});
+
+test("agent turn diagnostics bound the text and replace the structured report with a digest", () => {
+  const text = "t".repeat(30_000);
+  const structured = { phase_id: "phase-01", round: 2, verdict: "REWORK", findings: [{ evidence: "e".repeat(5_000) }] };
+  const summary = summarizeAgentTurn(text, structured);
+  assert.equal(summary.text_bytes, 30_000);
+  assert.match(summary.text as string, /audit text truncated; 30000 bytes total/);
+  assert.ok((summary.text as string).length < 30_000);
+  assert.equal(summary.structured_phase_id, "phase-01");
+  assert.equal(summary.structured_round, 2);
+  assert.equal(summary.structured_verdict, "REWORK");
+  assert.equal(typeof summary.structured_sha256, "string");
+  assert.ok(!JSON.stringify(summary).includes("e".repeat(1_000)), "structured report body must not be duplicated");
 });
 
 test("run diagnostics redact known host credential values and credential-shaped fields", async () => {

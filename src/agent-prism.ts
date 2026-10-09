@@ -21,7 +21,7 @@ import {
 } from "./reports.js";
 import { defaultIsolationProvider } from "./isolation-provider.js";
 import type { SandboxedBackend } from "./sandbox.js";
-import { appendAgentSessionEvent } from "./run-log.js";
+import { appendAgentSessionEvent, summarizeAgentPrompt, summarizeAgentTurn } from "./run-log.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -213,10 +213,15 @@ export class AgentPrismSessionPair implements HarnessPair {
       const activeSession = role === "executor" ? this.executor?.sessionId : this.reviewer?.sessionId;
       if ((this.options.permissionMode ?? "autonomous") === "autonomous") {
         const optionId = selectedPermissionOptionId(request, true);
-        await this.audit("agent_permission", {
-          role, session_id: activeSession ?? null, mode: "autonomous", tool, selected_option_id: optionId ?? null,
-          options: request.options.map((option) => ({ option_id: option.optionId, name: option.name, kind: option.kind })),
-        });
+        const option = request.options.find((entry) => entry.optionId === optionId);
+        const autoApproved = option?.kind === "allow_once" || option?.kind === "allow_always";
+        if (!autoApproved) {
+          // Autonomous auto-approvals carry no diagnostic value; only denials/cancellations do.
+          await this.audit("agent_permission", {
+            role, session_id: activeSession ?? null, mode: "autonomous", tool, selected_option_id: optionId ?? null,
+            options: request.options.map((entry) => ({ option_id: entry.optionId, name: entry.name, kind: entry.kind })),
+          });
+        }
         return role === "executor" ? executorPermission(request) : reviewerPermission(request);
       }
       const optionId = await this.options.onPermissionChoice?.(role, request);
@@ -289,7 +294,8 @@ export class AgentPrismSessionPair implements HarnessPair {
     options?: { signal?: AbortSignal },
   ): Promise<AcpAgentTurn> {
     await this.audit("agent_prompt", {
-      role, session_id: agent.sessionId, backend: agent.backendId, model: agent.model, prompt,
+      role, session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+      ...summarizeAgentPrompt(prompt),
     });
     let turn: AcpAgentTurn | undefined;
     const eventCounts: Record<string, number> = {};
@@ -312,8 +318,7 @@ export class AgentPrismSessionPair implements HarnessPair {
       structured_attempts: turn.structuredAttempts,
       structured_error: turn.structuredError,
       event_counts: eventCounts,
-      text: turn.text,
-      structured: turn.structured,
+      ...summarizeAgentTurn(turn.text, turn.structured),
     });
     return turn;
   }

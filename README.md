@@ -49,6 +49,7 @@ The normal command surface is intentionally small:
 /plan-execute setup
 /plan-execute settings [run-id]
 /plan-execute start <run-id>
+/plan-execute resume <run-id>
 /plan-execute stop <run-id>
 /plan-execute status <run-id>
 ```
@@ -91,7 +92,8 @@ plan/...
     revisions/
       revision-001/package/...
   reports/...
-  diffs/...
+  review-diffs/...
+  final-diffs/...
   completions/...
 ```
 
@@ -99,7 +101,7 @@ Diagnostics are intentionally layered rather than capturing every ACP event. `.r
 
 `.runtime/main-pi-session.json` is also diagnostic rather than authoritative evidence. It stores only a bounded recent snapshot of the Main Pi branch (at most 120 compacted entries and 512 KiB), with source/retained entry counts and a truncation flag. Large strings, nested collections, and older entries are deliberately omitted instead of mirroring the entire conversation.
 
-Each Executor/Reviewer session has a small transcript under `.runtime/sessions/executor/` or `.runtime/sessions/reviewer/`. A session transcript keeps only information useful for reconstruction: session start/close metadata, the plugin prompt for each turn, permission decisions, and the final terminal/structured turn with aggregate event counts. Raw thought/message chunks, usage-update streams, and other high-frequency ACP stream traffic are not persisted. Structured execution/review reports, acceptance outputs, immutable diffs, and completion records remain the authoritative evidence. JSONL appends are serialized per file to prevent concurrent diagnostic writes from corrupting records.
+Each Executor/Reviewer session has a small transcript under `.runtime/sessions/executor/` or `.runtime/sessions/reviewer/`. A session transcript keeps only information useful for reconstruction: session start/close metadata, a prompt digest with bounded head/tail (the full prompt is reproducible from the frozen package plus persisted diffs and reports), human permission decisions (autonomous auto-approvals are not recorded), and the terminal turn's bounded text plus a digest and identity of its structured report. Raw thought/message chunks, usage-update streams, and other high-frequency ACP stream traffic are not persisted. Structured execution/review reports under `.runtime/reports/`, acceptance outputs, immutable diffs, and completion records remain the authoritative evidence. JSONL appends are serialized per file to prevent concurrent diagnostic writes from corrupting records.
 
 Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
 
@@ -294,8 +296,4 @@ Headless execution can additionally set:
 
 Interactive setup remains the normal workflow.
 
-## Validation status
-
-The native-session architecture previously passed real WSL validation for OpenCode Executor + Codex Reviewer (**3/3**) and Pi (**3/3**). Claude reached **2/3** before the plugin-forced Claude inner-sandbox issue was removed. After workflow/UX changes, rerun real provider gates on the current head before treating earlier provider results as validation of the new head.
-
-Non-billable CI is necessary but does not replace a real provider-call test for the selected CLI/model/gateway.
+Non-billable CI is necessary but does not replace a real provider-call test for the selected CLI/model/gateway. Real provider gates may incur charges; rerun them on the current head before relying on earlier validation results.

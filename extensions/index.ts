@@ -1,6 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { access, readdir, readFile } from "node:fs/promises";
-import { promisify } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import type {
   ExtensionAPI,
@@ -10,7 +8,6 @@ import type {
 import { Type, type Static } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import {
-  formatPackageSummary,
   formatValidationIssues,
   makeRunId,
   PackageInputError,
@@ -24,7 +21,6 @@ import {
 import {
   cancelRun,
   createDraftState,
-  formatStatus,
   freezeRun,
   loadValidatedRun,
   packageRoot,
@@ -48,7 +44,6 @@ import {
   probeAcpConfiguration,
   probeAcpModels,
   verifyAcpModelCall,
-  removeProjectPluginProfile,
   saveProjectPluginProfile,
   type AcpBackend,
   type DetectedCli,
@@ -91,7 +86,6 @@ import type {
   WorkflowState,
 } from "../src/types.js";
 
-const execFile = promisify(execFileCallback);
 const WIDGET_KEY = "pi-plan-execute-auto";
 const STATE_ENTRY = "plan-execute-state";
 const PHASE_ENTRY = "plan-execute-phase";
@@ -1122,27 +1116,6 @@ async function commandSettings(ctx: ExtensionCommandContext, runIdArg?: string):
         runId ? "Model/effort changes apply to sessions created after the next resume." : "",
       ].filter(Boolean).join("\n"), "info");
     }
-  } catch (error) {
-    notify(ctx, error instanceof Error ? error.message : String(error), "error");
-  }
-}
-
-async function commandConfig(ctx: ExtensionCommandContext): Promise<void> {
-  try {
-    const profile = await loadProjectPluginProfile(ctx.cwd);
-    notify(ctx, profile
-      ? `Executor: ${profile.executorModel} (${profile.executorReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReviewer: ${profile.reviewerModel} (${profile.reviewerReasoningEffort ?? profile.reasoningEffort ?? "backend default"})\nReview loop limit: ${profile.reviewRoundLimit}\nPermissions: ${profile.permissionMode}\nExecution timeout: ${formatStageTimeout(profile.stageTimeoutMs)}\nNetwork consent: ${profile.networkRiskApprovedAt}`
-      : "No project configuration. Use /plan-execute setup.", profile ? "info" : "warning");
-  } catch (error) {
-    notify(ctx, error instanceof Error ? error.message : String(error), "error");
-  }
-}
-
-async function commandResetConfig(ctx: ExtensionCommandContext): Promise<void> {
-  if (!ctx.hasUI || !await ctx.ui.confirm("Forget plan-execute setup?", "This removes project ACP model selection and network consent. Existing Golden Packages and commits are not removed.")) return;
-  try {
-    await removeProjectPluginProfile(ctx.cwd);
-    notify(ctx, "Project configuration removed. Run /plan-execute setup before starting a new run.", "info");
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
@@ -2257,7 +2230,6 @@ async function reviewDraftAndStart(
 }
 
 async function handleFinalize(
-  pi: ExtensionAPI,
   ctx: ExtensionContext,
   params: FinalizeParams,
 ): Promise<ReturnType<typeof textResult>> {
@@ -2301,7 +2273,6 @@ async function handleFinalize(
 }
 
 async function handleRevise(
-  pi: ExtensionAPI,
   ctx: ExtensionContext,
   params: ReviseParams,
 ): Promise<ReturnType<typeof textResult>> {
@@ -2411,63 +2382,6 @@ async function commandFinalize(pi: ExtensionAPI, ctx: ExtensionCommandContext, d
     pi.sendUserMessage(buildFinalizePrompt(directive), { expandPromptTemplates: false });
   } catch (error) {
     notify(ctx, error instanceof Error ? error.message : String(error), "warning");
-  }
-}
-
-async function commandValidate(ctx: ExtensionCommandContext, runId: string): Promise<void> {
-  try {
-    const root = packageRoot(ctx.cwd, runId);
-    const result = await validatePackageDirectory(root);
-    if (!result.ok || !result.package) {
-      notify(ctx, `Package validation failed for ${runId}:\n${formatValidationIssues(result.errors)}`, "error");
-      return;
-    }
-    notify(ctx, formatPackageSummary(result.package), "info");
-  } catch (error) {
-    notify(ctx, error instanceof Error ? error.message : String(error), "error");
-  }
-}
-
-async function commandApprove(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
-  runId: string,
-  start: boolean,
-): Promise<void> {
-  try {
-    const loaded = await loadValidatedRun(ctx.cwd, runId);
-    if (loaded.state.status !== "draft") {
-      notify(ctx, `Run ${runId} is already ${loaded.state.status}; approval is not available.`, "warning");
-      return;
-    }
-    const selection = await approvedSetup(ctx.cwd, ctx.hasUI);
-    const review = `${await packageReviewText(loaded.package)}\n\nExecutor: ${selection.executorModel} (${selection.executorReasoningEffort ?? selection.reasoningEffort ?? "backend default"})\nReviewer: ${selection.reviewerModel} (${selection.reviewerReasoningEffort ?? selection.reasoningEffort ?? "backend default"})\nReview loop limit: ${selection.reviewRoundLimit}\nPermissions: ${selection.permissionMode}`;
-    const ok = !ctx.hasUI || await ctx.ui.confirm("Freeze Golden Document Package", review);
-    if (!ok) {
-      notify(ctx, "Approval cancelled; package remains unfrozen.", "info");
-      return;
-    }
-    const state = await freezeRun(loaded.package, runId, {
-      reviewedPackageHash: loaded.package.package_hash,
-      executorModel: selection.executorModel,
-      reviewerModel: selection.reviewerModel,
-      ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
-      ...(selection.executorReasoningEffort ? { executorReasoningEffort: selection.executorReasoningEffort } : {}),
-      ...(selection.reviewerReasoningEffort ? { reviewerReasoningEffort: selection.reviewerReasoningEffort } : {}),
-      permissionMode: selection.permissionMode,
-      reviewRoundLimit: selection.reviewRoundLimit,
-    });
-    pi.appendEntry(STATE_ENTRY, state);
-    showWidget(ctx, stateLines(state));
-    if (!start) {
-      notify(ctx, `Run ${runId} plan approved. Execution & Review has not started.`, "info");
-      return;
-    }
-    const result = await startStageB(pi, ctx, runId, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
-    if (result.status === "paused") return;
-    notify(ctx, result.status === "not_started" ? (result.reason ?? "Execution & Review has not started.") : `Execution & Review ${result.status}.`, result.status === "not_started" ? "warning" : "info");
-  } catch (error) {
-    notify(ctx, error instanceof Error ? error.message : String(error), "error");
   }
 }
 
@@ -2668,7 +2582,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     parameters: FINALIZE_SCHEMA,
     executionMode: "sequential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return handleFinalize(pi, ctx, params);
+      return handleFinalize(ctx, params);
     },
   });
 
@@ -2687,7 +2601,7 @@ export default function planExecuteAuto(pi: ExtensionAPI): void {
     parameters: REVISE_SCHEMA,
     executionMode: "sequential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return handleRevise(pi, ctx, params);
+      return handleRevise(ctx, params);
     },
   });
 

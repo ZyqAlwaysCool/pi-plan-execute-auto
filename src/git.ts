@@ -7,7 +7,6 @@ import {
   lstat,
   mkdir,
   opendir,
-  readFile,
   readlink,
   realpath,
   rename,

@@ -37,10 +37,6 @@ function stringArray(value: unknown, maxItems = MAX_REPORT_LIST_ITEMS): string[]
   return value as string[];
 }
 
-function positiveRound(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1;
-}
-
 function normalizeSelfTests(value: unknown): ExecutionSelfTestEvidence[] | undefined {
   if (!Array.isArray(value) || value.length > MAX_REPORT_LIST_ITEMS) return undefined;
   const result: ExecutionSelfTestEvidence[] = [];
@@ -250,6 +246,3 @@ export function makeInvalidReviewReport(
   };
 }
 
-export function isReportRound(value: unknown): value is number {
-  return positiveRound(value);
-}

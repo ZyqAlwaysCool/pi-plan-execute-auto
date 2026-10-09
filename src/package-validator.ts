@@ -859,22 +859,6 @@ export async function writeWorkflowState(root: string, state: import("./types.js
   await writeJsonAtomic(join(root, STATE_FILE), state);
 }
 
-export async function packageStatus(root: string): Promise<import("./types.js").WorkflowStatusSnapshot | undefined> {
-  const state = await readWorkflowState(root);
-  if (!state) return undefined;
-  const current = state.phases.find((phase) => phase.status !== "completed");
-  return {
-    run_id: state.run_id,
-    status: state.status,
-    package_dir: state.package_dir,
-    package_hash: state.package_hash,
-    ...(current?.phase_id ? { current_phase: current.phase_id } : {}),
-    completed_phases: state.phases.filter((phase) => phase.status === "completed").length,
-    total_phases: state.phases.length,
-    ...(state.pause_reason ? { pause_reason: state.pause_reason } : {}),
-  };
-}
-
 export function formatValidationIssues(issues: PackageValidationIssue[]): string {
   if (issues.length === 0) return "No validation errors.";
   return issues.map((entry) => `- [${entry.code}] ${entry.path}: ${entry.message}`).join("\n");

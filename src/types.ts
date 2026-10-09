@@ -363,13 +363,3 @@ export interface StageBRunResult {
   pause?: PauseRecord | undefined;
 }
 
-export function isWorkflowStatus(value: unknown): value is WorkflowStatus {
-  return (
-    value === "draft" ||
-    value === "frozen" ||
-    value === "running" ||
-    value === "paused" ||
-    value === "completed" ||
-    value === "cancelled"
-  );
-}

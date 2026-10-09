@@ -1,5 +1,6 @@
 import { mkdir, appendFile, writeFile, rename } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { dirname, resolve, sep } from "node:path";
 
 function inside(root: string, candidate: string): boolean {
   const resolvedRoot = resolve(root);
@@ -85,6 +86,69 @@ export function agentSessionTranscriptRelativePath(
   sessionId: string,
 ): string {
   return `.runtime/sessions/${role}/${safeSessionSegment(sessionId)}.jsonl`;
+}
+
+const MAX_AUDIT_TEXT_BYTES = 24_000;
+const MAX_PROMPT_HEAD_BYTES = 2_000;
+const MAX_PROMPT_TAIL_BYTES = 600;
+
+/** Longest prefix whose UTF-8 length stays within `maxBytes`; never splits a code point. */
+function headWithinBytes(value: string, maxBytes: number): string {
+  let end = value.length;
+  while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maxBytes) end -= 1;
+  return value.slice(0, end);
+}
+
+/** Longest suffix whose UTF-8 length stays within `maxBytes`; never splits a code point. */
+function tailWithinBytes(value: string, maxBytes: number): string {
+  let start = 0;
+  while (start < value.length && Buffer.byteLength(value.slice(start), "utf8") > maxBytes) start += 1;
+  return value.slice(start);
+}
+
+/**
+ * Prompts are long but reproducible from the frozen package plus persisted diffs and reports.
+ * Diagnostics keep a digest plus bounded head/tail instead of duplicating the full prompt.
+ */
+export function summarizeAgentPrompt(prompt: string): Record<string, unknown> {
+  const bytes = Buffer.byteLength(prompt, "utf8");
+  const result: Record<string, unknown> = {
+    prompt_sha256: createHash("sha256").update(prompt).digest("hex"),
+    prompt_bytes: bytes,
+    prompt_head: headWithinBytes(prompt, MAX_PROMPT_HEAD_BYTES),
+  };
+  if (bytes > MAX_PROMPT_HEAD_BYTES + MAX_PROMPT_TAIL_BYTES) {
+    result.prompt_tail = tailWithinBytes(prompt, MAX_PROMPT_TAIL_BYTES);
+  }
+  return result;
+}
+
+/**
+ * Structured reports are authoritative under `.runtime/reports/`; the transcript keeps the bounded
+ * agent text plus a digest and identity of the structured report instead of a second full copy.
+ */
+export function summarizeAgentTurn(text: string, structured: unknown): Record<string, unknown> {
+  const textBytes = Buffer.byteLength(text, "utf8");
+  const result: Record<string, unknown> = {
+    text: textBytes <= MAX_AUDIT_TEXT_BYTES
+      ? text
+      : `${headWithinBytes(text, MAX_AUDIT_TEXT_BYTES)}\n[audit text truncated; ${textBytes} bytes total]`,
+    text_sha256: createHash("sha256").update(text).digest("hex"),
+    text_bytes: textBytes,
+  };
+  if (structured !== undefined) {
+    const serialized = JSON.stringify(structured) ?? "undefined";
+    result.structured_sha256 = createHash("sha256").update(serialized).digest("hex");
+    result.structured_bytes = Buffer.byteLength(serialized, "utf8");
+    if (structured && typeof structured === "object" && !Array.isArray(structured)) {
+      const record = structured as Record<string, unknown>;
+      for (const key of ["phase_id", "round", "status", "verdict"] as const) {
+        const entry = record[key];
+        if (typeof entry === "string" || typeof entry === "number") result[`structured_${key}`] = entry;
+      }
+    }
+  }
+  return result;
 }
 
 export async function appendAgentSessionEvent(
@@ -198,8 +262,4 @@ export async function captureMainPiSession(
   entries: unknown,
 ): Promise<void> {
   await writeRunJson(runRoot, ".runtime/main-pi-session.json", mainPiSessionSnapshot(entries));
-}
-
-export function runtimePath(runRoot: string, ...parts: string[]): string {
-  return join(runRoot, ".runtime", ...parts);
 }

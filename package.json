@@ -47,5 +47,10 @@
     "tsx": "^4.19.0",
     "typebox": "1.3.27",
     "typescript": "^5.8.3"
-  }
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md"
+  ]
 }
