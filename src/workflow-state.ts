@@ -39,6 +39,7 @@ export function createDraftState(pkg: ValidatedPackage, runId: string): Workflow
     package_dir: pkg.root,
     status: "draft",
     created_at: new Date().toISOString(),
+    plan_revision: 1,
     phases: initialPhaseStates(pkg),
   };
 }
@@ -64,8 +65,19 @@ export async function loadValidatedRun(
   if (state.package_hash !== validation.package.package_hash) {
     throw new Error(`Workflow ${runId} package hash does not match its frozen state.`);
   }
-  if (state.reasoning_effort !== undefined && !["low", "medium", "high", "max"].includes(state.reasoning_effort)) {
-    throw new Error(`Workflow ${runId} has an unsupported persisted reasoning effort.`);
+  for (const effort of [state.reasoning_effort, state.executor_reasoning_effort, state.reviewer_reasoning_effort]) {
+    if (effort !== undefined && !["low", "medium", "high", "max"].includes(effort)) {
+      throw new Error(`Workflow ${runId} has an unsupported persisted reasoning effort.`);
+    }
+  }
+  if (state.reasoning_effort !== undefined && (state.executor_reasoning_effort !== undefined || state.reviewer_reasoning_effort !== undefined)) {
+    throw new Error(`Workflow ${runId} mixes shared and role-specific reasoning effort.`);
+  }
+  if (state.permission_mode !== undefined && state.permission_mode !== "autonomous" && state.permission_mode !== "ask") {
+    throw new Error(`Workflow ${runId} has an unsupported persisted agent permission mode.`);
+  }
+  if (state.review_round_limit !== undefined && (!Number.isInteger(state.review_round_limit) || state.review_round_limit < 1 || state.review_round_limit > 100)) {
+    throw new Error(`Workflow ${runId} has an invalid persisted review round limit.`);
   }
   assertSafeRunId(state.run_id);
   const expectedPhaseIds = validation.package.phases.map((phase) => phase.phase.id);
@@ -158,7 +170,16 @@ export async function loadValidatedRun(
 export async function freezeRun(
   pkg: ValidatedPackage,
   runId: string,
-  options?: { executorModel?: string; reviewerModel?: string; reasoningEffort?: WorkflowState["reasoning_effort"]; reviewedPackageHash?: string },
+  options?: {
+    executorModel?: string;
+    reviewerModel?: string;
+    reasoningEffort?: WorkflowState["reasoning_effort"];
+    executorReasoningEffort?: WorkflowState["executor_reasoning_effort"];
+    reviewerReasoningEffort?: WorkflowState["reviewer_reasoning_effort"];
+    permissionMode?: WorkflowState["permission_mode"];
+    reviewRoundLimit?: number;
+    reviewedPackageHash?: string;
+  },
 ): Promise<WorkflowState> {
   const root = pkg.root;
   const current = await readWorkflowState(root);
@@ -177,11 +198,20 @@ export async function freezeRun(
     throw new Error("The package hash changed after review; it remains draft and requires a new review.");
   }
   const state = createDraftState(validation.package, runId);
+  state.created_at = current?.created_at ?? state.created_at;
+  state.plan_revision = current?.plan_revision ?? 1;
   state.status = "frozen";
   state.approved_at = new Date().toISOString();
   if (options?.executorModel) state.executor_model = options.executorModel;
   if (options?.reviewerModel) state.reviewer_model = options.reviewerModel;
+  if (options?.reasoningEffort && (options.executorReasoningEffort || options.reviewerReasoningEffort)) {
+    throw new Error("Human freeze cannot mix shared and role-specific reasoning efforts.");
+  }
   if (options?.reasoningEffort) state.reasoning_effort = options.reasoningEffort;
+  if (options?.executorReasoningEffort) state.executor_reasoning_effort = options.executorReasoningEffort;
+  if (options?.reviewerReasoningEffort) state.reviewer_reasoning_effort = options.reviewerReasoningEffort;
+  if (options?.permissionMode) state.permission_mode = options.permissionMode;
+  if (options?.reviewRoundLimit !== undefined) state.review_round_limit = options.reviewRoundLimit;
   await writeWorkflowState(root, state);
   return state;
 }
@@ -218,20 +248,6 @@ export async function readRunStatus(cwd: string, runId: string): Promise<Workflo
     total_phases: validatedState.phases.length,
     ...(validatedState.pause_reason ? { pause_reason: validatedState.pause_reason } : {}),
   };
-}
-
-export function formatStatus(status: WorkflowStatusSnapshot): string {
-  return [
-    `Run: ${status.run_id}`,
-    `Status: ${status.status}`,
-    `Progress: ${status.completed_phases}/${status.total_phases}`,
-    `Current phase: ${status.current_phase ?? "none"}`,
-    `Package: ${status.package_dir}`,
-    `Golden hash: ${status.package_hash}`,
-    ...(status.branch_name ? [`Branch: ${status.branch_name}`] : []),
-    ...(status.worktree_path ? [`Worktree: ${status.worktree_path}`] : []),
-    ...(status.pause_reason ? [`Pause reason: ${status.pause_reason}`] : []),
-  ].join("\n");
 }
 
 export { join };

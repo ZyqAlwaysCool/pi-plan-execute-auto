@@ -7,7 +7,6 @@ import {
   lstat,
   mkdir,
   opendir,
-  readFile,
   readlink,
   realpath,
   rename,
@@ -42,16 +41,24 @@ export interface GitWorkspaceOptions {
   dedicatedWorktreePath?: string;
 }
 
-export interface WorkspaceSnapshot {
+/**
+ * Git commit/ref/reflog/index identity. This evidence is the plugin's commit-boundary guard and
+ * deliberately excludes gitignored dependency/build artifacts: those never enter a phase commit,
+ * so `npm install`/build output must not be mistaken for a history rewrite.
+ */
+export interface GitHistorySnapshot {
   head: string;
   branch: string;
   refs: string;
   reflog: string;
   unreachable: string;
+  index: string;
+}
+
+export interface WorkspaceSnapshot extends GitHistorySnapshot {
   status: string;
   ignored: string;
   workingTreeDiff: string;
-  index: string;
   fileHashes: string;
 }
 
@@ -325,6 +332,21 @@ function uniqueSorted(values: readonly string[]): string[] {
   return [...new Set(values)].sort();
 }
 
+/** Bounded, byte-free summary of gitignored entries grouped by their top-level path segment. */
+function summarizeIgnoredPaths(paths: readonly string[]): string {
+  if (paths.length === 0) return "(none)";
+  const counts = new Map<string, number>();
+  for (const path of paths) {
+    const separator = path.indexOf("/");
+    const topLevel = separator === -1 ? path : path.slice(0, separator);
+    counts.set(topLevel, (counts.get(topLevel) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([name, count]) => `${name}=${count}`)
+    .join(", ");
+}
+
 /**
  * Git adapter with the policy-sensitive operations kept in one place. Commands are passed as
  * argv, never through a shell, so file names and commit messages cannot become shell syntax.
@@ -361,6 +383,20 @@ export class GitWorkspace {
       throw new GitPolicyError("git rev-parse HEAD returned an invalid commit SHA.", "GIT_HEAD_INVALID");
     }
     return value;
+  }
+
+  /**
+   * True when `ancestor` is reachable from `descendant`; an equal commit counts as an ancestor.
+   * Completed-phase evidence stays valid while later phase commits advance HEAD, so this is the
+   * correct containment check for already-committed phases. HEAD being behind or unrelated still
+   * fails closed.
+   */
+  async isAncestor(ancestor: string, descendant: string, options?: { signal?: AbortSignal; timeout?: number }): Promise<boolean> {
+    const args = ["merge-base", "--is-ancestor", ancestor, descendant];
+    const result = await this.git.run(args, options);
+    if (result.code === 0) return true;
+    if (result.code === 1) return false;
+    throw commandError(args, result);
   }
 
   async status(options?: { signal?: AbortSignal; timeout?: number }): Promise<GitFileStatus[]> {
@@ -444,14 +480,14 @@ export class GitWorkspace {
     const absolute = resolve(this.cwd, path);
     const link = await readlink(absolute);
     const lexicalTarget = isAbsolute(link) ? resolve(link) : resolve(dirname(absolute), link);
-    const root = resolve(this.cwd);
-    const relativeTarget = relative(root, lexicalTarget);
+    const lexicalRoot = resolve(this.cwd);
+    const relativeTarget = relative(lexicalRoot, lexicalTarget);
     if (isAbsolute(link) || relativeTarget.startsWith("..") || isAbsolute(relativeTarget)) {
       throw new GitPolicyError(`Workspace symlink escapes the dedicated worktree: ${path} -> ${link}.`, "WORKSPACE_SYMLINK_ESCAPE");
     }
     try {
-      const realTarget = await realpath(absolute);
-      const realRelative = relative(root, realTarget);
+      const [realRoot, realTarget] = await Promise.all([realpath(this.cwd), realpath(absolute)]);
+      const realRelative = relative(realRoot, realTarget);
       if (realRelative.startsWith("..") || isAbsolute(realRelative)) {
         throw new GitPolicyError(`Workspace symlink resolves outside the dedicated worktree: ${path}.`, "WORKSPACE_SYMLINK_ESCAPE");
       }
@@ -464,7 +500,12 @@ export class GitWorkspace {
     }
   }
 
-  async snapshot(options?: { signal?: AbortSignal; timeout?: number }): Promise<WorkspaceSnapshot> {
+  /**
+   * Capture Git commit/ref/reflog/index identity without reading workspace bytes. Used for the
+   * history/index immutability guard so that dependency installs and build output are never
+   * reported as history tampering. Reviewer read-only enforcement uses the full snapshot below.
+   */
+  async historySnapshot(options?: { signal?: AbortSignal; timeout?: number }): Promise<GitHistorySnapshot> {
     const commandOptions = options;
     const head = await this.head(commandOptions);
     const branchResult = await this.git.run(["symbolic-ref", "--short", "-q", "HEAD"], commandOptions);
@@ -474,6 +515,30 @@ export class GitWorkspace {
     if (refsResult.code !== 0 || reflogResult.code !== 0 || unreachableResult.code !== 0) {
       throw new GitPolicyError("Unable to capture Git refs/reflog evidence.", "GIT_HISTORY_EVIDENCE_FAILED");
     }
+    const indexArgs = ["ls-files", "--stage", "-z", "--", ...this.pathspecs()];
+    const indexResult = await this.git.run(indexArgs, commandOptions);
+    if (indexResult.code !== 0) throw commandError(indexArgs, indexResult);
+    return {
+      head,
+      branch: branchResult.code === 0 ? branchResult.stdout.trim() : "(detached)",
+      refs: createHash("sha256").update(refsResult.stdout).digest("hex"),
+      reflog: createHash("sha256").update(reflogResult.stdout).digest("hex"),
+      unreachable: createHash("sha256").update(unreachableResult.stdout).digest("hex"),
+      index: createHash("sha256").update(indexResult.stdout).digest("hex"),
+    };
+  }
+
+  /** Cheap gitignored-entry summary that never reads file bytes; advisory evidence for the Reviewer. */
+  async ignoredSummary(options?: { signal?: AbortSignal; timeout?: number }): Promise<string> {
+    const args = ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...this.pathspecs()];
+    const result = await this.git.run(args, options);
+    if (result.code !== 0) throw commandError(args, result);
+    return summarizeIgnoredPaths(parseNullSeparatedNames(result.stdout));
+  }
+
+  async snapshot(options?: { signal?: AbortSignal; timeout?: number }): Promise<WorkspaceSnapshot> {
+    const commandOptions = options;
+    const history = await this.historySnapshot(commandOptions);
     const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...this.pathspecs()];
     const statusResult = await this.git.run(statusArgs, commandOptions);
     if (statusResult.code !== 0) throw commandError(statusArgs, statusResult);
@@ -486,9 +551,6 @@ export class GitWorkspace {
     const diffArgs = ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--", ...this.pathspecs()];
     const diffResult = await this.git.run(diffArgs, commandOptions);
     if (diffResult.code !== 0) throw commandError(diffArgs, diffResult);
-    const indexArgs = ["ls-files", "--stage", "-z", "--", ...this.pathspecs()];
-    const indexResult = await this.git.run(indexArgs, commandOptions);
-    if (indexResult.code !== 0) throw commandError(indexArgs, indexResult);
 
     const entries = parseStatus(statusResult.stdout);
     const fileHash = createHash("sha256");
@@ -529,15 +591,10 @@ export class GitWorkspace {
       ignoredBytesHash.update("\0");
     }
     return {
-      head,
-      branch: branchResult.code === 0 ? branchResult.stdout.trim() : "(detached)",
-      refs: createHash("sha256").update(refsResult.stdout).digest("hex"),
-      reflog: createHash("sha256").update(reflogResult.stdout).digest("hex"),
-      unreachable: createHash("sha256").update(unreachableResult.stdout).digest("hex"),
+      ...history,
       status: createHash("sha256").update(statusResult.stdout).digest("hex"),
       ignored: ignoredBytesHash.digest("hex"),
       workingTreeDiff: createHash("sha256").update(diffResult.stdout).digest("hex"),
-      index: createHash("sha256").update(indexResult.stdout).digest("hex"),
       fileHashes: fileHash.digest("hex"),
     };
   }
@@ -545,7 +602,7 @@ export class GitWorkspace {
   async assertDedicatedIdentity(): Promise<void> {
     if (!this.dedicatedBranch || !this.dedicatedWorktreePath) {
       throw new GitPolicyError(
-        "Stage B requires a plugin-created dedicated branch and worktree.",
+        "Execution & Review requires a plugin-created dedicated branch and worktree.",
         "DEDICATED_WORKTREE_REQUIRED",
       );
     }
@@ -554,9 +611,19 @@ export class GitWorkspace {
     if (branchResult.code !== 0 || topResult.code !== 0) {
       throw new GitPolicyError("Unable to verify dedicated worktree identity.", "WORKTREE_IDENTITY_UNKNOWN");
     }
-    if (branchResult.stdout.trim() !== this.dedicatedBranch || resolve(topResult.stdout.trim()) !== resolve(this.dedicatedWorktreePath)) {
+    let sameWorktree = false;
+    try {
+      const [reportedTop, expectedTop] = await Promise.all([
+        realpath(topResult.stdout.trim()),
+        realpath(this.dedicatedWorktreePath),
+      ]);
+      sameWorktree = reportedTop === expectedTop;
+    } catch {
+      throw new GitPolicyError("Unable to canonicalize dedicated worktree identity.", "WORKTREE_IDENTITY_UNKNOWN");
+    }
+    if (branchResult.stdout.trim() !== this.dedicatedBranch || !sameWorktree) {
       throw new GitPolicyError(
-        `Stage B is not running in its dedicated worktree (${this.dedicatedBranch} at ${this.dedicatedWorktreePath}).`,
+        `Execution & Review is not running in its dedicated worktree (${this.dedicatedBranch} at ${this.dedicatedWorktreePath}).`,
         "WORKTREE_IDENTITY_MISMATCH",
       );
     }
@@ -734,18 +801,20 @@ export function createLocalGitOperations(cwd: string): GitOperations {
   };
 }
 
+/**
+ * Git operations bound to a working directory.
+ *
+ * Do not delegate this to Pi's extension `exec`: its `execCommand` concatenates
+ * `Buffer.toString()` per pipe chunk, so a UTF-8 code point that straddles a chunk
+ * boundary becomes U+FFFD. Diff evidence is hash-compared against the reviewed
+ * patch, so that corruption produced spurious `CACHED_DIFF_MISMATCH` pauses. Node's
+ * `execFile` decodes streams correctly. `_pi` is retained only for API compatibility.
+ */
 export function createPiGitOperations(
-  pi: { exec(command: string, args: string[], options?: { signal?: AbortSignal | undefined; timeout?: number | undefined; cwd?: string | undefined }): Promise<GitCommandResult> },
+  _pi: { exec(command: string, args: string[], options?: { signal?: AbortSignal | undefined; timeout?: number | undefined; cwd?: string | undefined }): Promise<GitCommandResult> },
   cwd?: string,
 ): GitOperations {
-  return {
-    run(args, options) {
-      return pi.exec("git", args, {
-        ...options,
-        ...(cwd ? { cwd } : {}),
-      });
-    },
-  };
+  return createLocalGitOperations(cwd ?? process.cwd());
 }
 
 export async function ensureDedicatedWorktree(
@@ -771,29 +840,50 @@ export async function ensureDedicatedWorktree(
     cwd: options.sourceCwd,
     runtimeRoot: options.runtimeRoot,
   });
+  const targetPath = resolve(options.targetPath);
+  const branchName = options.branchName;
+  if (options.existing?.path || options.existing?.branchName) {
+    if (!options.existing.path || options.existing.branchName !== branchName) {
+      throw new GitPolicyError("Persisted dedicated worktree identity does not match this run.", "WORKTREE_IDENTITY_MISMATCH");
+    }
+    let persistedMatches = false;
+    try {
+      const [persistedPath, expectedPath] = await Promise.all([
+        realpath(options.existing.path),
+        realpath(targetPath),
+      ]);
+      persistedMatches = persistedPath === expectedPath;
+    } catch {
+      throw new GitPolicyError("Persisted dedicated worktree cannot be canonicalized.", "WORKTREE_IDENTITY_UNKNOWN");
+    }
+    if (!persistedMatches) {
+      throw new GitPolicyError("Persisted dedicated worktree identity does not match this run.", "WORKTREE_IDENTITY_MISMATCH");
+    }
+    const branch = await options.targetGit.run(["branch", "--show-current"], commandOptions);
+    const top = await options.targetGit.run(["rev-parse", "--show-toplevel"], commandOptions);
+    let reportedMatches = false;
+    if (top.code === 0) {
+      try {
+        reportedMatches = await realpath(top.stdout.trim()) === await realpath(targetPath);
+      } catch {
+        reportedMatches = false;
+      }
+    }
+    if (branch.code !== 0 || top.code !== 0 || branch.stdout.trim() !== branchName || !reportedMatches) {
+      throw new GitPolicyError("Persisted dedicated worktree cannot be verified.", "WORKTREE_IDENTITY_UNKNOWN");
+    }
+    const targetHead = await new GitWorkspace(options.targetGit, { cwd: targetPath }).head(commandOptions);
+    return { branchName, path: targetPath, baseCommit: targetHead };
+  }
+
   const baseCommit = await source.head(commandOptions);
   await source.assertNoCachedChanges(commandOptions);
   const dirty = await source.changedPaths(commandOptions);
   if (dirty.length > 0) {
     throw new GitPolicyError(
-      `Main worktree must be clean before creating a dedicated Stage B worktree: ${dirty.join(", ")}.`,
+      `Main worktree must be clean before creating the dedicated execution worktree: ${dirty.join(", ")}.`,
       "SOURCE_WORKTREE_DIRTY",
     );
-  }
-
-  const targetPath = resolve(options.targetPath);
-  const branchName = options.branchName;
-  if (options.existing?.path || options.existing?.branchName) {
-    if (options.existing.path !== targetPath || options.existing.branchName !== branchName) {
-      throw new GitPolicyError("Persisted dedicated worktree identity does not match this run.", "WORKTREE_IDENTITY_MISMATCH");
-    }
-    const branch = await options.targetGit.run(["branch", "--show-current"], commandOptions);
-    const top = await options.targetGit.run(["rev-parse", "--show-toplevel"], commandOptions);
-    if (branch.code !== 0 || top.code !== 0 || branch.stdout.trim() !== branchName || resolve(top.stdout.trim()) !== targetPath) {
-      throw new GitPolicyError("Persisted dedicated worktree cannot be verified.", "WORKTREE_IDENTITY_UNKNOWN");
-    }
-    const targetHead = await new GitWorkspace(options.targetGit, { cwd: targetPath }).head(commandOptions);
-    return { branchName, path: targetPath, baseCommit: targetHead };
   }
 
   await mkdir(dirname(targetPath), { recursive: true });

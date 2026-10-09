@@ -2,12 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { constants as fsConstants, realpathSync, statSync, accessSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { AcpAgent } from "@automatalabs/workflows";
 import { createSandboxedBackend, supportedBackendForModel, verifySandboxBoundary } from "./sandbox.js";
-import type { ReasoningEffort } from "./types.js";
+import { DEFAULT_MAX_REVIEW_ROUNDS, isValidStageTimeoutMs, type AgentPermissionMode, type ReasoningEffort } from "./types.js";
 
 const execFile = promisify(execFileCallback);
 const MAX_PROFILE_BYTES = 16 * 1024;
@@ -20,7 +22,14 @@ export interface ProjectPluginProfile {
   gitEntry: string;
   executorModel: string;
   reviewerModel: string;
+  /** Legacy shared effort for previously approved configurations. */
   reasoningEffort?: ReasoningEffort;
+  executorReasoningEffort?: ReasoningEffort;
+  reviewerReasoningEffort?: ReasoningEffort;
+  permissionMode: AgentPermissionMode;
+  reviewRoundLimit: number;
+  /** Whole-run Execution & Review budget in ms; `0` means no timeout. Absent keeps the recommended default. */
+  stageTimeoutMs?: number;
   /** Digest of the project-local, untrusted preference cache approved by the human. */
   configSha256: string;
   networkRiskApprovedAt: string;
@@ -32,6 +41,14 @@ export interface DetectedCli {
   version: string;
   models: string[];
 }
+
+export interface ClaudeNativeSandboxPreflight {
+  enabled: boolean;
+  socat?: string;
+  sources: string[];
+}
+
+const MAX_CLAUDE_SETTINGS_BYTES = 512 * 1024;
 
 function regularObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -62,8 +79,8 @@ export function parseOpenCodeModels(text: string): string[] {
   return [...models].sort();
 }
 
-function onPath(name: string): string | undefined {
-  for (const dir of (process.env.PATH ?? "").split(":")) {
+function onPath(name: string, pathValue = process.env.PATH ?? ""): string | undefined {
+  for (const dir of pathValue.split(":")) {
     if (!dir) continue;
     try {
       const executable = realpathSync(join(dir, name));
@@ -74,6 +91,64 @@ function onPath(name: string): string | undefined {
     }
   }
   return undefined;
+}
+
+async function claudeSandboxSetting(path: string): Promise<boolean | undefined> {
+  let stat;
+  try {
+    stat = await lstat(path);
+  } catch (error) {
+    if (regularObject(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_CLAUDE_SETTINGS_BYTES) {
+    throw new Error(`Refusing unsafe Claude settings file while checking native sandbox requirements: ${path}`);
+  }
+  const raw = await readFile(path, "utf8");
+  const errors: ParseError[] = [];
+  const parsed = parseJsonc(raw, errors, { allowTrailingComma: true });
+  if (errors.length || !regularObject(parsed)) {
+    throw new Error(`Claude settings file is not valid JSON/JSONC: ${path}`);
+  }
+  const sandbox = parsed.sandbox;
+  if (!regularObject(sandbox) || typeof sandbox.enabled !== "boolean") return undefined;
+  return sandbox.enabled;
+}
+
+/**
+ * Inspect only the user's own Claude Code sandbox configuration. The plugin does
+ * not enable Claude's inner Bash sandbox. If the user enables it natively, Linux/
+ * WSL Claude Code may need socat and setup should explain that dependency.
+ */
+export async function inspectClaudeNativeSandbox(
+  projectRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ClaudeNativeSandboxPreflight> {
+  const configRoot = resolve(env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude"));
+  const candidates = [
+    join(configRoot, "settings.json"),
+    join(resolve(projectRoot), ".claude", "settings.json"),
+    join(resolve(projectRoot), ".claude", "settings.local.json"),
+  ];
+  let configured: boolean | undefined;
+  const sources: string[] = [];
+  for (const path of candidates) {
+    const value = await claudeSandboxSetting(path);
+    if (value === undefined) continue;
+    configured = value;
+    sources.push(`${path}: sandbox.enabled=${String(value)}`);
+  }
+  const scrub = env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB?.trim().toLowerCase();
+  if (scrub === "1" || scrub === "true") {
+    configured = true;
+    sources.push("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is enabled in the host environment");
+  }
+  const socat = onPath("socat", env.PATH ?? "");
+  return {
+    enabled: configured === true,
+    ...(socat ? { socat } : {}),
+    sources,
+  };
 }
 
 /** Listing candidates is not verification: the selected model is still checked by live sandboxed ACP. */
@@ -205,10 +280,6 @@ export async function verifyAcpModelCall(
     reasoningEffort ? { reasoningEffort } : {});
 }
 
-export async function probeCodexAcpModels(projectRoot: string): Promise<string[]> {
-  return probeAcpModels(projectRoot, "codex");
-}
-
 async function projectIdentity(cwd: string): Promise<{ projectRoot: string; gitEntry: string }> {
   const projectRoot = await realpath(cwd);
   const git = join(projectRoot, ".git");
@@ -231,7 +302,13 @@ function validateProfile(value: unknown, identity: { projectRoot: string; gitEnt
     typeof value.executorModel !== "string" || typeof value.reviewerModel !== "string" ||
     typeof value.networkRiskApprovedAt !== "string" || !Number.isFinite(Date.parse(value.networkRiskApprovedAt)) ||
     typeof value.configSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.configSha256) ||
-    (value.reasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reasoningEffort as string))) {
+    (value.reasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reasoningEffort as string)) ||
+    (value.executorReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.executorReasoningEffort as string)) ||
+    (value.reviewerReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reviewerReasoningEffort as string)) ||
+    (value.reasoningEffort !== undefined && (value.executorReasoningEffort !== undefined || value.reviewerReasoningEffort !== undefined)) ||
+    (value.permissionMode !== "autonomous" && value.permissionMode !== "ask") ||
+    (value.stageTimeoutMs !== undefined && !isValidStageTimeoutMs(value.stageTimeoutMs)) ||
+    !Number.isInteger(value.reviewRoundLimit) || (value.reviewRoundLimit as number) < 1 || (value.reviewRoundLimit as number) > 100) {
     throw new Error("Saved plan-execute configuration is invalid or belongs to a different Git repository. Run /plan-execute setup again.");
   }
   supportedBackendForModel(value.executorModel);
@@ -252,6 +329,11 @@ function approvedCache(profile: ProjectPluginProfile): Record<string, unknown> {
     version: 1, projectRoot: profile.projectRoot, gitEntry: profile.gitEntry,
     executorModel: profile.executorModel, reviewerModel: profile.reviewerModel,
     ...(profile.reasoningEffort ? { reasoningEffort: profile.reasoningEffort } : {}),
+    ...(profile.executorReasoningEffort ? { executorReasoningEffort: profile.executorReasoningEffort } : {}),
+    ...(profile.reviewerReasoningEffort ? { reviewerReasoningEffort: profile.reviewerReasoningEffort } : {}),
+    permissionMode: profile.permissionMode,
+    reviewRoundLimit: profile.reviewRoundLimit,
+    ...(profile.stageTimeoutMs !== undefined ? { stageTimeoutMs: profile.stageTimeoutMs } : {}),
   };
 }
 
@@ -312,15 +394,24 @@ export async function loadProjectPluginProfile(cwd: string, agentDir = getAgentD
 /** Project cache is model-editable; only the protected user-owned digest and network consent authorize it. */
 export async function saveProjectPluginProfile(
   cwd: string,
-  selected: Pick<ProjectPluginProfile, "executorModel" | "reviewerModel" | "reasoningEffort">,
+  selected: Pick<ProjectPluginProfile, "executorModel" | "reviewerModel"> &
+    Partial<Pick<ProjectPluginProfile, "reasoningEffort" | "executorReasoningEffort" | "reviewerReasoningEffort" | "permissionMode" | "reviewRoundLimit" | "stageTimeoutMs">>,
   agentDir = getAgentDir(),
 ): Promise<ProjectPluginProfile> {
   const identity = await projectIdentity(cwd);
+  if (selected.stageTimeoutMs !== undefined && !isValidStageTimeoutMs(selected.stageTimeoutMs)) {
+    throw new Error("Execution timeout must be 0 (no timeout) or an integer number of milliseconds from 1 minute to 24 hours.");
+  }
   const approved = {
     version: 1, ...identity,
     executorModel: selected.executorModel,
     reviewerModel: selected.reviewerModel,
     ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}),
+    ...(selected.executorReasoningEffort ? { executorReasoningEffort: selected.executorReasoningEffort } : {}),
+    ...(selected.reviewerReasoningEffort ? { reviewerReasoningEffort: selected.reviewerReasoningEffort } : {}),
+    permissionMode: selected.permissionMode ?? "autonomous",
+    reviewRoundLimit: selected.reviewRoundLimit ?? DEFAULT_MAX_REVIEW_ROUNDS,
+    ...(selected.stageTimeoutMs !== undefined ? { stageTimeoutMs: selected.stageTimeoutMs } : {}),
   };
   const profile: ProjectPluginProfile = validateProfile({
     ...approved, configSha256: cacheHash(approved), networkRiskApprovedAt: new Date().toISOString(),

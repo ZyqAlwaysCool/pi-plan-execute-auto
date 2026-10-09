@@ -187,8 +187,12 @@ test("real single-phase workflow completes sandboxed acceptance and plugin-owned
         assert.equal(result.status, "completed", result.status === "paused" ? result.reason : undefined);
         const loaded = await loadValidatedRun(source, "live-test");
         assert.equal(loaded.state.status, "completed");
-        assert.equal(loaded.state.phases[0]?.phase_commit_sha, (await git("git", ["-C", worktree, "rev-parse", "HEAD"])).stdout.trim());
-        assert.notEqual(loaded.state.phases[0]?.phase_commit_sha, base);
+        const phaseState = loaded.state.phases[0];
+        assert.equal(phaseState?.phase_commit_sha, (await git("git", ["-C", worktree, "rev-parse", "HEAD"])).stdout.trim());
+        assert.notEqual(phaseState?.phase_commit_sha, base);
+        assert.ok(phaseState?.executor_session_id);
+        assert.ok(phaseState?.reviewer_session_id);
+        assert.notEqual(phaseState?.executor_session_id, phaseState?.reviewer_session_id);
         assert.equal(await readFile(join(worktree, "sample.txt"), "utf8"), "implemented\n");
         assert.equal(await readFile(join(source, "sample.txt"), "utf8"), "initial\n");
       } finally {

@@ -40,7 +40,13 @@ async function fixture(run: (ctx: { source: string; cwd: string; golden: string;
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
-for (const backend of ["claude", "pi"] as const) {
+const requestedBuiltins = (process.env.PI_PLAN_EXECUTE_ACP_TEST_BUILTINS ?? "claude,pi")
+  .split(",")
+  .map((value) => value.trim())
+  .filter((value): value is "claude" | "pi" => value === "claude" || value === "pi");
+if (requestedBuiltins.length === 0) throw new Error("PI_PLAN_EXECUTE_ACP_TEST_BUILTINS must include claude and/or pi.");
+
+for (const backend of requestedBuiltins) {
   const model = process.env[`PI_PLAN_EXECUTE_ACP_TEST_${backend.toUpperCase()}_MODEL`];
   if (!model || supportedBackendForModel(model) !== backend) {
     throw new Error(`Explicit PI_PLAN_EXECUTE_ACP_TEST_${backend.toUpperCase()}_MODEL=${backend}/<model> is required.`);
@@ -139,8 +145,12 @@ for (const backend of ["claude", "pi"] as const) {
         assert.equal(result.status, "completed", result.status === "paused" ? result.reason : undefined);
         const loaded = await loadValidatedRun(source, "live");
         assert.equal(loaded.state.status, "completed");
-        assert.equal(loaded.state.phases[0]?.phase_commit_sha, (await git("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim());
-        assert.notEqual(loaded.state.phases[0]?.phase_commit_sha, base);
+        const phaseState = loaded.state.phases[0];
+        assert.equal(phaseState?.phase_commit_sha, (await git("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim());
+        assert.notEqual(phaseState?.phase_commit_sha, base);
+        assert.ok(phaseState?.executor_session_id);
+        assert.ok(phaseState?.reviewer_session_id);
+        assert.notEqual(phaseState?.executor_session_id, phaseState?.reviewer_session_id);
         assert.equal(await readFile(join(cwd, "sample.txt"), "utf8"), "implemented\n");
         assert.equal(await readFile(join(source, "sample.txt"), "utf8"), "initial\n");
       } finally { await pair.close(); }

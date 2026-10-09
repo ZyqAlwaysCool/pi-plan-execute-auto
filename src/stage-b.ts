@@ -7,6 +7,7 @@ import {
   phaseCommitMessage,
   phaseCompletionPayloadSha256,
   phaseEvidenceHashesForRecord,
+  type GitHistorySnapshot,
   type PhaseEvidenceHashes,
   type WorkspaceSnapshot,
 } from "./git.js";
@@ -30,20 +31,26 @@ import {
   validateExecutionEvidence,
 } from "./reports.js";
 import {
+  DEFAULT_MAX_REVIEW_ROUNDS,
   RUNTIME_DIRECTORY,
   type AcceptanceCommandRunner,
   type AcceptanceResult,
   type ExecutionReport,
   type HarnessPair,
+  type PauseInput,
+  type PauseRecord,
+  type PauseStage,
   type PhaseCompletionRecord,
   type PhasePackage,
   type PhaseState,
   type ReviewReport,
+  type StageBPlanSnapshot,
   type StageBRunResult,
   type StageBStatusEvent,
   type ValidatedPackage,
   type WorkflowState,
 } from "./types.js";
+import { abortPauseInput, createPauseRecord, formatPauseReason } from "./pause.js";
 import {
   validatePackageDirectory,
   writeJsonAtomic,
@@ -90,8 +97,25 @@ function snapshotsEqual(left: WorkspaceSnapshot, right: WorkspaceSnapshot): bool
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function historyAndIndexEqual(left: WorkspaceSnapshot, right: WorkspaceSnapshot): boolean {
-  return left.head === right.head && left.branch === right.branch && left.refs === right.refs && left.reflog === right.reflog && left.unreachable === right.unreachable && left.ignored === right.ignored && left.index === right.index;
+const GIT_HISTORY_FIELDS = ["head", "branch", "refs", "reflog", "unreachable", "index"] as const;
+
+function changedGitHistoryFields(left: GitHistorySnapshot, right: GitHistorySnapshot): string[] {
+  return GIT_HISTORY_FIELDS.filter((field) => left[field] !== right[field]);
+}
+
+/**
+ * Gitignored dependency/build artifacts are outside the phase commit boundary. They may change
+ * freely while the Executor installs or builds, but the Reviewer is told when they changed so
+ * acceptance poisoning stays visible instead of silent.
+ */
+function ignoredChangeNote(before: string, after: string): string | undefined {
+  if (before === after) return undefined;
+  return [
+    "The Executor changed gitignored dependency/build artifacts.",
+    `ignored top-level entries before: ${before}`,
+    `ignored top-level entries after: ${after}`,
+    "Ignored artifacts never enter the phase commit; inspect them only if they could influence acceptance or hide unreviewed behavior.",
+  ].join("\n");
 }
 
 function deliverableSnapshotsEqual(left: WorkspaceSnapshot, right: WorkspaceSnapshot): boolean {
@@ -120,6 +144,8 @@ export interface StageBControllerOptions {
   gitTimeoutMs?: number | undefined;
   /** Extension entry points set this; unit tests may use an explicitly in-memory harness. */
   requireDedicatedWorktree?: boolean;
+  /** Explicit safe-resume: rebuild fresh ACP sessions around persisted phase/worktree evidence. */
+  resumePaused?: boolean;
 }
 
 /**
@@ -136,7 +162,7 @@ export class StageBController {
   constructor(options: StageBControllerOptions) {
     this.options = options;
     this.state = options.state;
-    this.maxReviewRounds = options.maxReviewRounds ?? options.package.manifest.max_review_rounds ?? 3;
+    this.maxReviewRounds = options.maxReviewRounds ?? options.state.review_round_limit ?? options.package.manifest.max_review_rounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
     this.acceptanceTimeoutMs = options.acceptanceTimeoutMs ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
   }
@@ -208,12 +234,13 @@ export class StageBController {
     return changed.filter((path) => !isPathAllowed(path, phase.acceptance.scope.allowed_paths));
   }
 
-  private async assertNoHistoryOrIndexMutation(before: WorkspaceSnapshot, actor: string): Promise<WorkspaceSnapshot> {
-    const after = await this.options.git.snapshot(this.gitOptions());
-    if (!historyAndIndexEqual(before, after)) {
+  private async assertNoHistoryOrIndexMutation(before: GitHistorySnapshot, actor: string): Promise<GitHistorySnapshot> {
+    const after = await this.options.git.historySnapshot(this.gitOptions());
+    const changed = changedGitHistoryFields(before, after);
+    if (changed.length > 0) {
       throw new WorkflowPauseError(
         "HARNESS_CHANGED_HISTORY",
-        `${actor} changed Git HEAD, branch refs, reflog, unreachable objects, ignored files, or index; no reset was attempted.`,
+        `${actor} changed Git ${changed.join(", ")}; no reset was attempted.`,
       );
     }
     return after;
@@ -371,10 +398,13 @@ export class StageBController {
         phase.acceptance,
       );
       const head = await this.options.git.head(this.gitOptions());
-      if (head !== evidence.record.phase_commit_sha) {
+      if (
+        head !== evidence.record.phase_commit_sha &&
+        !(await this.options.git.isAncestor(evidence.record.phase_commit_sha, head, this.gitOptions()))
+      ) {
         throw new WorkflowPauseError(
           "COMPLETION_HEAD_MISMATCH",
-          `Completion record expects HEAD ${evidence.record.phase_commit_sha}, but worktree is at ${head}.`,
+          `Completion record commit ${evidence.record.phase_commit_sha} is not an ancestor of worktree HEAD ${head}; the plugin did not reset anything.`,
         );
       }
       try {
@@ -436,6 +466,10 @@ export class StageBController {
       promptSection("golden_manifest", JSON.stringify(this.options.package.manifest, null, 2), 12_000),
       `phase_id: ${phase.phase.id}`,
       `round: ${round}`,
+      `review_round_limit: ${this.maxReviewRounds}`,
+      `review_rounds_remaining_including_this_round: ${this.maxReviewRounds - round + 1}`,
+      `review_rounds_remaining_after_this_round: ${this.maxReviewRounds - round}`,
+      "Use the remaining review budget deliberately: finish the current phase, run all required self-tests, and address all known findings before returning.",
       `phase_base_commit: ${baseCommit}`,
       `allowed_paths: ${JSON.stringify(phase.acceptance.scope.allowed_paths)}`,
       promptSection("CURRENT PHASE SPEC", phase.spec, 20_000),
@@ -457,6 +491,7 @@ export class StageBController {
     execution: ExecutionReport,
     acceptance: AcceptanceResult[],
     history: ReviewReport[],
+    workspaceNote?: string,
   ): string {
     const previousFindings = history.flatMap((report) => report.findings).map((finding) => ({
       id: finding.id,
@@ -497,10 +532,15 @@ export class StageBController {
       promptSection("golden_manifest", JSON.stringify(this.options.package.manifest, null, 2), 12_000),
       `phase_id: ${phase.phase.id}`,
       `round: ${round}`,
+      `review_round_limit: ${this.maxReviewRounds}`,
+      `review_rounds_remaining_including_this_round: ${this.maxReviewRounds - round + 1}`,
+      `review_rounds_remaining_after_this_round: ${this.maxReviewRounds - round}`,
+      "Use the remaining review budget explicitly: identify every blocking issue now, avoid drip-feeding findings across rounds, and PASS only when this phase is actually acceptable.",
       `phase_base_commit: ${baseCommit}`,
       promptSection("CURRENT PHASE SPEC", phase.spec, 20_000),
       promptSection("CURRENT PHASE ACCEPTANCE CONTRACT", JSON.stringify(phase.acceptance, null, 2), 12_000),
       promptSection("ACTUAL DIFF PREVIEW (the full immutable patch is at complete_canonical_diff_path)", diff || "(no tracked or untracked changes)", 24_000),
+      ...(workspaceNote ? [promptSection("EXECUTOR WORKSPACE NOTE (advisory; ignored artifacts are outside the phase commit boundary)", workspaceNote, 4_000)] : []),
       promptSection("EXECUTOR REPORT (evidence to verify, not authority)", JSON.stringify(execution, null, 2), 12_000),
       promptSection("PLUGIN ACCEPTANCE RESULTS", JSON.stringify(acceptance, null, 2), 10_000),
       promptSection("PREVIOUS REVIEW REPORT PATHS (all must remain in scope)", JSON.stringify(reportPaths, null, 2), 8_000),
@@ -511,6 +551,35 @@ export class StageBController {
       "PASS is allowed only when there are no blocking findings, all previous blocking findings are resolved, and deterministic acceptance is green.",
     ];
     return lines.join("\n\n");
+  }
+
+  private resumeFeedback(
+    phase: PhasePackage,
+    history: ReviewReport[],
+  ): string {
+    const state = this.phaseState(phase);
+    const pause = this.state.pause;
+    const previousPause = pause
+      ? `[${pause.code}] ${pause.summary}${pause.detail && pause.detail !== pause.summary ? ` (${pause.detail})` : ""}`
+      : state.last_error ?? this.state.pause_reason ?? "(unknown)";
+    const pieces = [
+      "RESUME CHECKPOINT: a previous ACP session ended before this phase completed.",
+      "This is a fresh Executor session. Do not assume conversational memory from the prior session.",
+      `Persisted rounds already consumed: ${state.review_rounds} of ${this.maxReviewRounds}.`,
+      `Previous pause: ${previousPause}`,
+      "Inspect the actual current worktree diff and frozen phase contract before changing anything.",
+      "Preserve valid in-scope partial work; fix it in place rather than resetting or discarding the worktree.",
+    ];
+    if (state.acceptance_results?.length) {
+      pieces.push(`Last persisted deterministic acceptance:\n${formatAcceptanceResults(state.acceptance_results)}`);
+    }
+    if (state.unresolved_findings.length > 0) {
+      pieces.push(`Persisted unresolved findings:\n${state.unresolved_findings.map((finding) => `- ${finding.id}: ${finding.summary}`).join("\n")}`);
+    }
+    const lastReview = history.at(-1);
+    if (lastReview) pieces.push(`Last persisted Reviewer report:\n${formatReviewFeedback(lastReview)}`);
+    pieces.push("Continue CURRENT PHASE ONLY, rerun every required self-test, and return a fresh structured execution report. Do not commit.");
+    return pieces.join("\n\n");
   }
 
   private feedbackForExecution(
@@ -532,11 +601,16 @@ export class StageBController {
     return pieces.join("\n\n");
   }
 
-  private async pause(phase: PhasePackage | undefined, reason: string, code: string): Promise<StageBRunResult> {
+  private async pause(phase: PhasePackage | undefined, input: PauseInput): Promise<StageBRunResult> {
+    const phaseState = phase ? this.phaseState(phase) : undefined;
+    const record: PauseRecord = createPauseRecord({
+      ...input,
+      ...(phase && phaseState ? { phase_id: phase.phase.id, round: phaseState.review_rounds } : {}),
+    });
     this.state.status = "paused";
-    this.state.pause_reason = `[${code}] ${reason}`;
-    if (phase) {
-      const phaseState = this.phaseState(phase);
+    this.state.pause = record;
+    this.state.pause_reason = formatPauseReason(record);
+    if (phase && phaseState) {
       if (phaseState.status !== "completed") {
         phaseState.status = "paused";
         phaseState.last_error = this.state.pause_reason;
@@ -544,19 +618,40 @@ export class StageBController {
       this.emit({
         phase_id: phase.phase.id,
         round: phaseState.review_rounds,
-        executor_status: "failed",
-        reviewer_status: "failed",
+        executor_status: "interrupted",
+        reviewer_status: "interrupted",
         message: this.state.pause_reason,
+        pause: record,
+        plan: this.planSnapshot(),
       });
     }
     await this.save();
-    const pauseReason = this.state.pause_reason ?? `[${code}] ${reason}`;
-    return { status: "paused", state: this.state, reason: pauseReason };
+    const pauseReason = this.state.pause_reason ?? formatPauseReason(record);
+    return { status: "paused", state: this.state, reason: pauseReason, pause: record };
+  }
+
+  /** Classify the Stage B abort signal into a precise, resumability-aware pause cause. */
+  private abortPause(stage: PauseStage, summary: string): PauseInput {
+    return abortPauseInput(this.options.signal?.reason, { stage, summary });
+  }
+
+  /** Cheap plan progress snapshot shared by every status event and the live widget. */
+  private planSnapshot(): StageBPlanSnapshot {
+    const phases = this.options.package.phases;
+    const phaseStatuses = phases.map((phase) => this.phaseState(phase).status);
+    return {
+      phase_ids: phases.map((phase) => phase.phase.id),
+      phase_statuses: phaseStatuses,
+      current_index: phaseStatuses.findIndex((status) => status !== "completed"),
+      review_round_limit: this.maxReviewRounds,
+    };
   }
 
   private async phase(phase: PhasePackage): Promise<StageBRunResult | undefined> {
     await this.assertCompletedEvidence();
     const phaseState = this.phaseState(phase);
+    const resumingFromCheckpoint = this.options.resumePaused === true &&
+      (phaseState.status === "paused" || phaseState.status === "running");
     if (phaseState.status === "completed") {
       if (!(await this.reconcileCompletion(phase))) {
         throw new WorkflowPauseError("COMPLETION_RECORD_MISSING", `Completed phase ${phase.phase.id} has no immutable completion record.`);
@@ -587,11 +682,12 @@ export class StageBController {
       phaseState.status = "running";
     }
 
-    let feedback: string | undefined;
     let history = await this.loadReviewHistory(phase);
+    let feedback: string | undefined = resumingFromCheckpoint ? this.resumeFeedback(phase, history) : undefined;
+    let freshResumeTurn = resumingFromCheckpoint;
     while (phaseState.review_rounds < this.maxReviewRounds) {
       if (this.options.signal?.aborted) {
-        return this.pause(phase, "Stage B was cancelled before phase completion.", "ABORTED");
+        return this.pause(phase, this.abortPause("phase", "Execution & Review was cancelled before phase completion."));
       }
       const round = phaseState.review_rounds + 1;
       await this.assertPackageUnchanged();
@@ -599,13 +695,19 @@ export class StageBController {
       await this.options.git.assertNoCachedChanges(this.gitOptions());
       const initialDiff = await this.options.git.diffFrom(baseCommit, this.gitOptions());
       const beforeExecutorReports = await this.captureReportHashes(phase);
-      const beforeExecutorSnapshot = await this.options.git.snapshot(this.gitOptions());
+      const beforeExecutorHistory = await this.options.git.historySnapshot(this.gitOptions());
+      const beforeExecutorIgnored = await this.options.git.ignoredSummary(this.gitOptions());
       this.emit({
         phase_id: phase.phase.id,
         round,
         executor_status: "running",
         reviewer_status: "pending",
-        message: feedback ? "Executor resuming same session after feedback." : "Executor implementing current phase.",
+        message: freshResumeTurn
+          ? "Executor rebuilding a fresh session from the persisted resume checkpoint."
+          : feedback
+            ? "Executor resuming same session after feedback."
+            : "Executor implementing current phase.",
+        plan: this.planSnapshot(),
       });
 
       const harnessOptions = {
@@ -636,7 +738,7 @@ export class StageBController {
         );
       } catch (error) {
         if (this.options.signal?.aborted) {
-          return this.pause(phase, "Stage B was cancelled during Executor execution.", "ABORTED");
+          return this.pause(phase, this.abortPause("executor", "Execution & Review was cancelled during Executor execution."));
         }
         if (error instanceof WorkflowPauseError) throw error;
         throw new WorkflowPauseError(
@@ -644,7 +746,12 @@ export class StageBController {
           `Executor harness failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      await this.assertNoHistoryOrIndexMutation(beforeExecutorSnapshot, "Executor");
+      freshResumeTurn = false;
+      await this.assertNoHistoryOrIndexMutation(beforeExecutorHistory, "Executor");
+      const executorWorkspaceNote = ignoredChangeNote(
+        beforeExecutorIgnored,
+        await this.options.git.ignoredSummary(this.gitOptions()),
+      );
       await this.assertReportHashes(beforeExecutorReports, "Executor");
       await this.assertPackageUnchanged();
       await this.assertCompletedEvidence();
@@ -658,9 +765,9 @@ export class StageBController {
       const evidenceError = validateExecutionEvidence(execution, phase.acceptance, actualChanged);
       const outOfScope = await this.assertScope(phase);
       const beforeAcceptanceReports = await this.captureReportHashes(phase);
-      const beforeAcceptanceSnapshot = await this.options.git.snapshot(this.gitOptions());
+      const beforeAcceptanceHistory = await this.options.git.historySnapshot(this.gitOptions());
       const acceptance = await runAcceptance(phase.acceptance, this.options.acceptanceRunner, this.acceptanceOptions());
-      await this.assertNoHistoryOrIndexMutation(beforeAcceptanceSnapshot, "Deterministic acceptance");
+      await this.assertNoHistoryOrIndexMutation(beforeAcceptanceHistory, "Deterministic acceptance");
       await this.assertReportHashes(beforeAcceptanceReports, "Deterministic acceptance");
       await this.assertCompletedEvidence();
       await this.writeAcceptanceResults(phase, round, acceptance);
@@ -668,7 +775,7 @@ export class StageBController {
       if (execution.status !== "complete" || evidenceError || outOfScope.length > 0 || !requiredAcceptancePassed(acceptance)) {
         feedback = this.feedbackForExecution(execution, acceptance, outOfScope, undefined, evidenceError);
         if (round >= this.maxReviewRounds) {
-          return this.pause(phase, `Phase did not pass deterministic validation after ${round} review rounds.`, "MAX_REVIEW_ROUNDS");
+          return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "acceptance", summary: `Phase did not pass deterministic validation after ${round} review rounds.` });
         }
         continue;
       }
@@ -686,11 +793,12 @@ export class StageBController {
         executor_status: "complete",
         reviewer_status: "running",
         message: "Independent reviewer inspecting current phase diff.",
+        plan: this.planSnapshot(),
       });
       let review: ReviewReport;
       try {
         const raw = await this.options.harness.review(
-          this.reviewerPrompt(phase, baseCommit, round, reviewDiff, reviewDiffAbsolute, reviewDiffSha256, execution, acceptance, history),
+          this.reviewerPrompt(phase, baseCommit, round, reviewDiff, reviewDiffAbsolute, reviewDiffSha256, execution, acceptance, history, executorWorkspaceNote),
           round,
           harnessOptions,
         );
@@ -705,7 +813,7 @@ export class StageBController {
         );
       } catch (error) {
         if (this.options.signal?.aborted) {
-          return this.pause(phase, "Stage B was cancelled during Reviewer execution.", "ABORTED");
+          return this.pause(phase, this.abortPause("reviewer", "Execution & Review was cancelled during Reviewer execution."));
         }
         if (error instanceof WorkflowPauseError) throw error;
         throw new WorkflowPauseError(
@@ -740,10 +848,11 @@ export class StageBController {
           executor_status: "complete",
           reviewer_status: "rework",
           message: `Reviewer requested rework: ${review.summary}`,
+          plan: this.planSnapshot(),
         });
         feedback = this.feedbackForExecution(execution, acceptance, [], review);
         if (round >= this.maxReviewRounds) {
-          return this.pause(phase, `Reviewer did not PASS after ${round} review rounds.`, "MAX_REVIEW_ROUNDS");
+          return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "reviewer", summary: `Reviewer did not PASS after ${round} review rounds.` });
         }
         continue;
       }
@@ -775,7 +884,7 @@ export class StageBController {
       if (!requiredAcceptancePassed(finalAcceptance) || finalOutOfScope.length > 0) {
         feedback = this.feedbackForExecution(execution, finalAcceptance, finalOutOfScope, review);
         if (round >= this.maxReviewRounds) {
-          return this.pause(phase, `Acceptance failed after reviewer PASS on round ${round}.`, "MAX_REVIEW_ROUNDS");
+          return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "acceptance", summary: `Acceptance failed after reviewer PASS on round ${round}.` });
         }
         continue;
       }
@@ -884,15 +993,27 @@ export class StageBController {
         executor_status: "complete",
         reviewer_status: "pass",
         message: `Phase committed at ${phaseCommit}.`,
+        plan: this.planSnapshot(),
       });
       return undefined;
     }
 
-    return this.pause(phase, `Phase reached max_review_rounds=${this.maxReviewRounds}.`, "MAX_REVIEW_ROUNDS");
+    return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "reviewer", summary: `Phase reached max_review_rounds=${this.maxReviewRounds}.` });
   }
 
   async run(): Promise<StageBRunResult> {
-    if (this.state.status === "paused" || this.state.status === "completed" || this.state.status === "cancelled") {
+    if (this.state.status === "draft") {
+      return {
+        status: "not_started",
+        state: this.state,
+        reason: "Human approval is required before Execution & Review; draft planning never starts Executor or Reviewer sessions.",
+      };
+    }
+    if (
+      (this.state.status === "paused" && this.options.resumePaused !== true) ||
+      this.state.status === "completed" ||
+      this.state.status === "cancelled"
+    ) {
       return this.state.status === "completed"
         ? { status: "completed", state: this.state }
         : this.state.pause_reason
@@ -904,6 +1025,7 @@ export class StageBController {
       this.state.status = "running";
       this.state.started_at ??= new Date().toISOString();
       delete this.state.pause_reason;
+      delete this.state.pause;
       await this.save();
       if (this.options.requireDedicatedWorktree !== false) await this.options.git.assertDedicatedIdentity();
       await this.assertPackageUnchanged();
@@ -918,11 +1040,11 @@ export class StageBController {
       await this.save();
       return { status: "completed", state: this.state };
     } catch (error) {
-      if (this.options.signal?.aborted) return this.pause(currentPhase, "Stage B was cancelled.", "ABORTED");
-      if (error instanceof WorkflowPauseError) return this.pause(currentPhase, error.message, error.code);
-      if (error instanceof GitPolicyError) return this.pause(currentPhase, error.message, error.code);
+      if (this.options.signal?.aborted) return this.pause(currentPhase, this.abortPause("unknown", "Execution & Review was cancelled."));
+      if (error instanceof WorkflowPauseError) return this.pause(currentPhase, { code: error.code, stage: "unknown", summary: error.message });
+      if (error instanceof GitPolicyError) return this.pause(currentPhase, { code: error.code, stage: "unknown", summary: error.message });
       const message = error instanceof Error ? error.message : String(error);
-      return this.pause(currentPhase, message, "STAGE_B_ERROR");
+      return this.pause(currentPhase, { code: "STAGE_B_ERROR", stage: "unknown", summary: message });
     }
   }
 }

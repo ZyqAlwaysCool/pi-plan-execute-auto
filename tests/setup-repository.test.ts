@@ -1,7 +1,7 @@
 import { execFile as callback } from "node:child_process";
 import { lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -33,13 +33,15 @@ test("setup does not initialize Git unless the human explicitly selects it", asy
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("initializing only creates .git; no user files are added or committed", async () => {
+test("initializing configures a repository-local runtime ignore rule without changing project files", async () => {
   const { root, project } = await fixture();
   const notes: string[] = [];
   try {
     await writeFile(join(project, "user-file.txt"), "keep these bytes\n");
     assert.equal(await ensureSetupRepository(project, ui("Initialize Git repository here (no files staged)", false, notes)), true);
     assert.equal(await exists(join(project, ".git")), true);
+    assert.equal(await exists(join(project, ".gitignore")), false);
+    assert.match(await readFile(join(project, ".git", "info", "exclude"), "utf8"), /\.pi-plan-execute-auto\//);
     assert.equal(await readFile(join(project, "user-file.txt"), "utf8"), "keep these bytes\n");
     await assert.rejects(git("git", ["-C", project, "rev-parse", "--verify", "HEAD"]));
     assert.equal((await git("git", ["-C", project, "ls-files"])).stdout.trim(), "");
@@ -63,6 +65,37 @@ test("separately approved baseline commit is empty and never captures untracked 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("setup appends the runtime rule once to Git info/exclude without changing .gitignore", async () => {
+  const { root, project } = await fixture();
+  try {
+    await git("git", ["-C", project, "init", "-q"]);
+    await writeFile(join(project, ".gitignore"), "# existing\r\nnode_modules/\n", "utf8");
+    const before = await readFile(join(project, ".gitignore"), "utf8");
+    await ensureSetupRepository(project, ui("unused", false));
+    await ensureSetupRepository(project, ui("unused", false));
+    assert.equal(await readFile(join(project, ".gitignore"), "utf8"), before);
+    const exclude = await readFile(join(project, ".git", "info", "exclude"), "utf8");
+    assert.equal((exclude.match(/\.pi-plan-execute-auto\//g) ?? []).length, 1);
+    await mkdir(join(project, ".pi-plan-execute-auto"));
+    await writeFile(join(project, ".pi-plan-execute-auto", "config.json"), "{}\n");
+    assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "?? .gitignore");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("setup refuses a symlinked Git info/exclude without changing its target", async () => {
+  const { root, project } = await fixture();
+  try {
+    await git("git", ["-C", project, "init", "-q"]);
+    const exclude = join(project, ".git", "info", "exclude");
+    const outside = join(root, "outside-ignore");
+    await writeFile(outside, "keep\n");
+    await rm(exclude, { force: true });
+    await symlink(outside, exclude);
+    await assert.rejects(ensureSetupRepository(project, ui("unused", false)), /symlinked Git info\/exclude/);
+    assert.equal(await readFile(outside, "utf8"), "keep\n");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("an unborn repository with staged files is never committed automatically", async () => {
   const { root, project } = await fixture();
   try {
@@ -77,6 +110,28 @@ test("an unborn repository with staged files is never committed automatically", 
     await assert.rejects(git("git", ["-C", project, "rev-parse", "--verify", "HEAD"]));
     assert.equal((await git("git", ["-C", project, "status", "--porcelain"])).stdout.trim(), "A  staged.txt");
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("setup uses the common Git info/exclude when started from a linked worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-linked-worktree-"));
+  const main = join(root, "main");
+  const linked = join(root, "linked");
+  try {
+    await mkdir(main);
+    await git("git", ["-C", main, "init", "-q"]);
+    await git("git", ["-C", main, "config", "user.name", "Setup Fixture"]);
+    await git("git", ["-C", main, "config", "user.email", "setup@example.invalid"]);
+    await git("git", ["-C", main, "commit", "--allow-empty", "-m", "base"]);
+    await git("git", ["-C", main, "worktree", "add", "-b", "linked-test", linked]);
+    assert.equal(await ensureSetupRepository(linked, ui("unused", false)), true);
+    const common = (await git("git", ["-C", linked, "rev-parse", "--git-common-dir"])).stdout.trim();
+    const commonDir = resolve(linked, common);
+    assert.match(await readFile(join(commonDir, "info", "exclude"), "utf8"), /\.pi-plan-execute-auto\//);
+    assert.equal(await exists(join(linked, ".gitignore")), false);
+  } finally {
+    await git("git", ["-C", main, "worktree", "remove", "--force", linked]).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("host GIT_DIR/GIT_WORK_TREE variables cannot redirect setup", async () => {

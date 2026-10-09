@@ -7,6 +7,7 @@ import {
 } from "@automatalabs/workflows";
 import { Type, type TSchema } from "typebox";
 import type {
+  AgentPermissionMode,
   ExecutionReport,
   HarnessPair,
   ReasoningEffort,
@@ -18,7 +19,9 @@ import {
   MAX_REPORT_LIST_ITEMS,
   MAX_REPORT_STRING_LENGTH,
 } from "./reports.js";
-import { createSandboxedBackend, verifySandboxBoundary, type SandboxedBackend } from "./sandbox.js";
+import { defaultIsolationProvider } from "./isolation-provider.js";
+import type { SandboxedBackend } from "./sandbox.js";
+import { appendAgentSessionEvent, summarizeAgentPrompt, summarizeAgentTurn } from "./run-log.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -86,30 +89,36 @@ function invalidStructuredTurn(role: "executor" | "reviewer", turn: AcpAgentTurn
   return new Error(`${role} ACP turn did not yield a structured report (stop=${turn.stopReason}, attempts=${turn.structuredAttempts ?? 0}, text_bytes=${Buffer.byteLength(turn.text)}, structured_error=${turn.structuredError?.slice(0, 300) ?? "none"}).`);
 }
 
+function selectedPermissionOptionId(request: RequestPermissionRequest, allow: boolean): string | undefined {
+  return (allow
+    ? request.options.find((option) => option.kind === "allow_once")
+      ?? request.options.find((option) => option.kind === "allow_always")
+    : request.options.find((option) => option.kind === "reject_once")
+      ?? request.options.find((option) => option.kind === "reject_always"))?.optionId;
+}
+
 function selectedPermission(request: RequestPermissionRequest, allow: boolean): ReturnType<typeof selectPermissionOption> {
-  const wanted = request.options.find((option) =>
-    allow ? option.kind === "allow_once" : option.kind === "reject_once" || option.kind === "reject_always",
-  );
-  return wanted ? selectPermissionOption(request, wanted.optionId) : { outcome: { outcome: "cancelled" } };
+  const optionId = selectedPermissionOptionId(request, allow);
+  return optionId ? selectPermissionOption(request, optionId) : { outcome: { outcome: "cancelled" } };
 }
 
 function reviewerPermission(request: RequestPermissionRequest): ReturnType<typeof selectPermissionOption> {
-  // Codex requests permission even for read-only Git commands. The verified OS
-  // read-only mount is the boundary; grant one tool call, never a persistent grant.
+  // The verified OS read-only mount is the Reviewer write boundary. Autonomous
+  // mode prefers one-time grants and falls back to a CLI-advertised persistent allow.
   return selectedPermission(request, true);
 }
 
 function executorPermission(request: RequestPermissionRequest): ReturnType<typeof selectPermissionOption> {
-  // Allow one tool call only after the OS mount probe passed. The worktree is the
-  // only persistent writable project root; Git metadata remains read-only.
+  // Autonomous mode keeps the native CLI moving without user interaction. It
+  // prefers one-time grants; the dedicated worktree remains the host write boundary.
   return selectedPermission(request, true);
 }
 
 export function requireAcpNetworkRiskAcknowledgement(approvedProjectProfile = false): void {
   if (!approvedProjectProfile && process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK !== "1") {
     throw new Error(
-      "ACP tool network egress is not OS-isolated. Stage B is disabled by default; " +
-      "for a non-sensitive repository only, set PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 after acknowledging that ACP tools can transmit workspace data.",
+      "Execution & Review uses the selected Agent CLIs with their normal network access. " +
+      "Headless mode requires PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 to explicitly acknowledge that behavior.",
     );
   }
 }
@@ -141,9 +150,19 @@ export interface AgentPrismSessionPairOptions {
   executorMode?: string;
   reviewerMode?: string;
   schemaRetries?: number;
+  /** Legacy shared effort for callers not using per-role configuration. */
   reasoningEffort?: ReasoningEffort;
+  executorReasoningEffort?: ReasoningEffort;
+  reviewerReasoningEffort?: ReasoningEffort;
   /** Verified user-owned project profile consent; headless runs may use the explicit env fallback. */
   networkRiskApproved?: boolean;
+  permissionMode?: AgentPermissionMode;
+  /** Run root for local diagnostic transcripts; no provider credential material is intentionally recorded. */
+  runRoot?: string;
+  onPermissionChoice?: (
+    role: "executor" | "reviewer",
+    request: RequestPermissionRequest,
+  ) => Promise<string | undefined>;
   onLiveEvent?: (role: "executor" | "reviewer", event: string) => void;
 }
 
@@ -163,17 +182,55 @@ export class AgentPrismSessionPair implements HarnessPair {
     this.options = options;
   }
 
+  private async audit(type: string, details: Record<string, unknown>): Promise<void> {
+    if (!this.options.runRoot) return;
+    const role = details.role;
+    const sessionId = details.session_id;
+    if ((role === "executor" || role === "reviewer") && typeof sessionId === "string" && sessionId) {
+      await appendAgentSessionEvent(this.options.runRoot, role, sessionId, type, details).catch(() => undefined);
+    }
+  }
+
   private async closeExecutorSession(): Promise<void> {
     const agent = this.executor;
     const sandbox = this.executorSandbox;
     this.executor = undefined;
     this.executorSandbox = undefined;
     this.executorBaseCommit = undefined;
+    if (agent) await this.audit("agent_session_closed", {
+      role: "executor", session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+    });
     try {
       await agent?.close({ keep: true });
     } finally {
       await sandbox?.cleanup();
     }
+  }
+
+  private permissionResolver(role: "executor" | "reviewer") {
+    return async (request: RequestPermissionRequest) => {
+      const tool = request.toolCall.title ?? request.toolCall.name ?? request.toolCall.toolCallId;
+      const activeSession = role === "executor" ? this.executor?.sessionId : this.reviewer?.sessionId;
+      if ((this.options.permissionMode ?? "autonomous") === "autonomous") {
+        const optionId = selectedPermissionOptionId(request, true);
+        const option = request.options.find((entry) => entry.optionId === optionId);
+        const autoApproved = option?.kind === "allow_once" || option?.kind === "allow_always";
+        if (!autoApproved) {
+          // Autonomous auto-approvals carry no diagnostic value; only denials/cancellations do.
+          await this.audit("agent_permission", {
+            role, session_id: activeSession ?? null, mode: "autonomous", tool, selected_option_id: optionId ?? null,
+            options: request.options.map((entry) => ({ option_id: entry.optionId, name: entry.name, kind: entry.kind })),
+          });
+        }
+        return role === "executor" ? executorPermission(request) : reviewerPermission(request);
+      }
+      const optionId = await this.options.onPermissionChoice?.(role, request);
+      await this.audit("agent_permission", {
+        role, session_id: activeSession ?? null, mode: "ask", tool, selected_option_id: optionId ?? null,
+        options: request.options.map((option) => ({ option_id: option.optionId, name: option.name, kind: option.kind })),
+      });
+      return optionId ? selectPermissionOption(request, optionId) : { outcome: { outcome: "cancelled" as const } };
+    };
   }
 
   private async getExecutor(signal: AbortSignal | undefined, phaseBaseCommit: string): Promise<AcpAgent> {
@@ -190,10 +247,10 @@ export class AgentPrismSessionPair implements HarnessPair {
         includeProviderCredentials: true,
         ...(signal ? { signal } : {}),
       };
-      const sandbox = await createSandboxedBackend(sandboxOptions);
+      const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
       let agent: AcpAgent | undefined;
       try {
-        await verifySandboxBoundary(sandboxOptions);
+        await defaultIsolationProvider.verifyBoundary(sandboxOptions);
         agent = new AcpAgent({
           cwd: this.options.cwd,
           ...(model ? { model } : {}),
@@ -204,15 +261,20 @@ export class AgentPrismSessionPair implements HarnessPair {
           schemaRetries: this.options.schemaRetries ?? 2,
           permissions: { defaultOutcome: "deny" },
           ...(signal ? { signal } : {}),
-          onPermissionRequest: executorPermission,
+          onPermissionRequest: this.permissionResolver("executor"),
           retainHistory: true,
         });
         await agent.ready();
-        if (this.options.reasoningEffort) await requireReasoningEffort(agent, this.options.reasoningEffort);
+        const effort = this.options.executorReasoningEffort ?? this.options.reasoningEffort;
+        if (effort) await requireReasoningEffort(agent, effort);
         if (this.options.executorMode && agent.modes?.currentModeId !== this.options.executorMode) {
           throw new Error(`Executor backend ${agent.backendId} did not enter the required ${this.options.executorMode} mode.`);
         }
         await sandbox.scrubCredentials();
+        await this.audit("agent_session_started", {
+          role: "executor", session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+          phase_base_commit: phaseBaseCommit,
+        });
         this.executor = agent;
         this.executorSandbox = sandbox;
         this.executorBaseCommit = phaseBaseCommit;
@@ -231,8 +293,14 @@ export class AgentPrismSessionPair implements HarnessPair {
     prompt: string,
     options?: { signal?: AbortSignal },
   ): Promise<AcpAgentTurn> {
+    await this.audit("agent_prompt", {
+      role, session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+      ...summarizeAgentPrompt(prompt),
+    });
     let turn: AcpAgentTurn | undefined;
+    const eventCounts: Record<string, number> = {};
     for await (const event of agent.stream(prompt, options)) {
+      eventCounts[event.type] = (eventCounts[event.type] ?? 0) + 1;
       try {
         this.options.onLiveEvent?.(role, event.type);
       } catch {
@@ -241,6 +309,17 @@ export class AgentPrismSessionPair implements HarnessPair {
       if (event.type === "turn") turn = event.turn;
     }
     if (!turn) throw new Error(`${role} ACP stream ended without a terminal turn.`);
+    await this.audit("agent_turn", {
+      role,
+      session_id: agent.sessionId,
+      backend: agent.backendId,
+      model: agent.model,
+      stop_reason: turn.stopReason,
+      structured_attempts: turn.structuredAttempts,
+      structured_error: turn.structuredError,
+      event_counts: eventCounts,
+      ...summarizeAgentTurn(turn.text, turn.structured),
+    });
     return turn;
   }
 
@@ -293,17 +372,17 @@ export class AgentPrismSessionPair implements HarnessPair {
       includeProviderCredentials: true,
       ...(options?.signal ? { signal: options.signal } : {}),
     };
-    const sandbox = await createSandboxedBackend(sandboxOptions);
+    const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
     let reviewer: AcpAgent | undefined;
     this.reviewer = undefined;
     try {
-      await verifySandboxBoundary(sandboxOptions);
+      await defaultIsolationProvider.verifyBoundary(sandboxOptions);
       // codex-acp's "read-only" mode actually requests workspaceWrite and runs a
       // second bubblewrap that must mkdir .agents under the OS-read-only worktree.
       // That inner sandbox fails before even read-only Git commands can run. Use
       // the adapter's no-inner-sandbox mode ONLY after verifying our own trusted
       // bubblewrap read-only mount; ACP permissions are never the write boundary.
-      const reviewerMode = this.options.reviewerMode ?? (sandbox.backendId === "codex" ? "agent-full-access" : sandbox.backendId === "pi" ? undefined : "plan");
+      const reviewerMode = this.options.reviewerMode ?? (sandbox.backendId === "codex" ? "agent-full-access" : undefined);
       reviewer = new AcpAgent({
         cwd,
         ...(model ? { model } : {}),
@@ -316,16 +395,20 @@ export class AgentPrismSessionPair implements HarnessPair {
         // receives only a one-shot grant, never a persistent allow_always grant.
         permissions: { defaultOutcome: "deny" },
         ...(options?.signal ? { signal: options.signal } : {}),
-        onPermissionRequest: reviewerPermission,
+        onPermissionRequest: this.permissionResolver("reviewer"),
         retainHistory: false,
       });
       this.reviewer = reviewer;
       await reviewer.ready();
-      if (this.options.reasoningEffort) await requireReasoningEffort(reviewer, this.options.reasoningEffort);
+      const effort = this.options.reviewerReasoningEffort ?? this.options.reasoningEffort;
+      if (effort) await requireReasoningEffort(reviewer, effort);
       if (reviewerMode && reviewer.modes?.currentModeId !== reviewerMode) {
         throw new Error(`Reviewer backend ${reviewer.backendId} did not enter the configured ${reviewerMode} mode.`);
       }
       await sandbox.scrubCredentials();
+      await this.audit("agent_session_started", {
+        role: "reviewer", session_id: reviewer.sessionId, backend: reviewer.backendId, model: reviewer.model,
+      });
       const turn = await this.streamPrompt(reviewer, "reviewer", prompt, options);
       const value = parseTurn(turn);
       if (value === undefined) throw invalidStructuredTurn("reviewer", turn);
@@ -338,6 +421,9 @@ export class AgentPrismSessionPair implements HarnessPair {
       return value as ReviewReport;
     } finally {
       this.reviewer = undefined;
+      if (reviewer) await this.audit("agent_session_closed", {
+        role: "reviewer", session_id: reviewer.sessionId, backend: reviewer.backendId, model: reviewer.model,
+      });
       try {
         await reviewer?.close({ keep: true });
       } finally {

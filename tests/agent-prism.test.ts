@@ -19,9 +19,9 @@ test("unrestricted ACP tool network requires explicit non-sensitive repository r
   const previous = process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK;
   try {
     delete process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK;
-    assert.throws(requireAcpNetworkRiskAcknowledgement, /disabled by default/);
+    assert.throws(requireAcpNetworkRiskAcknowledgement, /normal network access/);
     process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK = "0";
-    assert.throws(requireAcpNetworkRiskAcknowledgement, /disabled by default/);
+    assert.throws(requireAcpNetworkRiskAcknowledgement, /normal network access/);
     process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK = "1";
     assert.doesNotThrow(requireAcpNetworkRiskAcknowledgement);
   } finally {
@@ -38,8 +38,8 @@ test("live ACP session calls fail closed before starting either actor without ne
       cwd: process.cwd(), sourceRoot: process.cwd(), goldenRoot: `${process.cwd()}/docs`,
       executorModel: "codex/mock", reviewerModel: "codex/mock",
     });
-    await assert.rejects(pair.execute("probe", 1, { phaseBaseCommit: "a".repeat(40) }), /disabled by default/);
-    await assert.rejects(pair.review("probe", 1), /disabled by default/);
+    await assert.rejects(pair.execute("probe", 1, { phaseBaseCommit: "a".repeat(40) }), /normal network access/);
+    await assert.rejects(pair.review("probe", 1), /normal network access/);
   } finally {
     if (previous === undefined) delete process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK;
     else process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK = previous;

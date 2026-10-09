@@ -1,13 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import {
   chmod,
   copyFile,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   readFile,
+  readdir,
   rm,
   symlink,
   writeFile,
@@ -33,6 +36,7 @@ import type { GitCommandResult } from "./types.js";
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
 const SCRATCH_ROOT = "/tmp";
+const MACOS_SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const RUNTIME_ROOT = "/agent-runtime";
 const RUNTIME_NODE_BIN = `${RUNTIME_ROOT}/node-bin`;
 const RUNTIME_NODE_MODULES = `${RUNTIME_ROOT}/node_modules`;
@@ -70,6 +74,7 @@ interface BackendRuntime {
   command: string;
   args: string[];
   credentialSources: Array<{ source: string; relativeTarget: string }>;
+  nativeStateSources?: Array<{ source: string; relativeTarget: string }>;
   extraBinary?: { source: string; target: string };
   nodeModulesRoot?: string;
   useNodeEnvProxy?: boolean;
@@ -80,33 +85,42 @@ function isWithin(root: string, candidate: string): boolean {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+function canonicalPolicyPath(path: string): string {
+  return canonicalExistingPath(resolve(path)) ?? resolve(path);
+}
+
 function assertAgentRoots(options: SandboxOptions): void {
-  const cwd = resolve(options.cwd);
-  const sourceRoot = resolve(options.sourceRoot);
-  const goldenRoot = resolve(options.goldenRoot);
+  const cwd = canonicalPolicyPath(options.cwd);
+  const sourceRoot = canonicalPolicyPath(options.sourceRoot);
+  const goldenRoot = canonicalPolicyPath(options.goldenRoot);
   if (goldenRoot === sourceRoot || isWithin(goldenRoot, sourceRoot)) {
     throw new Error("Golden Package cannot contain the protected source root; mount only the run-specific package directory.");
   }
   if (isWithin(cwd, goldenRoot) || isWithin(goldenRoot, cwd)) {
     throw new Error("The dedicated worktree and Golden Package must be physically separate sandbox roots.");
   }
-  if (goldenRoot === "/") throw new Error("Golden Package cannot be the host filesystem root.");
-  for (const broadRoot of ["/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]) {
+  if (goldenRoot === canonicalPolicyPath("/")) throw new Error("Golden Package cannot be the host filesystem root.");
+  const broadGoldenRoots = ["/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]
+    .map(canonicalPolicyPath);
+  for (const broadRoot of broadGoldenRoots) {
     if (isWithin(goldenRoot, broadRoot) || isWithin(broadRoot, goldenRoot)) {
       throw new Error(`Golden Package cannot expose or overlap a broad host root: ${broadRoot}.`);
     }
   }
-  if (cwd === "/") throw new Error("Agent workspace cannot be the host filesystem root.");
-  for (const broadRoot of [homedir(), "/home", "/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]) {
+  if (cwd === canonicalPolicyPath("/")) throw new Error("Agent workspace cannot be the host filesystem root.");
+  const broadWorkspaceRoots = [homedir(), "/home", "/root", "/etc", "/usr", "/var", "/opt", "/tmp", "/run", "/proc", "/sys", "/dev"]
+    .map(canonicalPolicyPath);
+  for (const broadRoot of broadWorkspaceRoots) {
     if (isWithin(cwd, broadRoot)) {
       throw new Error(`Agent workspace cannot expose a broad host root: ${broadRoot}.`);
     }
   }
-  if (isWithin("/tmp", cwd) || isWithin("/etc", cwd) || isWithin("/usr", cwd) || isWithin("/var", cwd) || isWithin("/opt", cwd) || isWithin("/root", cwd)) {
+  const systemWorkspaceRoots = ["/tmp", "/etc", "/usr", "/var", "/opt", "/root"].map(canonicalPolicyPath);
+  if (systemWorkspaceRoots.some((root) => isWithin(root, cwd))) {
     throw new Error("Agent worktree must be outside host system and temporary directories.");
   }
   const sensitiveHomeRoots = [".ssh", ".aws", ".azure", ".gnupg", ".config", ".kube", ".docker", ".npm", ".local/share"]
-    .map((entry) => resolve(homedir(), entry));
+    .map((entry) => canonicalPolicyPath(resolve(homedir(), entry)));
   for (const sensitiveRoot of sensitiveHomeRoots) {
     if (isWithin(cwd, sensitiveRoot) || isWithin(sensitiveRoot, cwd) || isWithin(goldenRoot, sensitiveRoot) || isWithin(sensitiveRoot, goldenRoot)) {
       throw new Error(`Agent workspace or Golden Package overlaps a protected credential directory: ${sensitiveRoot}.`);
@@ -122,7 +136,7 @@ export function supportedBackendForModel(model: string | undefined): SupportedAc
   const separator = model.indexOf("/");
   const backend = separator > 0 ? model.slice(0, separator).toLowerCase() : "";
   if (backend !== "claude" && backend !== "codex" && backend !== "opencode" && backend !== "pi") {
-    throw new Error(`ACP backend ${backend || "<default>"} is not allowlisted for isolated Stage B execution.`);
+    throw new Error(`ACP backend ${backend || "<default>"} is not allowlisted for isolated agent execution.`);
   }
   if (!model.slice(separator + 1).trim()) throw new Error(`ACP model route is incomplete: ${model}`);
   return backend;
@@ -163,6 +177,43 @@ export function findBubblewrap(): string {
     }
   }
   throw new Error("A root-owned system bubblewrap (bwrap) is required; refusing to start ACP without it.");
+}
+
+
+/** macOS isolation must use Apple's system-owned Seatbelt launcher, never a PATH override. */
+export function validateMacOSSandboxExec(path: string): string {
+  const requested = resolve(path);
+  if (requested !== MACOS_SANDBOX_EXEC) {
+    throw new Error(`Refusing non-system macOS sandbox launcher: ${path}; expected ${MACOS_SANDBOX_EXEC}.`);
+  }
+  let realPath: string;
+  try {
+    realPath = realpathSync(requested);
+  } catch {
+    throw new Error(`macOS sandbox-exec does not exist: ${requested}`);
+  }
+  const file = statSync(realPath);
+  if (
+    basename(realPath) !== "sandbox-exec" ||
+    file.uid !== 0 ||
+    (file.mode & 0o022) !== 0 ||
+    !file.isFile()
+  ) {
+    throw new Error(`Refusing untrusted macOS sandbox-exec binary: ${realPath}.`);
+  }
+  try {
+    accessSync(realPath, fsConstants.X_OK);
+  } catch {
+    throw new Error(`macOS sandbox-exec is not executable: ${realPath}`);
+  }
+  return requested;
+}
+
+export function findMacOSSandboxExec(): string {
+  if (process.platform !== "darwin") {
+    throw new Error("The macOS Seatbelt sandbox provider is available only on macOS.");
+  }
+  return validateMacOSSandboxExec(MACOS_SANDBOX_EXEC);
 }
 
 function findExecutable(name: string): string {
@@ -347,7 +398,6 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
     const nodeModules = realpathSync(outerNodeModulesRoot(entry));
     const nodeEntry = join(RUNTIME_NODE_MODULES, relative(nodeModules, entry));
     const nodeBinary = realpathSync(process.execPath);
-    const nodeBinDir = dirname(nodeBinary);
     const nodePath = join(RUNTIME_NODE_BIN, basename(nodeBinary));
     const codexHome = resolve(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"));
     return {
@@ -355,6 +405,7 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
       args: [nodeEntry],
       nodeModulesRoot: nodeModules,
       credentialSources: [{ source: join(codexHome, "auth.json"), relativeTarget: "codex-home/auth.json" }],
+      nativeStateSources: [{ source: codexHome, relativeTarget: "codex-home" }],
     };
   }
 
@@ -369,6 +420,8 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
     const entry = library;
     const nodeModules = realpathSync(outerNodeModulesRoot(library));
     const nodeBinary = realpathSync(process.execPath);
+    const claudeConfig = resolve(process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude"));
+    const piAgentDir = resolve(process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent"));
     return {
       command: join(RUNTIME_NODE_BIN, basename(nodeBinary)),
       args: [backend === "pi" ? `${RUNTIME_ROOT}/pi-acp-bootstrap.mjs` : join(RUNTIME_NODE_MODULES, relative(nodeModules, entry))],
@@ -379,8 +432,14 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
         target: `${RUNTIME_ROOT}/pi-acp-bootstrap.mjs`,
       } } : {}),
       credentialSources: backend === "claude"
-        ? [{ source: join(homedir(), ".claude", ".credentials.json"), relativeTarget: "home/.claude/.credentials.json" }]
-        : [{ source: join(resolve(process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent")), "auth.json"), relativeTarget: "home/.pi/agent/auth.json" }],
+        ? []
+        : [{ source: join(piAgentDir, "auth.json"), relativeTarget: "home/.pi/agent/auth.json" }],
+      nativeStateSources: backend === "claude"
+        ? [
+            { source: claudeConfig, relativeTarget: "home/.claude" },
+            { source: join(homedir(), ".claude.json"), relativeTarget: "home/.claude.json" },
+          ]
+        : [{ source: piAgentDir, relativeTarget: "home/.pi/agent" }],
     };
   }
 
@@ -389,10 +448,15 @@ function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
   }
   const command = findExecutable("opencode");
   const xdgDataHome = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
+  const xdgConfigHome = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
   return {
     command: `${RUNTIME_ROOT}/opencode`,
     args: ["acp"],
     credentialSources: [{ source: join(xdgDataHome, "opencode", "auth.json"), relativeTarget: "data/opencode/auth.json" }],
+    nativeStateSources: [
+      { source: join(xdgDataHome, "opencode"), relativeTarget: "data/opencode" },
+      { source: join(xdgConfigHome, "opencode"), relativeTarget: "config/opencode" },
+    ],
     extraBinary: { source: command, target: `${RUNTIME_ROOT}/opencode` },
   };
 }
@@ -417,7 +481,13 @@ function tryRealpath(path: string): string | undefined {
   }
 }
 
-function addMinimalFilesystem(args: string[], options: SandboxOptions, scratchPath: string, runtime: BackendRuntime): void {
+function addMinimalFilesystem(
+  args: string[],
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  backendId?: SupportedAcpBackend,
+): void {
   const created = new Set<string>();
   const cwd = resolve(options.cwd);
   const goldenRoot = resolve(options.goldenRoot);
@@ -431,8 +501,8 @@ function addMinimalFilesystem(args: string[], options: SandboxOptions, scratchPa
 
   args.push("--tmpfs", "/");
 
-  // Expose system executables, dynamic libraries and shared data, not the host root or /usr/local.
-  for (const hostPath of ["/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/share"]) {
+  // Expose system/user-installed executables and shared runtime data, not the host root or unrelated home directories.
+  for (const hostPath of ["/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/share", "/usr/local/bin", "/usr/local/lib", "/usr/local/share"]) {
     const source = tryRealpath(hostPath);
     if (!source) continue;
     ensureDirectoryArgs(args, created, hostPath);
@@ -524,6 +594,16 @@ function addMinimalFilesystem(args: string[], options: SandboxOptions, scratchPa
   args.push("--remount-ro", "/");
 
   const runtimeHome = "/tmp/run";
+  for (const [source, target] of [
+    [tryRealpath(join(homedir(), ".local", "bin")), `${runtimeHome}/home/.local/bin`],
+    [tryRealpath(join(homedir(), ".cargo", "bin")), `${runtimeHome}/home/.cargo/bin`],
+    [tryRealpath(join(homedir(), "bin")), `${runtimeHome}/home/bin`],
+  ] as const) {
+    if (!source) continue;
+    ensureDirectoryArgs(args, created, target);
+    args.push("--ro-bind", source, target);
+  }
+  const backendEnv = nativeBackendEnvironment(backendId);
   args.push(
     "--clearenv",
     "--setenv", "HOME", `${runtimeHome}/home`,
@@ -533,23 +613,45 @@ function addMinimalFilesystem(args: string[], options: SandboxOptions, scratchPa
     "--setenv", "CODEX_HOME", `${runtimeHome}/codex-home`,
     "--setenv", "CLAUDE_CONFIG_DIR", `${runtimeHome}/home/.claude`,
     "--setenv", "PI_CODING_AGENT_DIR", `${runtimeHome}/home/.pi/agent`,
-    "--setenv", "PI_OFFLINE", "1",
     "--setenv", "XDG_DATA_HOME", `${runtimeHome}/data`,
     "--setenv", "XDG_STATE_HOME", `${runtimeHome}/state`,
     "--setenv", "XDG_CACHE_HOME", `${runtimeHome}/cache`,
     "--setenv", "XDG_CONFIG_HOME", `${runtimeHome}/config`,
-    "--setenv", "OPENCODE_DISABLE_AUTOUPDATE", "1",
-    "--setenv", "PATH", `${RUNTIME_NODE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    "--setenv", "PATH", `${runtimeHome}/home/.local/bin:${runtimeHome}/home/.cargo/bin:${runtimeHome}/home/bin:${RUNTIME_NODE_BIN}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
     "--setenv", "LANG", "C.UTF-8",
     "--setenv", "LC_ALL", "C.UTF-8",
     "--setenv", "TERM", "dumb",
     ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? ["--setenv", "NODE_USE_ENV_PROXY", "1"] : []),
+    ...backendEnv.flatMap(([key, value]) => ["--setenv", key, value]),
     ...proxies.flatMap(([key, value]) => ["--setenv", key, value]),
     "--setenv", "GIT_OPTIONAL_LOCKS", "0",
     "--setenv", "GIT_CONFIG_NOSYSTEM", "1",
-    "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null",
+    "--setenv", "GIT_CONFIG_GLOBAL", `${runtimeHome}/home/.gitconfig`,
     "--chdir", cwd,
   );
+}
+
+function nativeBackendEnvironment(backendId: SupportedAcpBackend | undefined): Array<[string, string]> {
+  if (!backendId) return [];
+  const prefixes = backendId === "claude"
+    ? ["ANTHROPIC_", "CLAUDE_"]
+    : backendId === "codex"
+      ? ["OPENAI_", "CODEX_"]
+      : [
+          "OPENAI_", "ANTHROPIC_", "GOOGLE_", "GEMINI_", "DEEPSEEK_", "MISTRAL_",
+          "GROQ_", "OPENROUTER_", "AZURE_OPENAI_", "AWS_", "BEDROCK_", "VERTEX_", "OLLAMA_",
+        ];
+  const managed = new Set([
+    "HOME", "PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CODEX_PATH", "PI_CODING_AGENT_DIR",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+  ]);
+  const entries: Array<[string, string]> = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!value || managed.has(key) || !prefixes.some((prefix) => key.startsWith(prefix))) continue;
+    if (value.includes("\0")) throw new Error(`Invalid NUL byte in ${key}; refusing to forward it into the agent sandbox.`);
+    entries.push([key, value]);
+  }
+  return entries;
 }
 
 function safeProxyEnvironment(): Array<[string, string]> {
@@ -557,21 +659,244 @@ function safeProxyEnvironment(): Array<[string, string]> {
   for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] as const) {
     const value = process.env[key] ?? process.env[key.toLowerCase()];
     if (!value) continue;
+    if (value.includes("\0")) throw new Error(`Invalid NUL byte in ${key}; refusing to forward it into the Agent CLI sandbox.`);
     let parsed: URL;
     try {
       parsed = new URL(value);
     } catch {
-      throw new Error(`Invalid ${key} URL; refusing to forward it into the ACP sandbox.`);
+      throw new Error(`Invalid ${key} URL; refusing to forward it into the Agent CLI sandbox.`);
     }
-    if (
-      !["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol) ||
-      parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/"
-    ) {
-      throw new Error(`${key} must be a credential-free proxy URL without path/query data to enter the ACP sandbox.`);
+    if (!["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol)) {
+      throw new Error(`${key} uses an unsupported proxy protocol: ${parsed.protocol}`);
     }
+    // Full native sessions preserve the user's normal proxy semantics, including
+    // authenticated proxies. The value exists only in the isolated process env.
     result.push([key, value], [key.toLowerCase(), value]);
   }
   return result;
+}
+
+
+function seatbeltString(value: string): string {
+  if (value.includes("\0")) throw new Error("Seatbelt profile paths cannot contain NUL bytes.");
+  return JSON.stringify(value);
+}
+
+function canonicalExistingPath(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function macHostRuntime(runtime: BackendRuntime): { command: string; args: string[] } {
+  const nodeBinary = realpathSync(process.execPath);
+  const mapPath = (value: string): string => {
+    if (value === join(RUNTIME_NODE_BIN, basename(nodeBinary))) return nodeBinary;
+    if (value.startsWith(`${RUNTIME_NODE_MODULES}/`) && runtime.nodeModulesRoot) {
+      return join(runtime.nodeModulesRoot, relative(RUNTIME_NODE_MODULES, value));
+    }
+    if (runtime.extraBinary && value === runtime.extraBinary.target) return runtime.extraBinary.source;
+    return value;
+  };
+  return {
+    command: mapPath(runtime.command),
+    args: runtime.args.map(mapPath),
+  };
+}
+
+function macSandboxPathEntries(): string[] {
+  const candidates = [
+    join(homedir(), ".local", "bin"),
+    join(homedir(), ".cargo", "bin"),
+    join(homedir(), "bin"),
+    dirname(realpathSync(process.execPath)),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  return [...new Set(candidates.filter((path) => canonicalExistingPath(path)))];
+}
+
+function macSandboxEnvironment(
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  backendId?: SupportedAcpBackend,
+): Array<[string, string]> {
+  const runtimeRoot = join(scratchPath, "run");
+  const proxies = safeProxyEnvironment();
+  const hasNodeHttpProxy = proxies.some(([key, value]) =>
+    ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].includes(key) && /^https?:\/\//i.test(value),
+  );
+  const entries: Array<[string, string]> = [
+    ["HOME", join(runtimeRoot, "home")],
+    ["TMPDIR", scratchPath],
+    ["TMP", scratchPath],
+    ["TEMP", scratchPath],
+    ["CODEX_HOME", join(runtimeRoot, "codex-home")],
+    ["CLAUDE_CONFIG_DIR", join(runtimeRoot, "home", ".claude")],
+    ["PI_CODING_AGENT_DIR", join(runtimeRoot, "home", ".pi", "agent")],
+    ["XDG_DATA_HOME", join(runtimeRoot, "data")],
+    ["XDG_STATE_HOME", join(runtimeRoot, "state")],
+    ["XDG_CACHE_HOME", join(runtimeRoot, "cache")],
+    ["XDG_CONFIG_HOME", join(runtimeRoot, "config")],
+    ["PATH", macSandboxPathEntries().join(":")],
+    ["LANG", "C"],
+    ["LC_ALL", "C"],
+    ["TERM", "dumb"],
+    ["GIT_OPTIONAL_LOCKS", "0"],
+    ["GIT_CONFIG_NOSYSTEM", "1"],
+    ["GIT_CONFIG_GLOBAL", join(runtimeRoot, "home", ".gitconfig")],
+    ["GIT_DIR", join(runtimeRoot, "git-mirror")],
+    ["GIT_WORK_TREE", resolve(options.cwd)],
+    ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? [["NODE_USE_ENV_PROXY", "1"] as [string, string]] : []),
+    ...nativeBackendEnvironment(backendId),
+    ...proxies,
+  ];
+  for (const [key, value] of entries) {
+    if (key.includes("=") || key.includes("\0") || value.includes("\0")) {
+      throw new Error(`Invalid environment entry for macOS sandbox: ${key}`);
+    }
+  }
+  return entries;
+}
+
+function ancestorMetadataPaths(path: string): string[] {
+  const ancestors: string[] = [];
+  let current = dirname(resolve(path));
+  while (current !== "/" && current !== ".") {
+    ancestors.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return ancestors;
+}
+
+function macSandboxProfile(
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  hostRuntime: { command: string; args: string[] },
+): string {
+  const readDirectories = new Set<string>();
+  const readFiles = new Set<string>();
+  const addDirectory = (path: string) => {
+    const real = canonicalExistingPath(path);
+    if (real) readDirectories.add(real);
+  };
+  const addFileOrDirectory = (path: string) => {
+    const real = canonicalExistingPath(path);
+    if (!real) return;
+    const stat = statSync(real);
+    if (stat.isDirectory()) readDirectories.add(real);
+    else if (stat.isFile()) readFiles.add(real);
+  };
+
+  for (const path of [
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/Library",
+    "/private/etc",
+    "/private/var/db",
+    "/opt/homebrew",
+    options.cwd,
+    options.goldenRoot,
+    scratchPath,
+    dirname(dirname(realpathSync(process.execPath))),
+    runtime.nodeModulesRoot ?? "",
+    ...macSandboxPathEntries(),
+  ]) {
+    if (path) addDirectory(path);
+  }
+  addFileOrDirectory(hostRuntime.command);
+  for (const arg of hostRuntime.args) {
+    if (isAbsolute(arg)) addFileOrDirectory(arg);
+  }
+  if (runtime.extraBinary) addFileOrDirectory(runtime.extraBinary.source);
+
+  const writableDirectories = new Set<string>([realpathSync(scratchPath)]);
+  if (options.role !== "reviewer") writableDirectories.add(realpathSync(options.cwd));
+
+  const denyWrites = new Set<string>([
+    realpathSync(options.sourceRoot),
+    realpathSync(options.goldenRoot),
+    join(realpathSync(scratchPath), "run", "git-mirror"),
+    ...(options.role === "reviewer" ? [realpathSync(options.cwd)] : []),
+  ]);
+
+  // Seatbelt does not infer traversal metadata rights from a permitted descendant.
+  // Node realpathSync() resolves an absolute entrypoint by lstat'ing every ancestor
+  // (for example /Users -> /Users/name -> ... -> node_modules). Grant metadata on
+  // only those exact ancestor directories; never grant directory-data access there.
+  const metadataAncestors = new Set<string>();
+  for (const path of [...readDirectories, ...readFiles, ...writableDirectories]) {
+    for (const ancestor of ancestorMetadataPaths(path)) metadataAncestors.add(ancestor);
+  }
+
+  const lines = [
+    "(version 1)",
+    "(deny default)",
+    '(import "system.sb")',
+    "(allow process*)",
+    "(allow network*)",
+    "(allow mach-lookup)",
+    "(allow sysctl-read)",
+    "(allow file-read-metadata",
+    ...[...metadataAncestors].sort().map((path) => `  (literal ${seatbeltString(path)})`),
+    ")",
+    "(allow file-read*",
+    ...[...readDirectories].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
+    ...[...readFiles].sort().map((path) => `  (literal ${seatbeltString(path)})`),
+    ")",
+    "(allow file-write*",
+    ...[...writableDirectories].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
+    ")",
+    "(deny file-write*",
+    ...[...denyWrites].sort().map((path) => `  (subpath ${seatbeltString(path)})`),
+    ")",
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+async function writeMacSandboxProfile(
+  options: SandboxOptions,
+  scratchPath: string,
+  runtime: BackendRuntime,
+  hostRuntime: { command: string; args: string[] },
+): Promise<string> {
+  const path = join(scratchPath, "run", "seatbelt.sb");
+  await writeFile(path, macSandboxProfile(options, scratchPath, runtime, hostRuntime), { mode: 0o600 });
+  return path;
+}
+
+function macSandboxExecArgs(
+  profilePath: string,
+  environment: Array<[string, string]>,
+  cwd: string,
+  command: string,
+  args: string[],
+): string[] {
+  return [
+    "-f",
+    profilePath,
+    "/usr/bin/env",
+    "-C",
+    cwd,
+    "-i",
+    ...environment.map(([key, value]) => `${key}=${value}`),
+    command,
+    ...args,
+  ];
 }
 
 function quoteShell(value: string): string {
@@ -612,8 +937,7 @@ async function existingFile(path: string): Promise<string | undefined> {
   }
 }
 
-/** Stage just the selected OpenCode provider, never the whole host user config. */
-export async function stageSelectedOpenCodeProviderConfig(model: string, scratchPath: string, configRoot: string): Promise<string | undefined> {
+function selectedOpenCodeRoute(model: string): { providerId: string; modelId: string } | undefined {
   const modelSpec = model.slice(model.indexOf("/") + 1);
   const separator = modelSpec.indexOf("/");
   if (separator < 1 || separator === modelSpec.length - 1) return undefined;
@@ -622,6 +946,39 @@ export async function stageSelectedOpenCodeProviderConfig(model: string, scratch
   if (!/^[\w.-]+$/u.test(providerId) || !/^[\w.-]+$/u.test(modelId)) {
     throw new Error("OpenCode model/provider ID contains an unsupported character for isolated config staging.");
   }
+  return { providerId, modelId };
+}
+
+/** Stage only the selected OpenCode credential entry, never the multi-provider host auth file. */
+export async function stageSelectedOpenCodeCredential(
+  model: string,
+  scratchPath: string,
+  dataRoot: string,
+): Promise<string | undefined> {
+  const selected = selectedOpenCodeRoute(model);
+  if (!selected) return undefined;
+  const source = await existingFile(join(dataRoot, "opencode", "auth.json"));
+  if (!source) return undefined;
+  const sourceStat = await lstat(source);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.size > 1024 * 1024) {
+    throw new Error("Refusing non-regular or oversized OpenCode auth store.");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(source, "utf8")); } catch {
+    throw new Error("OpenCode auth store is not valid JSON.");
+  }
+  if (!plainRecord(parsed) || !(selected.providerId in parsed)) return undefined;
+  const target = join(scratchPath, "run", "data", "opencode", "auth.json");
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  await writeFile(target, `${JSON.stringify({ [selected.providerId]: parsed[selected.providerId] })}\n`, { flag: "wx", mode: 0o600 });
+  return target;
+}
+
+/** Stage just the selected OpenCode provider definition, never the whole host user config. */
+export async function stageSelectedOpenCodeProviderConfig(model: string, scratchPath: string, configRoot: string): Promise<string | undefined> {
+  const selected = selectedOpenCodeRoute(model);
+  if (!selected) return undefined;
+  const { providerId, modelId } = selected;
   const directory = join(configRoot, "opencode");
   const source = (await existingFile(join(directory, "opencode.jsonc")))
     ?? (await existingFile(join(directory, "opencode.json")));
@@ -643,8 +1000,9 @@ export async function stageSelectedOpenCodeProviderConfig(model: string, scratch
     throw new Error(`OpenCode config has no definition for model ${providerId}/${modelId}.`);
   }
   if (typeof provider.npm !== "string" || !plainRecord(provider.options) ||
-    typeof provider.options.baseURL !== "string" || typeof provider.options.apiKey !== "string") {
-    throw new Error("Selected OpenCode provider requires explicit npm, baseURL, and saved apiKey fields.");
+    typeof provider.options.baseURL !== "string" ||
+    ("apiKey" in provider.options && typeof provider.options.apiKey !== "string")) {
+    throw new Error("Selected OpenCode provider requires explicit npm/baseURL fields and an optional string apiKey.");
   }
   let baseURL: URL;
   try {
@@ -658,7 +1016,10 @@ export async function stageSelectedOpenCodeProviderConfig(model: string, scratch
   const selectedProvider = {
     npm: provider.npm,
     ...(typeof provider.name === "string" ? { name: provider.name } : {}),
-    options: { baseURL: provider.options.baseURL, apiKey: provider.options.apiKey },
+    options: {
+      baseURL: provider.options.baseURL,
+      ...(typeof provider.options.apiKey === "string" ? { apiKey: provider.options.apiKey } : {}),
+    },
     models: { [modelId]: provider.models[modelId] },
   };
   const target = join(scratchPath, "run", "config", "opencode", "opencode.json");
@@ -718,6 +1079,129 @@ async function prepareCredentials(
   return staged;
 }
 
+function assertTrustedExternalAgentBinary(
+  source: string,
+  roots: readonly string[],
+): string {
+  const real = realpathSync(source);
+  const stat = statSync(real);
+  if (!stat.isFile() || accessSync(real, fsConstants.X_OK) !== undefined || (stat.mode & 0o022) !== 0) {
+    throw new Error(`Refusing mutable or non-executable external agent binary: ${source}`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && stat.uid !== 0 && stat.uid !== uid) {
+    throw new Error(`Refusing external agent binary owned by another user: ${source}`);
+  }
+  for (const root of roots) {
+    if (isWithin(root, real)) {
+      throw new Error(`External agent binary may not come from the project/worktree/Golden roots: ${real}`);
+    }
+  }
+  if (isWithin("/tmp", real) || isWithin("/var/tmp", real)) {
+    throw new Error(`External agent binary may not come from a temporary directory: ${real}`);
+  }
+  let cursor = dirname(real);
+  while (cursor !== dirname(cursor)) {
+    const parent = statSync(cursor);
+    // A user-installed CLI commonly lives below ~/.opencode with 0775 directories
+    // (notably on WSL with umask 0002). The current OS user is already a trusted
+    // host principal: requiring every user-owned ancestor to be non-group-writable
+    // rejects normal installations without defending against that same principal.
+    //
+    // Keep the actual executable non-group/world-writable above, always reject
+    // world-writable ancestors, and allow group-write only on directories owned
+    // by the current trusted user. Root/foreign-owned group-writable directories
+    // remain untrusted because another principal can replace path components.
+    if ((parent.mode & 0o002) !== 0) {
+      throw new Error(`External agent binary has a world-writable parent directory: ${cursor}`);
+    }
+    if ((parent.mode & 0o020) !== 0 && (uid === undefined || parent.uid !== uid)) {
+      throw new Error(`External agent binary has a group-writable parent directory not owned by the current user: ${cursor}`);
+    }
+    if (uid !== undefined && parent.uid !== 0 && parent.uid !== uid) {
+      throw new Error(`External agent binary has a parent directory owned by another user: ${cursor}`);
+    }
+    cursor = dirname(cursor);
+  }
+  return real;
+}
+
+async function stageTrustedExternalAgentBinary(source: string, scratchPath: string): Promise<string> {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const handle = await open(source, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || (stat.mode & 0o111) === 0 || (stat.mode & 0o022) !== 0 ||
+      (uid !== undefined && stat.uid !== 0 && stat.uid !== uid)) {
+      throw new Error("External agent binary changed after provenance validation; refusing to stage it.");
+    }
+    if (stat.size <= 0 || stat.size > 512 * 1024 * 1024) {
+      throw new Error("External agent binary has an invalid or excessive size.");
+    }
+    const target = join(scratchPath, "run", "external", "opencode");
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    const input = handle.createReadStream({ autoClose: false });
+    const output = createWriteStream(target, { flags: "wx", mode: 0o500 });
+    await pipeline(input, output);
+    await chmod(target, 0o500);
+    return target;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function copyNativeStateSource(source: string, target: string): Promise<boolean> {
+  let stat;
+  try {
+    stat = await lstat(source);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error(`Refusing symlinked Agent CLI state root: ${source}`);
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  if (stat.isDirectory()) {
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    for (const entry of await readdir(source)) {
+      await cp(join(source, entry), join(target, entry), {
+        recursive: true,
+        force: true,
+        preserveTimestamps: true,
+        verbatimSymlinks: true,
+        // Native CLI state can contain live IPC sockets, FIFOs, or devices.
+        // They cannot be copied to a new session; keep ordinary files and links.
+        filter: async (path) => {
+          const item = await lstat(path).catch((error: unknown) => {
+            if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
+            throw error;
+          });
+          return !!item && (item.isFile() || item.isDirectory() || item.isSymbolicLink());
+        },
+      });
+    }
+    return true;
+  }
+  if (!stat.isFile()) throw new Error(`Unsupported Agent CLI state entry: ${source}`);
+  await copyFile(source, target);
+  return true;
+}
+
+async function stageNativeCliState(runtime: BackendRuntime, scratchPath: string): Promise<number> {
+  let backendStateCopied = 0;
+  for (const source of runtime.nativeStateSources ?? []) {
+    if (await copyNativeStateSource(source.source, join(scratchPath, "run", source.relativeTarget))) {
+      backendStateCopied += 1;
+    }
+  }
+  // Git user identity/preferences are useful to a normal CLI session, but they are
+  // not evidence that the selected Agent CLI itself has usable auth/config.
+  await copyNativeStateSource(
+    join(homedir(), ".gitconfig"),
+    join(scratchPath, "run", "home/.gitconfig"),
+  );
+  return backendStateCopied;
+}
+
 async function assertDedicatedWorktreePointer(cwd: string): Promise<void> {
   const path = join(cwd, ".git");
   const pointer = await lstat(path);
@@ -729,35 +1213,81 @@ async function assertDedicatedWorktreePointer(cwd: string): Promise<void> {
   if (!target || !isAbsolute(target)) throw new Error("Sandbox cwd has an invalid .git worktree pointer.");
 }
 
-export async function createSandboxedBackend(options: SandboxOptions): Promise<SandboxedBackend> {
+
+interface PreparedSandboxRuntime {
+  runtime: BackendRuntime;
+  credentials: string[];
+}
+
+async function prepareSandboxRuntime(
+  options: SandboxOptions,
+  backendId: SupportedAcpBackend,
+  cwd: string,
+  sourceRoot: string,
+  goldenRoot: string,
+  scratchPath: string,
+): Promise<PreparedSandboxRuntime> {
+  let runtime = backendRuntime(backendId);
+  const trustedOpenCodeBinary = backendId === "opencode" && runtime.extraBinary
+    ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
+    : undefined;
+  const credentials: string[] = [];
+  await prepareScratchLayout(scratchPath, cwd, options.signal);
+  const nativeStateCount = await stageNativeCliState(runtime, scratchPath);
+  if (trustedOpenCodeBinary && runtime.extraBinary) {
+    const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
+    runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
+  }
+  if (options.includeProviderCredentials && nativeStateCount === 0) {
+    if (backendId === "pi") {
+      credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
+    } else if (backendId === "opencode") {
+      const dataRoot = resolve(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"));
+      const configRoot = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
+      const selectedAuth = await stageSelectedOpenCodeCredential(options.model, scratchPath, dataRoot);
+      if (selectedAuth) credentials.push(selectedAuth);
+      const selectedConfig = await stageSelectedOpenCodeProviderConfig(options.model, scratchPath, configRoot);
+      if (selectedConfig) credentials.push(selectedConfig);
+      if (!selectedAuth && !selectedConfig) {
+        throw new Error("No native or isolated saved credential/config was found for the selected OpenCode provider.");
+      }
+    } else if (backendId === "codex") {
+      credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
+    } else if (!process.env.ANTHROPIC_AUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
+      throw new Error("Claude CLI state/authentication is unavailable inside the isolated session; run Claude login or provide the same host auth environment used by the working CLI.");
+    }
+  }
+  return { runtime, credentials };
+}
+
+async function createMacOSSandboxedBackend(options: SandboxOptions): Promise<SandboxedBackend> {
   const backendId = supportedBackendForModel(options.model);
   const cwd = await realpath(options.cwd);
   const sourceRoot = await realpath(options.sourceRoot);
   const goldenRoot = await realpath(options.goldenRoot);
-  assertAgentRoots({ ...options, cwd, sourceRoot, goldenRoot });
-  const bwrap = findBubblewrap();
+  const normalized = { ...options, cwd, sourceRoot, goldenRoot };
+  assertAgentRoots(normalized);
+  const sandboxExec = findMacOSSandboxExec();
   await assertDedicatedWorktreePointer(cwd);
-  const runtime = backendRuntime(backendId);
-  const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
-  const credentials: string[] = [];
+  const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-")));
   try {
-    await prepareScratchLayout(scratchPath, cwd, options.signal);
-    if (options.includeProviderCredentials) {
-      if (backendId === "pi") credentials.push(await stageSelectedPiCredential(options.model, runtime, scratchPath));
-      else credentials.push(...await prepareCredentials(backendId, runtime, scratchPath));
-      if (backendId === "opencode") {
-        const configRoot = resolve(process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"));
-        const selectedConfig = await stageSelectedOpenCodeProviderConfig(options.model, scratchPath, configRoot);
-        if (selectedConfig) credentials.push(selectedConfig);
-      }
-    }
-    const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
-    addMinimalFilesystem(commandArgs, { ...options, cwd, sourceRoot, goldenRoot }, scratchPath, runtime);
+    const { runtime, credentials } = await prepareSandboxRuntime(
+      normalized,
+      backendId,
+      cwd,
+      sourceRoot,
+      goldenRoot,
+      scratchPath,
+    );
+    const hostRuntime = macHostRuntime(runtime);
+    const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
+    const environment = macSandboxEnvironment(normalized, scratchPath, runtime, backendId);
     const config: CustomBackendConfig = {
-      command: bwrap,
-      args: [...commandArgs, "--", runtime.command, ...runtime.args],
+      command: sandboxExec,
+      args: macSandboxExecArgs(profilePath, environment, cwd, hostRuntime.command, hostRuntime.args),
       fork: { disposition: backendId === "claude" ? "id-only" : "live", cwd: "source-only" },
     };
+    let cleaned = false;
     return {
       backendId,
       config,
@@ -767,6 +1297,66 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
         credentials.length = 0;
       },
       async cleanup() {
+        if (cleaned) return;
+        cleaned = true;
+        await rm(scratchPath, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function createSandboxedBackend(options: SandboxOptions): Promise<SandboxedBackend> {
+  if (process.platform === "darwin") return createMacOSSandboxedBackend(options);
+  if (process.platform !== "linux") {
+    throw new Error(`Unsupported isolation host platform: ${process.platform}. Supported hosts are Linux/WSL and macOS.`);
+  }
+  const backendId = supportedBackendForModel(options.model);
+  const cwd = await realpath(options.cwd);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const goldenRoot = await realpath(options.goldenRoot);
+  assertAgentRoots({ ...options, cwd, sourceRoot, goldenRoot });
+  const bwrap = findBubblewrap();
+  await assertDedicatedWorktreePointer(cwd);
+  const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-"));
+  try {
+    const { runtime, credentials } = await prepareSandboxRuntime(
+      { ...options, cwd, sourceRoot, goldenRoot },
+      backendId,
+      cwd,
+      sourceRoot,
+      goldenRoot,
+      scratchPath,
+    );
+    const commandArgs = ["--die-with-parent", "--new-session", "--unshare-pid"];
+    addMinimalFilesystem(
+      commandArgs,
+      { ...options, cwd, sourceRoot, goldenRoot },
+      scratchPath,
+      runtime,
+      backendId,
+    );
+    const config: CustomBackendConfig = {
+      command: bwrap,
+      args: [...commandArgs, "--", runtime.command, ...runtime.args],
+      // Keep backend-native tools and settings. Worktree mounts and host-file
+      // isolation are the safety boundary; the plugin does not disable CLI tools.
+      fork: { disposition: backendId === "claude" ? "id-only" : "live", cwd: "source-only" },
+    };
+    let cleaned = false;
+    return {
+      backendId,
+      config,
+      scratchPath,
+      async scrubCredentials() {
+        await Promise.all(credentials.map((path) => rm(path, { force: true })));
+        credentials.length = 0;
+      },
+      async cleanup() {
+        if (cleaned) return;
+        cleaned = true;
         await rm(scratchPath, { recursive: true, force: true });
       },
     };
@@ -839,6 +1429,78 @@ async function exerciseFilesystemBoundary(
   }
 }
 
+
+async function exerciseMacOSFilesystemBoundary(
+  options: SandboxOptions,
+  label: string,
+  sandboxExec: string,
+  profilePath: string,
+  environment: Array<[string, string]>,
+): Promise<void> {
+  const { cwd, sourceRoot, goldenRoot } = options;
+  const nonce = randomUUID();
+  const hostCanaries = [
+    join(homedir(), `.pi-plan-execute-host-canary-${nonce}`),
+    join(dirname(sourceRoot), `.pi-plan-execute-other-project-canary-${nonce}`),
+    join(SCRATCH_ROOT, `.pi-plan-execute-tmp-canary-${nonce}`),
+  ];
+  const symlinkProbe = join(cwd, `.pi-plan-execute-symlink-probe-${nonce}`);
+  const gitMirrorProbe = join(dirname(profilePath), "git-mirror", `.pi-plan-execute-sandbox-probe-${nonce}`);
+  const deniedWrites: string[] = [];
+  let writableProbe: string | undefined;
+  try {
+    await Promise.all(hostCanaries.map((path) => writeFile(path, nonce, { flag: "wx", mode: 0o600 })));
+    const protectedRoots = options.role === "reviewer" ? [cwd, goldenRoot] : [goldenRoot];
+    deniedWrites.push(...protectedRoots.map((root) => join(root, `.pi-plan-execute-sandbox-probe-${nonce}`)));
+    deniedWrites.push(gitMirrorProbe);
+    if (options.role !== "reviewer") writableProbe = join(cwd, `.pi-plan-execute-sandbox-probe-${nonce}`);
+    await symlink(join(sourceRoot, "package.json"), symlinkProbe);
+    deniedWrites.push(symlinkProbe);
+    const script = probeScript(options.role, deniedWrites, writableProbe, hostCanaries);
+    try {
+      await execFile(
+        sandboxExec,
+        macSandboxExecArgs(profilePath, environment, cwd, "/bin/sh", ["-c", script]),
+        {
+          cwd,
+          timeout: 10_000,
+          maxBuffer: 1024 * 1024,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+      );
+    } catch (error) {
+      throw new Error(`OS filesystem sandbox probe failed for ${label}/${options.role}: ${String(error)}`);
+    }
+  } finally {
+    await Promise.all([
+      ...hostCanaries.map((path) => rm(path, { force: true })),
+      ...deniedWrites.filter((path) => path !== gitMirrorProbe).map((path) => rm(path, { force: true })),
+      ...(writableProbe ? [rm(writableProbe, { force: true })] : []),
+      rm(symlinkProbe, { force: true }),
+    ]);
+  }
+}
+
+async function runMacOSFilesystemProbe(options: SandboxOptions, runtime: BackendRuntime, label: string): Promise<void> {
+  const cwd = await realpath(options.cwd);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const goldenRoot = await realpath(options.goldenRoot);
+  const normalized = { ...options, cwd, sourceRoot, goldenRoot };
+  assertAgentRoots(normalized);
+  await assertDedicatedWorktreePointer(cwd);
+  const sandboxExec = findMacOSSandboxExec();
+  const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-sandbox-probe-")));
+  try {
+    await prepareProbeScratch(scratchPath);
+    const hostRuntime = macHostRuntime(runtime);
+    const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
+    const environment = macSandboxEnvironment(normalized, scratchPath, runtime, label as SupportedAcpBackend);
+    await exerciseMacOSFilesystemBoundary(normalized, label, sandboxExec, profilePath, environment);
+  } finally {
+    await rm(scratchPath, { recursive: true, force: true });
+  }
+}
+
 async function runFilesystemProbe(options: SandboxOptions, runtime: BackendRuntime, label: string): Promise<void> {
   const cwd = await realpath(options.cwd);
   const sourceRoot = await realpath(options.sourceRoot);
@@ -851,7 +1513,7 @@ async function runFilesystemProbe(options: SandboxOptions, runtime: BackendRunti
   try {
     await prepareProbeScratch(scratchPath);
     const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
-    addMinimalFilesystem(args, normalized, scratchPath, runtime);
+    addMinimalFilesystem(args, normalized, scratchPath, runtime, label as SupportedAcpBackend);
     await exerciseFilesystemBoundary(normalized, label, bwrap, args);
   } finally {
     await rm(scratchPath, { recursive: true, force: true });
@@ -861,6 +1523,13 @@ async function runFilesystemProbe(options: SandboxOptions, runtime: BackendRunti
 /** Exercise the actual trusted mount policy before opening an agent session. */
 export async function verifySandboxBoundary(options: SandboxOptions): Promise<void> {
   const backendId = supportedBackendForModel(options.model);
+  if (process.platform === "darwin") {
+    await runMacOSFilesystemProbe(options, backendRuntime(backendId), backendId);
+    return;
+  }
+  if (process.platform !== "linux") {
+    throw new Error(`Unsupported isolation host platform: ${process.platform}. Supported hosts are Linux/WSL and macOS.`);
+  }
   await runFilesystemProbe(options, backendRuntime(backendId), backendId);
 }
 
@@ -878,8 +1547,64 @@ function outputText(value: unknown): string {
   return Buffer.isBuffer(value) ? value.toString("utf8") : "";
 }
 
+
+async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promise<GitCommandResult> {
+  const sandboxOptions: SandboxOptions = {
+    role: "acceptance",
+    model: "acceptance-command",
+    cwd: options.cwd,
+    sourceRoot: options.sourceRoot,
+    goldenRoot: options.goldenRoot,
+    ...(options.signal ? { signal: options.signal } : {}),
+  };
+  const runtime: BackendRuntime = { command: "/bin/bash", args: [], credentialSources: [] };
+  const cwd = await realpath(options.cwd);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const goldenRoot = await realpath(options.goldenRoot);
+  const normalized = { ...sandboxOptions, cwd, sourceRoot, goldenRoot };
+  assertAgentRoots(normalized);
+  await assertDedicatedWorktreePointer(cwd);
+  const sandboxExec = findMacOSSandboxExec();
+  const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-acceptance-")));
+  try {
+    await prepareScratchLayout(scratchPath, cwd, options.signal);
+    const hostRuntime = macHostRuntime(runtime);
+    const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
+    const environment = macSandboxEnvironment(normalized, scratchPath, runtime);
+    await exerciseMacOSFilesystemBoundary(normalized, "acceptance", sandboxExec, profilePath, environment);
+    const timeout = options.timeout ?? 120_000;
+    try {
+      const result = await execFile(
+        sandboxExec,
+        macSandboxExecArgs(profilePath, environment, cwd, "/bin/bash", ["-lc", options.command]),
+        {
+          cwd,
+          timeout,
+          maxBuffer: 16 * 1024 * 1024,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+      );
+      return { stdout: result.stdout, stderr: result.stderr, code: 0 };
+    } catch (error) {
+      const failure = error as { code?: unknown; killed?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown };
+      return {
+        stdout: outputText(failure.stdout),
+        stderr: outputText(failure.stderr),
+        code: typeof failure.code === "number" ? failure.code : -1,
+        ...(failure.killed || failure.signal || failure.code === "ETIMEDOUT" || failure.code === "ABORT_ERR" ? { killed: true } : {}),
+      };
+    }
+  } finally {
+    await rm(scratchPath, { recursive: true, force: true });
+  }
+}
+
 /** Run contract-supplied shell commands with the same filesystem boundary as the ACP actors. */
 export async function runSandboxedCommand(options: SandboxedCommandOptions): Promise<GitCommandResult> {
+  if (process.platform === "darwin") return runMacOSSandboxedCommand(options);
+  if (process.platform !== "linux") {
+    throw new Error(`Unsupported isolation host platform: ${process.platform}. Supported hosts are Linux/WSL and macOS.`);
+  }
   const sandboxOptions: SandboxOptions = {
     role: "acceptance",
     model: "acceptance-command",
@@ -899,9 +1624,9 @@ export async function runSandboxedCommand(options: SandboxedCommandOptions): Pro
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-acceptance-"));
   try {
     await prepareScratchLayout(scratchPath, cwd, options.signal);
-    // Acceptance commands do not need provider access. Deny all network egress in the
-    // kernel rather than trusting shell commands or credential-free proxy settings.
-    const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-net"];
+    // Acceptance commands keep normal networking just like the Agent CLI sessions.
+    // The same filesystem/worktree boundary still applies.
+    const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
     addMinimalFilesystem(args, normalized, scratchPath, runtime);
     await exerciseFilesystemBoundary(normalized, "acceptance", bwrap, args);
     const timeout = options.timeout ?? 120_000;

@@ -4,7 +4,7 @@ on:
   pull_request:
   workflow_dispatch:
 jobs:
-  sandbox:
+  linux-sandbox:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -13,7 +13,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - name: Install trusted system bubblewrap
+      - name: Install trusted system sandbox tool
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
@@ -24,5 +24,37 @@ jobs:
       - run: npm run build
       - run: npm run test:sandbox:required
       - run: npm test
+
+  macos-sandbox:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Verify system Seatbelt launcher
+        run: |
+          test -x /usr/bin/sandbox-exec
+          test "$(stat -f %u /usr/bin/sandbox-exec)" = 0
+          /usr/bin/sandbox-exec -p '(version 1) (allow default)' /usr/bin/true
+      - run: npm ci
+      - name: Install OpenCode ACP fixture
+        run: |
+          npm install -g opencode-ai@1.18.33
+          which opencode
+          opencode --version
+      - run: npm run check
+      - run: npm run build
+      - run: npm run test:sandbox:macos:required
+      - name: Dump recent ACP sandbox denials
+        if: failure()
+        run: |
+          sudo log show --last 3m --style compact \
+            --predicate 'eventMessage BEGINSWITH[c] "Sandbox:" AND (eventMessage CONTAINS[c] "codex" OR eventMessage CONTAINS[c] "pi-plan-execute-sandbox")' \
+            | tail -n 300 || true
+      - run: npm test
+
 # Real ACP provider integration is deliberately a separate, explicit billable job:
 # npm run test:acp:required, with saved provider auth and both routed model env vars.

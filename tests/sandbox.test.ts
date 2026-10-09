@@ -146,7 +146,37 @@ test("ACP backend command uses minimal mounts and a scrubbed environment", {
   }
 });
 
-test("Pi ACP stages only the selected provider and unlinks auth before its first turn", {
+test("Codex catalog staging preserves config but skips live IPC sockets", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const root = await mkdtemp(join(dirname(process.cwd()), ".peac-codex-socket-"));
+  const previous = process.env.CODEX_HOME;
+  const server = createServer();
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    const home = join(root, "codex-home");
+    await mkdir(join(home, "ipc"), { recursive: true });
+    await writeFile(join(home, "config.toml"), "model = 'fixture'\n");
+    const socket = join(home, "ipc", "ipc.sock");
+    await new Promise<void>((resolve, reject) => server.listen(socket, resolve).once("error", reject));
+    process.env.CODEX_HOME = home;
+    const cwd = await makeGitWorktree(root);
+    const sourceRoot = join(root, "source");
+    const goldenRoot = join(sourceRoot, ".pi-plan-execute-auto", "fixture");
+    await mkdir(goldenRoot, { recursive: true });
+    sandbox = await createSandboxedBackend({ role: "reviewer", model: "codex/gpt-5.6-sol", cwd, sourceRoot, goldenRoot });
+    assert.equal(await readFile(join(sandbox.scratchPath, "run", "codex-home", "config.toml"), "utf8"), "model = 'fixture'\n");
+    await assert.rejects(access(join(sandbox.scratchPath, "run", "codex-home", "ipc", "ipc.sock")));
+  } finally {
+    await sandbox?.cleanup();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi ACP preserves native CLI auth state and bootstrap unlinks it before the first turn", {
   skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted bwrap is required for the Pi bootstrap",
 }, async () => {
   const root = await mkdtemp(join(dirname(process.cwd()), ".peac-pi-auth-fixture-"));
@@ -169,7 +199,7 @@ test("Pi ACP stages only the selected provider and unlinks auth before its first
     const target = join(sandbox.scratchPath, "run", "home", ".pi", "agent", "auth.json");
     const staged = await readFile(target, "utf8");
     assert.match(staged, /selected-test-token/);
-    assert.doesNotMatch(staged, /OTHER-SECRET|unrelated/);
+    assert.match(staged, /OTHER-SECRET|unrelated/);
     assert.ok(sandbox.config.args?.includes("/agent-runtime/pi-acp-bootstrap.mjs"));
     agent = new AcpAgent({ cwd, model: "pi/openai-codex/gpt-5.5", backends: { pi: sandbox.config }, permissions: { defaultOutcome: "deny" } });
     await agent.ready();
@@ -216,15 +246,16 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
       else process.env.PATH = originalPath;
     }
 
-    // Node-backed Claude/Pi must use the already-vetted credential-free proxy;
-    // Node's fetch otherwise ignores HTTP(S)_PROXY and live turns fail after ready().
+    // Native CLI sessions preserve the user's proxy semantics, including an
+    // authenticated proxy. Node-backed Claude/Pi additionally enable env-proxy handling.
     const priorHttpsProxy = process.env.HTTPS_PROXY;
     try {
-      process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+      process.env.HTTPS_PROXY = "http://fixture-user:fixture-pass@127.0.0.1:7890";
       for (const model of ["claude/sonnet", "pi/openai-codex/gpt-5.5", "codex/gpt-5.6-sol"]) {
         const sandbox = await createSandboxedBackend({ ...common, role: "reviewer", model });
         try {
           const args = sandbox.config.args ?? [];
+          assert.ok(args.includes("http://fixture-user:fixture-pass@127.0.0.1:7890"));
           const proxyFlag = args.findIndex((value, index) => value === "NODE_USE_ENV_PROXY" && args[index + 1] === "1");
           assert.equal(proxyFlag !== -1, model.startsWith("claude/") || model.startsWith("pi/"));
         } finally { await sandbox.cleanup(); }
@@ -258,11 +289,15 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
     await writeFile(join(hostConfig, "opencode", "opencode.jsonc"), JSON.stringify({
       provider: { "deepseek-local": {
         npm: "@ai-sdk/openai-compatible",
-        options: { baseURL: "http://127.0.0.1:8080/v1", apiKey: "temporary-provider-key" },
+        options: { baseURL: "http://127.0.0.1:8080/v1" },
         models: { "deepseek-flash": { variants: { high: {} } } },
       } },
+      plugin: ["fixture-native-plugin"],
     }));
-    await writeFile(join(hostData, "opencode", "auth.json"), "{}\n");
+    await writeFile(join(hostData, "opencode", "auth.json"), JSON.stringify({
+      "deepseek-local": { type: "api", key: "selected-opencode-secret" },
+      "unrelated-provider": { type: "api", key: "OTHER-SECRET" },
+    }));
     const savedEnv = {
       PATH: process.env.PATH,
       XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
@@ -277,13 +312,18 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
         ...common, role: "executor", model: "opencode/deepseek-local/deepseek-flash",
         includeProviderCredentials: true,
       });
-      const providerConfig = join(configured.scratchPath, "run", "config", "opencode", "opencode.json");
+      const providerConfig = join(configured.scratchPath, "run", "config", "opencode", "opencode.jsonc");
       const stagedAuth = join(configured.scratchPath, "run", "data", "opencode", "auth.json");
-      assert.match(await readFile(providerConfig, "utf8"), /temporary-provider-key/);
-      await access(stagedAuth);
+      const stagedProvider = await readFile(providerConfig, "utf8");
+      const stagedCredential = await readFile(stagedAuth, "utf8");
+      assert.doesNotMatch(stagedProvider, /selected-opencode-secret|OTHER-SECRET/);
+      assert.match(stagedProvider, /fixture-native-plugin/);
+      assert.match(stagedCredential, /selected-opencode-secret/);
+      assert.match(stagedCredential, /OTHER-SECRET|unrelated-provider/);
       await configured.scrubCredentials();
-      await assert.rejects(access(providerConfig));
-      await assert.rejects(access(stagedAuth));
+      // Native CLI state lives only in run-private scratch, but remains available
+      // for the full CLI session just as it would in a standalone OpenCode session.
+      await access(stagedAuth);
     } finally {
       await configured?.cleanup();
       for (const [key, value] of Object.entries(savedEnv)) {
@@ -324,7 +364,7 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
           command: `node -e 'const s=require("node:net").connect(${address.port},"127.0.0.1"); s.on("connect",()=>process.exit(73)); s.on("error",()=>process.exit(0)); setTimeout(()=>process.exit(74),2000)'`,
           timeout: 20_000,
         });
-        assert.equal(network.code, 0, `acceptance reached the host network or could not run node: ${network.stderr}`);
+        assert.equal(network.code, 73, `acceptance could not reach the normal host network: ${network.stderr}`);
       } finally {
         server.close();
       }
@@ -332,6 +372,149 @@ test("bubblewrap denies Reviewer writes and grants Executor writes only in its w
       await Promise.all([sourceMarker, siblingMarker, goldenMarker, tmpMarker].map((path) => rm(path, { force: true })));
     }
   } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Claude isolated session preserves native CLI routing, auth and tools without host-home mounts", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-claude-native-fixture-"));
+  const worktree = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+  const claudeConfig = join(fixture, "claude-config");
+  await mkdir(claudeConfig);
+  await writeFile(join(claudeConfig, "settings.json"), JSON.stringify({
+    enabledPlugins: { "fixture-plugin@example": true },
+    env: { FIXTURE_SETTING: "preserved" },
+  }));
+  const original = {
+    token: process.env.ANTHROPIC_AUTH_TOKEN,
+    baseUrl: process.env.ANTHROPIC_BASE_URL,
+    model: process.env.ANTHROPIC_MODEL,
+    sonnet: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+    configDir: process.env.CLAUDE_CONFIG_DIR,
+    httpsProxy: process.env.HTTPS_PROXY,
+    subprocessScrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB,
+  };
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    process.env.CLAUDE_CONFIG_DIR = claudeConfig;
+    process.env.ANTHROPIC_AUTH_TOKEN = "HOST_CLAUDE_NATIVE_TOKEN";
+    process.env.ANTHROPIC_BASE_URL = "http://gateway.example.invalid:8080";
+    process.env.ANTHROPIC_MODEL = "deepseek-flash[1m]";
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "deepseek-flash[1m]";
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+    delete process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB;
+    sandbox = await createSandboxedBackend({
+      role: "executor",
+      model: "claude/sonnet",
+      cwd: worktree,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+      includeProviderCredentials: true,
+    });
+    const args = sandbox.config.args ?? [];
+    const routedEnv: Record<string, string> = {};
+    for (let index = 0; index < args.length - 2; index += 1) {
+      if (args[index] === "--setenv") routedEnv[args[index + 1] ?? ""] = args[index + 2] ?? "";
+    }
+    assert.equal(routedEnv.ANTHROPIC_AUTH_TOKEN, "HOST_CLAUDE_NATIVE_TOKEN");
+    assert.equal(routedEnv.ANTHROPIC_BASE_URL, "http://gateway.example.invalid:8080");
+    assert.equal(routedEnv.ANTHROPIC_MODEL, "deepseek-flash[1m]");
+    assert.equal(routedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL, "deepseek-flash[1m]");
+    assert.equal(routedEnv.HTTPS_PROXY, "http://127.0.0.1:7890");
+    assert.equal(routedEnv.CLAUDE_CONFIG_DIR, "/tmp/run/home/.claude");
+    assert.notEqual(routedEnv.CLAUDE_CONFIG_DIR, claudeConfig);
+    assert.equal(routedEnv.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, undefined);
+    assert.equal(sandbox.config.sessionMeta, undefined);
+    const stagedSettings = await readFile(join(sandbox.scratchPath, "run", "home", ".claude", "settings.json"), "utf8");
+    assert.match(stagedSettings, /fixture-plugin@example/);
+    assert.match(stagedSettings, /FIXTURE_SETTING/);
+    assert.equal(args.includes("--unshare-net"), false);
+  } finally {
+    await sandbox?.cleanup();
+    if (original.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = original.token;
+    if (original.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = original.baseUrl;
+    if (original.model === undefined) delete process.env.ANTHROPIC_MODEL; else process.env.ANTHROPIC_MODEL = original.model;
+    if (original.sonnet === undefined) delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL; else process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = original.sonnet;
+    if (original.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = original.configDir;
+    if (original.httpsProxy === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = original.httpsProxy;
+    if (original.subprocessScrub === undefined) delete process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB; else process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = original.subprocessScrub;
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode runtime rejects a PATH binary sourced from the project tree", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-opencode-provenance-"));
+  const worktree = await makeGitWorktree(fixture, { "bin/opencode": "#!/bin/sh\nexit 0\n" });
+  const untrustedDir = join(process.cwd(), ".peac-untrusted-opencode-bin");
+  const sourceBin = join(untrustedDir, "opencode");
+  const previousPath = process.env.PATH;
+  try {
+    await mkdir(untrustedDir);
+    await writeFile(sourceBin, "#!/bin/sh\nexit 0\n");
+    await chmod(sourceBin, 0o755);
+    process.env.PATH = `${untrustedDir}:${previousPath ?? "/usr/bin:/bin"}`;
+    await assert.rejects(
+      createSandboxedBackend({
+        role: "executor",
+        model: "opencode/opencode/big-pickle",
+        cwd: worktree,
+        sourceRoot: process.cwd(),
+        goldenRoot: join(process.cwd(), "docs"),
+      }),
+      /External agent binary may not come from the project\/worktree\/Golden roots/,
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    await rm(untrustedDir, { recursive: true, force: true });
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode runtime accepts a current-user-owned 0775 install tree outside protected roots", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-opencode-user-install-"));
+  const install = join(fixture, "user-install");
+  const bin = join(install, "bin");
+  const executable = join(bin, "opencode");
+  const worktree = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+  const previousPath = process.env.PATH;
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    await mkdir(bin, { recursive: true, mode: 0o775 });
+    await chmod(install, 0o775);
+    await chmod(bin, 0o775);
+    await writeFile(executable, "#!/bin/sh\nexit 0\n");
+    await chmod(executable, 0o755);
+    process.env.PATH = `${bin}:${previousPath ?? "/usr/bin:/bin"}`;
+    sandbox = await createSandboxedBackend({
+      role: "executor",
+      model: "opencode/opencode/big-pickle",
+      cwd: worktree,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+    });
+    assert.equal(sandbox.backendId, "opencode");
+    const args = sandbox.config.args ?? [];
+    const runtimeTarget = args.indexOf("/agent-runtime/opencode");
+    assert.ok(runtimeTarget > 0);
+    const stagedBinary = args[runtimeTarget - 1] ?? "";
+    assert.equal(stagedBinary, join(sandbox.scratchPath, "run", "external", "opencode"));
+    assert.equal(args.includes(executable), false);
+
+    // Once staged, later replacement of the original PATH binary cannot change
+    // what the run executes.
+    await writeFile(executable, "#!/bin/sh\nexit 99\n");
+    await chmod(executable, 0o755);
+    const executed = await execFile(sandbox.config.command, args, { cwd: worktree });
+    assert.equal(executed.stdout, "");
+  } finally {
+    await sandbox?.cleanup();
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     await rm(fixture, { recursive: true, force: true });
   }
 });

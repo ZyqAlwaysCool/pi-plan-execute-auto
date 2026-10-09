@@ -12,7 +12,7 @@ import { createLocalGitOperations, ensureDedicatedWorktree, GitWorkspace, provis
 import { validatePhaseCompletionRecord } from "../src/completion.js";
 import { StageBController } from "../src/stage-b.js";
 import { readWorkflowState, validatePackageDirectory, writeValidatedPackage, writeWorkflowState } from "../src/package-validator.js";
-import type { AcceptanceCommandRunner, FinalizeInput, GitCommandResult, HarnessPair, ReviewReport, ExecutionReport, PhasePackage } from "../src/types.js";
+import type { AcceptanceCommandRunner, FinalizeInput, GitCommandResult, HarnessPair, ReviewReport, ExecutionReport, PhasePackage, StageBAbortReason, StageBStatusEvent } from "../src/types.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -115,6 +115,7 @@ class FakeHarness implements HarnessPair {
   reworkCalls = 0;
   reviewCalls = 0;
   lastReviewPrompt = "";
+  lastReworkPrompt = "";
   private readonly cwd: string;
   private readonly baseCommit: string;
   private readonly reworkRequired: boolean;
@@ -131,8 +132,9 @@ class FakeHarness implements HarnessPair {
     return execution(this.baseCommit, this.reworkRequired ? "blocked" : "complete");
   }
 
-  async rework(): Promise<ExecutionReport> {
+  async rework(prompt: string): Promise<ExecutionReport> {
     this.reworkCalls += 1;
+    this.lastReworkPrompt = prompt;
     await writeFile(join(this.cwd, "src", "change.txt"), "fixed\n", "utf8");
     const result = execution(this.baseCommit);
     return { ...result, round: 2 };
@@ -176,6 +178,36 @@ async function runController(
   return result;
 }
 
+test("draft planning state cannot start Executor or Reviewer work", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = new FakeHarness(setup.cwd, base);
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, {
+        cwd: setup.cwd,
+        runtimeRoot: ".pi-plan-execute-auto/stage-b-test",
+      }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+    assert.equal(result.status, "not_started");
+    assert.match(result.reason ?? "", /Human approval is required/);
+    assert.equal(state.status, "draft");
+    assert.equal(harness.executeCalls, 0);
+    assert.equal(harness.reworkCalls, 0);
+    assert.equal(harness.reviewCalls, 0);
+    assert.equal((await git(setup.cwd, ["status", "--porcelain"])).stdout.trim(), "");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
 test("prompt section limits retain rework feedback, previous findings, and output contracts", async () => {
   const setup = await setupRepo();
   try {
@@ -204,6 +236,9 @@ test("prompt section limits retain rework feedback, previous findings, and outpu
     const feedback = "FEEDBACK-MUST-SURVIVE";
     const executorPrompt = privateController.executorPrompt(phase, base, 2, "D".repeat(160_000), feedback);
     assert.match(executorPrompt, new RegExp(feedback));
+    assert.match(executorPrompt, /review_round_limit: 5/);
+    assert.match(executorPrompt, /review_rounds_remaining_including_this_round: 4/);
+    assert.match(executorPrompt, /review_rounds_remaining_after_this_round: 3/);
     assert.match(executorPrompt, /structured execution report/);
     const reviewerPrompt = privateController.reviewerPrompt(
       phase,
@@ -217,6 +252,10 @@ test("prompt section limits retain rework feedback, previous findings, and outpu
       [{ ...review(base, "REWORK"), findings: [{ id: "HISTORY-001", severity: "blocking", summary: "history finding", evidence: "evidence", blocking: true }] }],
     );
     assert.match(reviewerPrompt, /HISTORY-001/);
+    assert.match(reviewerPrompt, /review_round_limit: 5/);
+    assert.match(reviewerPrompt, /review_rounds_remaining_including_this_round: 4/);
+    assert.match(reviewerPrompt, /review_rounds_remaining_after_this_round: 3/);
+    assert.match(reviewerPrompt, /avoid drip-feeding findings/);
     assert.match(reviewerPrompt, /structured review report/);
     const manyFindings = Array.from({ length: 200 }, (_, index) => ({
       id: `HISTORY-${String(index).padStart(3, "0")}`,
@@ -330,6 +369,38 @@ test("dependency provisioning is bounded and cancellable", async () => {
   } finally {
     await rm(source, { recursive: true, force: true });
     await rm(target, { recursive: true, force: true });
+  }
+});
+
+test("an existing dedicated worktree is not blocked by later changes in the main worktree", async () => {
+  const setup = await setupRepo();
+  const worktree = join(tmpdir(), `pi-plan-execute-auto-existing-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const branchName = "pi-plan-execute-auto/existing-test";
+  try {
+    await ensureDedicatedWorktree(createLocalGitOperations(setup.cwd), {
+      sourceCwd: setup.cwd,
+      runId: "existing-test",
+      runtimeRoot: ".pi-plan-execute-auto/existing-test",
+      targetPath: worktree,
+      branchName,
+      targetGit: createLocalGitOperations(worktree),
+    });
+    await writeFile(join(setup.cwd, "main-only-uncommitted.txt"), "main workspace may move on\n", "utf8");
+    const reopened = await ensureDedicatedWorktree(createLocalGitOperations(setup.cwd), {
+      sourceCwd: setup.cwd,
+      runId: "existing-test",
+      runtimeRoot: ".pi-plan-execute-auto/existing-test",
+      targetPath: worktree,
+      branchName,
+      targetGit: createLocalGitOperations(worktree),
+      existing: { path: worktree, branchName },
+    });
+    assert.equal(reopened.path, worktree);
+    assert.equal(reopened.branchName, branchName);
+  } finally {
+    await git(setup.cwd, ["worktree", "remove", "--force", worktree]);
+    await rm(worktree, { recursive: true, force: true });
+    await rm(setup.cwd, { recursive: true, force: true });
   }
 });
 
@@ -569,6 +640,7 @@ test("Executor commit followed by reset is detected from refs and reflog", async
     const result = await runController(setup, harness);
     assert.equal(result.status, "paused");
     assert.match(result.reason ?? "", /HARNESS_CHANGED_HISTORY/);
+    assert.match(result.reason ?? "", /Executor changed Git reflog, unreachable/);
     assert.equal((await git(setup.cwd, ["log", "-1", "--pretty=%s"])).stdout.trim(), "initial");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
@@ -717,27 +789,65 @@ test("Reviewer dependency-tree writes are detected and pause before commit", asy
   }
 });
 
-test("acceptance dependency-tree writes fail closed", async () => {
+test("acceptance dependency and build writes do not pause the phase", async () => {
   const setup = await setupRepo();
   try {
-    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\nnode_modules/\n", "utf8");
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\nnode_modules/\ndist/\n", "utf8");
     await git(setup.cwd, ["add", ".gitignore"]);
-    await git(setup.cwd, ["commit", "-qm", "ignore dependencies"]);
+    await git(setup.cwd, ["commit", "-qm", "ignore dependencies and build output"]);
     await mkdir(join(setup.cwd, "node_modules"), { recursive: true });
     const dependencyFile = join(setup.cwd, "node_modules", "dependency.js");
     await writeFile(dependencyFile, "original\n", "utf8");
     const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    let acceptanceCalls = 0;
     const result = await runController(setup, new FakeHarness(setup.cwd, base), 3, {
       acceptanceRunner: {
         async run() {
-          await writeFile(dependencyFile, "acceptance\n", "utf8");
+          acceptanceCalls += 1;
+          await mkdir(join(setup.cwd, "dist"), { recursive: true });
+          await writeFile(dependencyFile, `acceptance-${acceptanceCalls}\n`, "utf8");
+          await writeFile(join(setup.cwd, "dist", "app.js"), `built-${acceptanceCalls}\n`, "utf8");
           return { stdout: "", stderr: "", code: 0 };
         },
       },
     });
-    assert.equal(result.status, "paused");
-    assert.match(result.reason ?? "", /HARNESS_CHANGED_HISTORY/);
-    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "2");
+    assert.equal(result.status, "completed");
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "3");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("Executor dependency and build writes complete the phase and are surfaced to the Reviewer", async () => {
+  const setup = await setupRepo();
+  try {
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\nnode_modules/\ndist/\n", "utf8");
+    await git(setup.cwd, ["add", ".gitignore"]);
+    await git(setup.cwd, ["commit", "-qm", "ignore dependencies and build output"]);
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    let reviewPrompt = "";
+    const harness: HarnessPair = {
+      async execute() {
+        await mkdir(join(setup.cwd, "node_modules", "dependency"), { recursive: true });
+        await writeFile(join(setup.cwd, "node_modules", "dependency", "index.js"), "installed\n", "utf8");
+        await mkdir(join(setup.cwd, "dist"), { recursive: true });
+        await writeFile(join(setup.cwd, "dist", "app.js"), "built\n", "utf8");
+        await writeFile(join(setup.cwd, "src", "change.txt"), "executor\n", "utf8");
+        return execution(base);
+      },
+      async rework() { return execution(base); },
+      async review(prompt) {
+        reviewPrompt = prompt;
+        return review(base);
+      },
+      async close() {},
+    };
+    const result = await runController(setup, harness);
+    assert.equal(result.status, "completed");
+    assert.match(reviewPrompt, /EXECUTOR WORKSPACE NOTE/);
+    assert.match(reviewPrompt, /node_modules=1/);
+    assert.match(reviewPrompt, /dist=1/);
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "3");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
   }
@@ -932,7 +1042,96 @@ test("cancelled Stage B pauses before commit", async () => {
       saveState: (next) => writeWorkflowState(setup.packageRoot, next),
     }).run();
     assert.equal(result.status, "paused");
-    assert.match(result.reason ?? "", /ABORTED/);
+    assert.match(result.reason ?? "", /\[ABORTED\]/);
+    assert.equal(result.state.pause?.code, "ABORTED");
+    assert.equal(result.state.pause?.resumable, true);
+    assert.equal(result.state.pause?.detail, "test cancellation");
+    assert.equal((await readWorkflowState(setup.packageRoot))?.pause?.code, "ABORTED");
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "1");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("Stage B aborts persist a precise, resumability-aware pause record", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const cases: Array<{ reason: StageBAbortReason | Error; code: string }> = [
+      { reason: { kind: "timeout", message: "Execution & Review timeout after 60000ms.", timeoutMs: 60_000, elapsedMs: 60_000 }, code: "TIMEOUT" },
+      { reason: { kind: "human_stop", message: "Execution & Review stopped by human." }, code: "HUMAN_STOP" },
+      { reason: { kind: "session_abort", message: "Pi session interrupted." }, code: "SESSION_ABORT" },
+      { reason: new Error("untyped legacy cancellation"), code: "ABORTED" },
+    ];
+    for (const item of cases) {
+      const controller = new AbortController();
+      controller.abort(item.reason);
+      const state = createDraftState(setup.pkg, "stage-b-test");
+      state.status = "frozen";
+      const result = await new StageBController({
+        package: setup.pkg,
+        state,
+        git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd, runtimeRoot: ".pi-plan-execute-auto/stage-b-test" }),
+        acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+        harness: new FakeHarness(setup.cwd, base),
+        signal: controller.signal,
+        requireDedicatedWorktree: false,
+        saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+      }).run();
+      assert.equal(result.status, "paused");
+      assert.equal(result.state.pause?.code, item.code, String(item.reason));
+      assert.equal(result.state.pause?.resumable, true, String(item.reason));
+      assert.equal(result.state.pause?.stage, "phase");
+      assert.match(result.reason ?? "", new RegExp(`\\[${item.code}\\]`));
+      assert.equal((await readWorkflowState(setup.packageRoot))?.pause_reason, result.reason);
+    }
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("a watchdog abort during Executor execution emits an interrupted status with the pause cause", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const controller = new AbortController();
+    const events: StageBStatusEvent[] = [];
+    const harness: HarnessPair = {
+      async execute() {
+        controller.abort({ kind: "timeout", message: "Execution & Review timeout after 60000ms.", timeoutMs: 60_000, elapsedMs: 60_000 } satisfies StageBAbortReason);
+        throw new Error("aborted by watchdog");
+      },
+      async rework() { throw new Error("unexpected rework"); },
+      async review() { throw new Error("unexpected review"); },
+      async close() {},
+    };
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "frozen";
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd, runtimeRoot: ".pi-plan-execute-auto/stage-b-test" }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      signal: controller.signal,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+      onStatus: (event) => events.push(event),
+    }).run();
+    assert.equal(result.status, "paused");
+    assert.equal(result.state.pause?.code, "TIMEOUT");
+    assert.equal(result.state.pause?.stage, "executor");
+    assert.equal(result.state.pause?.timeout_ms, 60_000);
+    assert.match(result.reason ?? "", /timed out after 1 minute/);
+    const terminal = events.at(-1)!;
+    assert.equal(terminal.executor_status, "interrupted");
+    assert.equal(terminal.reviewer_status, "interrupted");
+    assert.equal(terminal.pause?.code, "TIMEOUT");
+    assert.match(terminal.message, /\[TIMEOUT\]/);
+    assert.deepEqual(terminal.plan?.phase_ids, ["phase-01"]);
+    assert.deepEqual(terminal.plan?.phase_statuses, ["paused"]);
+    assert.equal(terminal.plan?.current_index, 0);
+    assert.equal(typeof terminal.plan?.review_round_limit, "number");
     assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "1");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
@@ -1241,6 +1440,282 @@ test("review loop breaker pauses without creating a completion commit", async ()
     assert.equal(result.state.phases[0]?.phase_commit_sha, undefined);
     const count = await git(setup.cwd, ["rev-list", "--count", "HEAD"]);
     assert.equal(count.stdout.trim(), "1");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+
+test("explicit Stage B resume rebuilds a fresh executor turn from persisted paused checkpoint", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    await writeFile(join(setup.cwd, "src", "change.txt"), "partial from interrupted session\n", "utf8");
+
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "paused";
+    state.pause_reason = "[HARNESS_ERROR] Reviewer provider usage limit interrupted the run.";
+    state.review_round_limit = 3;
+    const phase = state.phases[0]!;
+    phase.status = "paused";
+    phase.base_commit_sha = base;
+    phase.review_rounds = 1;
+    phase.last_error = state.pause_reason;
+
+    const harness = new FakeHarness(setup.cwd, base);
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, {
+        cwd: setup.cwd,
+        runtimeRoot: ".pi-plan-execute-auto/stage-b-test",
+      }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      maxReviewRounds: 3,
+      resumePaused: true,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+
+    assert.equal(result.status, "completed");
+    assert.equal(harness.executeCalls, 0, "resume checkpoint should be treated as rework of persisted partial work");
+    assert.equal(harness.reworkCalls, 1);
+    assert.equal(harness.reviewCalls, 1);
+    assert.match(harness.lastReworkPrompt, /RESUME CHECKPOINT/);
+    assert.match(harness.lastReworkPrompt, /fresh Executor session/);
+    assert.match(harness.lastReworkPrompt, /HARNESS_ERROR/);
+    assert.match(harness.lastReworkPrompt, /CURRENT ACTUAL WORKTREE DIFF/);
+    assert.equal(result.state.phases[0]?.review_rounds, 2);
+    assert.equal(result.state.phases[0]?.status, "completed");
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("paused Stage B remains inert unless resume is explicitly requested", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "paused";
+    state.pause_reason = "[HARNESS_ERROR] transient";
+    state.phases[0]!.status = "paused";
+    state.phases[0]!.base_commit_sha = base;
+    const harness = new FakeHarness(setup.cwd, base);
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      requireDedicatedWorktree: false,
+      saveState: async () => {},
+    }).run();
+    assert.equal(result.status, "paused");
+    assert.equal(harness.executeCalls + harness.reworkCalls + harness.reviewCalls, 0);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+
+test("resume reconciliation accepts a committed phase whose completion record landed before state save", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const completed = await runController(setup, new FakeHarness(setup.cwd, base));
+    assert.equal(completed.status, "completed");
+
+    const phase = completed.state.phases[0]!;
+    const committedSha = phase.phase_commit_sha;
+    assert.ok(committedSha);
+
+    // Simulate the crash window: immutable commit/record exist, but persisted
+    // workflow state still says the phase was running.
+    const stale = structuredClone(completed.state);
+    stale.status = "running";
+    delete stale.completed_at;
+    stale.pause_reason = undefined;
+    const stalePhase = stale.phases[0]!;
+    stalePhase.status = "running";
+    delete stalePhase.phase_commit_sha;
+    delete stalePhase.committed_at;
+    delete stalePhase.completion_record_path;
+    delete stalePhase.completion_record_sha256;
+    delete stalePhase.final_diff_path;
+    delete stalePhase.final_diff_sha256;
+    delete stalePhase.reviewed_diff_sha256;
+    await writeWorkflowState(setup.packageRoot, stale);
+
+    let harnessCalls = 0;
+    const harness: HarnessPair = {
+      async execute() { harnessCalls += 1; throw new Error("executor must not run"); },
+      async rework() { harnessCalls += 1; throw new Error("executor must not run"); },
+      async review() { harnessCalls += 1; throw new Error("reviewer must not run"); },
+      async close() {},
+    };
+    const recovered = await new StageBController({
+      package: setup.pkg,
+      state: stale,
+      git: new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd }),
+      acceptanceRunner: { run: async () => ({ stdout: "", stderr: "", code: 0 }) },
+      harness,
+      resumePaused: true,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+
+    assert.equal(recovered.status, "completed");
+    assert.equal(harnessCalls, 0);
+    assert.equal(stale.status, "completed");
+    assert.equal(stale.phases[0]?.status, "completed");
+    assert.equal(stale.phases[0]?.phase_commit_sha, committedSha);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("resume after multiple completed phases accepts HEAD descending from earlier phase commits", async () => {
+  const setup = await setupRepo();
+  try {
+    const phaseIds = ["phase-01", "phase-02", "phase-03"] as const;
+    const runId = "three-phase-resume-test";
+    const input: FinalizeInput = {
+      run_id: runId,
+      manifest: {
+        version: 1,
+        documents: [],
+        phases: phaseIds.map((id, index) => ({
+          id,
+          order: index + 1,
+          spec: `phases/${id}.md`,
+          acceptance: `acceptance/${id}.yaml`,
+          commit: { required: true, message: `complete ${id}` },
+        })),
+      },
+      files: [
+        ...phaseIds.map((id) => ({ path: `phases/${id}.md`, content: `${id}\n` })),
+        ...phaseIds.map((id) => ({
+          path: `acceptance/${id}.yaml`,
+          content: [
+            "version: 1",
+            `phase_id: ${id}`,
+            "scope:",
+            "  allowed_paths:",
+            "    - src/**",
+            "self_tests:",
+            "  - id: unit",
+            "    command: \"true\"",
+            "    required: true",
+            "review:",
+            "  require_no_blocking_findings: true",
+            "commit:",
+            "  required: true",
+            "  allow_empty: false",
+            "",
+          ].join("\n"),
+        })),
+      ],
+    };
+    const written = await writeValidatedPackage(setup.cwd, input, runId);
+    const validation = await validatePackageDirectory(written.package.root);
+    assert.ok(validation.package);
+    const pkg = validation.package;
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+
+    const phaseInfo = (prompt: string): { phaseId: string; baseCommit: string } => ({
+      phaseId: /\nphase_id: (phase-\d\d)\n/.exec(prompt)?.[1] ?? "phase-01",
+      baseCommit: /\nphase_base_commit: ([0-9a-f]{40})\n/.exec(prompt)?.[1] ?? base,
+    });
+    const executionFor = (phaseId: string, baseCommit: string): ExecutionReport => ({
+      phase_id: phaseId,
+      round: 1,
+      base_commit: baseCommit,
+      status: "complete",
+      summary: "done",
+      changed_files: [`src/${phaseId}.txt`],
+      self_tests: [{ id: "unit", command: "true", status: "passed" }],
+      resolved_findings: [],
+      known_issues: [],
+    });
+    const reviewFor = (phaseId: string, baseCommit: string): ReviewReport => ({
+      phase_id: phaseId,
+      round: 1,
+      base_commit: baseCommit,
+      verdict: "PASS",
+      summary: "green",
+      findings: [],
+      evidence: ["checked"],
+      acceptance_assessment: "pass",
+      out_of_scope_changes: [],
+    });
+    const completePhase = async (prompt: string): Promise<ExecutionReport> => {
+      const { phaseId, baseCommit } = phaseInfo(prompt);
+      await writeFile(join(setup.cwd, "src", `${phaseId}.txt`), phaseId, "utf8");
+      return executionFor(phaseId, baseCommit);
+    };
+    const workspace = () => new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, {
+      cwd: setup.cwd,
+      runtimeRoot: `.pi-plan-execute-auto/${runId}`,
+    });
+    const acceptanceRunner: AcceptanceCommandRunner = { run: async () => ({ stdout: "", stderr: "", code: 0 }) };
+    const saveState = (next: Parameters<typeof writeWorkflowState>[1]) => writeWorkflowState(written.package.root, next);
+
+    // First run completes phase-01 and phase-02, then the phase-03 executor fails.
+    const first = createDraftState(pkg, runId);
+    first.status = "frozen";
+    const firstResult = await new StageBController({
+      package: pkg,
+      state: first,
+      git: workspace(),
+      acceptanceRunner,
+      harness: {
+        async execute(prompt) {
+          if (phaseInfo(prompt).phaseId === "phase-03") throw new Error("simulated executor backend failure");
+          return completePhase(prompt);
+        },
+        async rework() { throw new Error("unexpected rework"); },
+        async review(prompt, round) {
+          const { phaseId, baseCommit } = phaseInfo(prompt);
+          return { ...reviewFor(phaseId, baseCommit), round };
+        },
+        async close() {},
+      },
+      maxReviewRounds: 3,
+      requireDedicatedWorktree: false,
+      saveState,
+    }).run();
+    assert.equal(firstResult.status, "paused");
+    assert.match(firstResult.reason ?? "", /HARNESS_ERROR/);
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "3");
+
+    // Second run resumes with HEAD at phase-02's commit while phase-01 is already history.
+    const persisted = await readWorkflowState(written.package.root);
+    assert.ok(persisted);
+    assert.equal(persisted.phases[0]?.status, "completed");
+    assert.equal(persisted.phases[1]?.status, "completed");
+    const secondResult = await new StageBController({
+      package: pkg,
+      state: persisted,
+      git: workspace(),
+      acceptanceRunner,
+      harness: {
+        async execute(prompt) { return completePhase(prompt); },
+        async rework(prompt) { return completePhase(prompt); },
+        async review(prompt, round) {
+          const { phaseId, baseCommit } = phaseInfo(prompt);
+          return { ...reviewFor(phaseId, baseCommit), round };
+        },
+        async close() {},
+      },
+      maxReviewRounds: 3,
+      requireDedicatedWorktree: false,
+      resumePaused: true,
+      saveState,
+    }).run();
+    assert.equal(secondResult.status, "completed");
+    assert.equal((await git(setup.cwd, ["rev-list", "--count", "HEAD"])).stdout.trim(), "4");
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
   }

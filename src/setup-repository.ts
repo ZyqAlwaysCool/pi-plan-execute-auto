@@ -1,7 +1,8 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFile = promisify(execFileCallback);
@@ -33,7 +34,50 @@ async function gitEntryExists(root: string): Promise<boolean> {
   }
 }
 
-/** Mutates no user files. Git init and an optional empty commit require distinct UI approvals. */
+async function ensurePluginIgnored(root: string, ui: SetupRepositoryUI): Promise<void> {
+  // Keep plugin runtime/config out of Git status without mutating project files.
+  // Repository-local info/exclude is intentionally untracked and applies only here.
+  const ignored = await git(root, ["check-ignore", "-q", "--no-index", "--", ".pi-plan-execute-auto/"])
+    .then(() => true, () => false);
+  if (ignored) return;
+
+  const commonDirRaw = await git(root, ["rev-parse", "--git-common-dir"]);
+  const commonDir = resolve(root, commonDirRaw);
+  const excludeRaw = await git(root, ["rev-parse", "--git-path", "info/exclude"]);
+  const excludePath = resolve(root, excludeRaw);
+  const infoDir = dirname(excludePath);
+  if (infoDir !== resolve(commonDir, "info")) {
+    throw new Error("Refusing unexpected Git info/exclude path; configure .pi-plan-execute-auto/ ignore manually.");
+  }
+  await mkdir(infoDir, { recursive: true, mode: 0o700 });
+  const rule = ".pi-plan-execute-auto/";
+  let entry;
+  try { entry = await lstat(excludePath); } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+  }
+  if (!entry) {
+    await writeFile(excludePath, `${rule}\n`, { flag: "wx", mode: 0o600 });
+  } else {
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error("Refusing to modify a non-regular or symlinked Git info/exclude file.");
+    }
+    const handle = await open(excludePath, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > 128 * 1024) throw new Error("Refusing to modify an oversized Git info/exclude file.");
+      const content = await handle.readFile("utf8");
+      if (content.includes("\0")) throw new Error("Refusing to modify a binary Git info/exclude file.");
+      const newline = content.includes("\r\n") ? "\r\n" : "\n";
+      const next = `${content}${content && !content.endsWith("\n") ? newline : ""}${rule}${newline}`;
+      await handle.truncate(0);
+      await handle.write(next, 0, "utf8");
+      await handle.truncate(Buffer.byteLength(next));
+    } finally { await handle.close(); }
+  }
+  ui.notify("Configured repository-local .git/info/exclude for .pi-plan-execute-auto/. No project file was changed or staged.", "info");
+}
+
+/** Git init and an optional empty commit require distinct UI approvals; user files are never staged. */
 export async function ensureSetupRepository(cwd: string, ui: SetupRepositoryUI): Promise<boolean> {
   const root = await realpath(cwd);
   if (root === "/" || root === homedir()) {
@@ -64,17 +108,18 @@ export async function ensureSetupRepository(cwd: string, ui: SetupRepositoryUI):
     }
     ui.notify("Initialized Git here. No project files were staged or committed.", "info");
   }
+  await ensurePluginIgnored(root, ui);
   let hasHead = false;
   try { await git(root, ["rev-parse", "--verify", "HEAD"]); hasHead = true; } catch { /* An unborn repository needs a baseline commit. */ }
   if (hasHead) return true;
   const cached = await git(root, ["ls-files", "--cached", "-z"]);
   if (cached) {
-    ui.notify("This repository has staged files but no commit. Commit or unstage them yourself before Stage B; setup will not commit user files.", "warning");
+    ui.notify("This repository has staged files but no commit. Commit or unstage them yourself before Execution & Review; setup will not commit user files.", "warning");
     return true;
   }
   const createBaseline = await ui.confirm(
     "Create an empty initial Git commit?",
-    "Stage B requires an existing HEAD to create a dedicated worktree. This creates an EMPTY baseline commit only; it does not add, stage, or commit your files. " +
+    "Execution & Review requires an existing HEAD to create a dedicated worktree. This creates an EMPTY baseline commit only; it does not add, stage, or commit your files. " +
     "Git user.name and user.email must already be configured. You may decline and create your own initial commit later.",
   );
   if (!createBaseline) {
@@ -83,9 +128,9 @@ export async function ensureSetupRepository(cwd: string, ui: SetupRepositoryUI):
   }
   try {
     await git(root, ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "--only", "--no-verify", "-m", "Initialize plan-execute repository"]);
-    ui.notify("Created an empty initial commit. Untracked project files were not staged; commit or ignore them before Stage B.", "info");
+    ui.notify("Created an empty initial commit. Untracked project files were not staged; commit or ignore them before Execution & Review.", "info");
   } catch {
-    ui.notify("Git was initialized, but the empty baseline commit failed (check Git user.name/user.email). Commit manually before Stage B; setup can continue.", "warning");
+    ui.notify("Git was initialized, but the empty baseline commit failed (check Git user.name/user.email). Commit manually before Execution & Review; setup can continue.", "warning");
   }
   return true;
 }

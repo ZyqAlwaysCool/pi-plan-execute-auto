@@ -8,3 +8,4 @@ export * from "./reports.js";
 export * from "./completion.js";
 export * from "./stage-b.js";
 export * from "./agent-prism.js";
+export * from "./isolation-provider.js";

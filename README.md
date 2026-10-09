@@ -1,56 +1,299 @@
 # pi-plan-execute-auto
 
-Pi-native phased planning/execution extension. The extension keeps Main Pi as the planning owner, requires explicit human freeze approval, validates a Golden Document Package, and runs ordered Executor → Reviewer rounds only after the human chooses `Approve & Start`.
+Pi-native phased planning, execution, independent review, acceptance, and phase-commit workflow.
 
-## Implemented contract
+The plugin keeps **Main Pi** as the planning partner. The user decides when planning is mature enough to formalize by running `/plan-execute`. The resulting phased plan stays editable until the human explicitly approves it; only then does automated Execution & Review begin.
 
-- `/plan-execute setup` detects four built-in ACP harness CLIs (Claude, Codex, OpenCode, Pi). After network-risk acknowledgement it lists candidates from each CLI or an isolated, read-only ACP catalog session in a disposable repository. It lets the human choose either role from the available harnesses and selects from the reasoning levels actually advertised by **both selected models** (`low`, `medium`, `high`, `max`, or backend default); availability and effort are rechecked at Stage B start. Non-secret selections are cached in `.pi-plan-execute-auto/config.json`, but their approved SHA-256 and the human's network consent are kept **outside the project** in the Pi user directory. Editing the project cache cannot authorize a route or consent. A catalog-only check is **not** a real provider-call test: choosing Claude or Pi requires a separate, explicitly approved, potentially billable synthetic-repository model-call preflight before saving setup; failures stop configuration without substituting a model. Current Claude availability and validation limits are documented below. `/plan-execute` (or `/plan-execute finalize`) then asks Main Pi to call `plan_execute_finalize`.
-- `plan_execute_finalize` writes `.pi-plan-execute-auto/<run-id>/manifest.yaml` plus the model-produced documents, then performs structural validation.
-- A package must contain at least one ordered phase. Each phase has an independent spec, acceptance YAML, required commit contract, allowed paths, at least one required self-test, review policy, and explicit `allow_empty`.
-- Approval is collected by native Pi UI or `/plan-execute approve <run-id>`; the model cannot silently freeze a package.
-- Golden files are hashed at freeze time. Runtime state and reports live under `.state.json` / `.runtime/` and are excluded from that hash.
-- Human `Approve & Start` is authoritative and always invokes Stage B; `/plan-execute approve <run-id> start` is the explicit command equivalent. Required acceptance commands are rerun by the plugin after Reviewer `PASS` inside the same OS filesystem sandbox policy as the ACP actors; a contract command cannot write to the host source worktree, Golden Package, or other host paths.
-- `AgentPrismSessionPair` uses AgentPrism `AcpAgent.stream()`: the Executor session stays open across REWORK, each Reviewer round is fresh, and every ACP server and acceptance shell is launched under bubblewrap. The sandbox starts from a private empty root and mounts only system runtime directories, the Node/ACP runtime, the dedicated worktree, the Golden Package, a run-private Git mirror, and run-private scratch. Reviewer mounts are read-only; the Codex Reviewer uses the adapter's `agent-full-access` mode **inside** the independently verified OS-read-only sandbox, because codex-acp's misleadingly named `read-only` mode still tries to create `.agents` in the read-only worktree. This mode is not the security boundary. Executor/acceptance persistent project writes are limited to the dedicated worktree (the synthetic rootfs is read-only and run scratch is private). Host `/`, home directories, source-worktree files (except the separately mounted Golden Package), shared Git metadata/history, host `/run`, and `/var/tmp` are not mounted (the sandbox has a private `/run` tmpfs). Host-home/other-project/tmp canaries plus filesystem write probes run before each session and acceptance command.
-- The ACP environment is cleared and rebuilt from an allowlist. Provider `auth.json` is copied into per-run scratch only for ACP startup and deleted before the first agent turn. For a custom OpenCode provider, only its selected provider/model definition (including the saved API key needed for startup) is extracted from host JSONC, staged in private scratch, and deleted before the first turn; unrelated providers, plugins, host config files, and credential-bearing environment variables are not mounted or forwarded. Custom ACP command overrides and untrusted bubblewrap binaries are rejected. Claude/Pi Node runtimes enable Node's environment proxy handling only for validated credential-free proxy URLs forwarded to the sandbox; without that, Pi model turns can fail after ACP `ready()` even when the host CLI succeeds. The sandbox replaces the host `.git` pointer with a read-only shallow Git mirror containing only the phase base commit and tree (no shared gitdir, writable index, other refs, or earlier history), so Reviewer can independently run Git diff. Reviewer also receives the complete immutable plugin-generated patch and SHA-256 from Golden Package runtime evidence.
-- Executor/Reviewer/acceptance history, refs, reflog, unreachable objects, index, tracked bytes, and all ignored/untracked file bytes (including ordinary files under provisioned `node_modules`/virtualenv roots), Golden Docs, scope, acceptance, commit, cancellation, timeout, and loop violations pause the workflow without reset/rebase/history rewriting.
-- Stage B uses a clean run-scoped branch/worktree by default and provisions private common dependency environments. Dependency files remain part of the workspace snapshot and any actor mutation fails closed. A successful phase gets exactly one plugin-owned commit whose parent, subject, tree diff, Reviewer-approved diff hash, completion-record payload, and report evidence are cross-validated.
+## Workflow
 
-## Development
+### Planning & Approval
+
+1. The user and Main Pi discuss the task normally for as many turns as needed.
+2. The user explicitly runs `/plan-execute`.
+3. Main Pi produces a validated draft package with ordered phases, phase specs, allowed paths, required self-tests, acceptance contracts, and phase commit messages.
+4. The human can:
+   - **Review Plan** — inspect the current draft;
+   - **Request Changes** — describe revisions in an editor; Main Pi regenerates the complete draft package and the plugin validates it again;
+   - **Approve & Start** — freeze the exact reviewed package hash and start execution;
+   - **Cancel**.
+5. Plan revision can repeat as many times as needed before approval. Previous draft revisions are retained under the run's `.runtime/planning/revisions/` directory. Draft creation/revision tools only write and validate the draft; the human **Plan Review & Approval** dialog is opened after the Main Pi turn finishes, so a tool call can never silently cross the `draft → frozen` boundary.
+
+The AI cannot silently approve or start execution. A revision request is handled only by Main Pi in the Planning & Approval stage: it never creates an Executor/Reviewer session, never runs acceptance, never creates the execution worktree, and never modifies project deliverables. The Execution & Review controller also refuses to run while workflow state is still `draft`, providing a second hard boundary below the UI/tool layer.
+
+Before **Approve & Start**, the plugin runs a readiness check. Normal fixable prerequisites—such as a dirty main worktree, missing Git baseline commit, unavailable isolation runtime, or a stale worktree path—do not turn the run into a failed/paused execution. The plan remains editable/retryable until the prerequisite is fixed.
+
+### Execution & Review
+
+For every phase:
+
+1. A full independent **Executor Agent CLI session** implements the current phase and runs its required self-tests.
+2. The plugin runs deterministic acceptance commands.
+3. A fresh full independent **Reviewer Agent CLI session** inspects the implementation.
+4. On `REWORK`, feedback returns to the **same Executor session** for that phase.
+5. A new Reviewer session checks the next round.
+6. On Reviewer `PASS`, the plugin reruns final acceptance and creates exactly one validated phase commit.
+7. The next phase starts with a **new Executor session**.
+
+The process continues until all phases have development, self-test, independent review, final acceptance, and a phase commit.
+
+Only integrity/execution failures that genuinely require human attention are persisted as `paused`—for example package/evidence tampering, worktree identity mismatch, broken completion evidence, or an execution process restart that would violate the same-session invariant. Ordinary start prerequisites remain retryable with `/plan-execute start <run-id>`.
+
+Gitignored dependency and build artifacts (for example `node_modules/` and `dist/`) are outside the phase commit boundary. Executor installs/builds and deterministic acceptance may create or update them without pausing the run, and the Executor's ignored-tree summary is surfaced to the Reviewer as advisory evidence. Git history, branch refs, reflogs, unreachable objects, the index, and every Reviewer workspace byte (including ignored files) remain fail-closed.
+
+## Commands
+
+The normal command surface is intentionally small:
+
+```text
+/plan-execute
+/plan-execute setup
+/plan-execute settings [run-id]
+/plan-execute start <run-id>
+/plan-execute resume <run-id>
+/plan-execute stop <run-id>
+/plan-execute status <run-id>
+```
+
+- `/plan-execute` formalizes the current planning discussion into a draft and opens Review & Approval.
+- `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout in one full wizard.
+- `settings [run-id]` reopens only the individual settings as a menu, without repeating the whole wizard. With no run id it targets project defaults; with a run id it also syncs that frozen run's persisted settings so an explicit resume stays allowed. Model/effort changes apply to sessions created after the next resume; the timeout is operational and never invalidates a frozen run.
+- `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
+- `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint.
+- `stop <run-id>` (or the `Ctrl+Shift+X` shortcut) requests a safe stop of an active execution and pauses without committing.
+- `status <run-id>` shows a compact status summary plus the workflow-timeline path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
+
+`start` and `resume` run Execution & Review in the background instead of holding Pi's input loop, so chat, `/plan-execute status`, and the stop command/shortcut stay usable while a run is live. Stopping, timing out, or quitting Pi aborts the active harness and records a resumable pause (session shutdown gets a short bounded drain to persist it).
+
+Structural validation, approval hashing, commit validation, and configuration integrity checks are automatic; they are not separate day-to-day commands.
+
+## Run-local diagnostics
+
+Each run is self-contained under:
+
+```text
+.pi-plan-execute-auto/<run-id>/
+```
+
+The directory contains the Golden Plan plus local diagnostic material under `.runtime/`. Copying the whole run directory is intended to provide enough context to diagnose most failures without scraping the main Pi UI.
+
+Typical contents include:
+
+```text
+manifest.yaml
+plan/...
+.state.json
+.runtime/
+  events.jsonl
+  main-pi-session.json
+  sessions/
+    executor/<session-id>.jsonl
+    reviewer/<session-id>.jsonl
+  planning/
+    revisions/
+      revision-001/package/...
+  reports/...
+  review-diffs/...
+  final-diffs/...
+  completions/...
+```
+
+Diagnostics are intentionally layered rather than capturing every ACP event. `.runtime/events.jsonl` is a **compact workflow timeline** only: plan revisions/review choices, approval, phase/round transitions, start blockers, and pause/completion state. Agent internals do not duplicate into that global file.
+
+`.runtime/main-pi-session.json` is also diagnostic rather than authoritative evidence. It stores only a bounded recent snapshot of the Main Pi branch (at most 120 compacted entries and 512 KiB), with source/retained entry counts and a truncation flag. Large strings, nested collections, and older entries are deliberately omitted instead of mirroring the entire conversation.
+
+Each Executor/Reviewer session has a small transcript under `.runtime/sessions/executor/` or `.runtime/sessions/reviewer/`. A session transcript keeps only information useful for reconstruction: session start/close metadata, a prompt digest with bounded head/tail (the full prompt is reproducible from the frozen package plus persisted diffs and reports), human permission decisions (autonomous auto-approvals are not recorded), and the terminal turn's bounded text plus a digest and identity of its structured report. Raw thought/message chunks, usage-update streams, and other high-frequency ACP stream traffic are not persisted. Structured execution/review reports under `.runtime/reports/`, acceptance outputs, immutable diffs, and completion records remain the authoritative evidence. JSONL appends are serialized per file to prevent concurrent diagnostic writes from corrupting records.
+
+Before diagnostic JSON is written, known host credential environment values and credential-shaped fields are redacted. The plugin does **not intentionally log provider credentials or copied authentication state** into the run diagnostics. This is defense in depth rather than a claim that arbitrary agent output can never contain sensitive project data: the bundle can contain source snippets, prompts, model/tool outputs, commands, and other project-sensitive material, so treat a copied run directory as sensitive debugging data.
+
+The main UI is deliberately compact: the live widget keeps the run id, `N/M phases` progress, a full phase-name checklist (`✓` completed, `▶` current, `⏸` paused, `○` pending) with the current review round, the whole-run budget, the latest ACP activity (spinner + `evt/s`), and the latest status message, while detailed diagnostics live in the run directory. Each completed phase also appends a durable `Phase N/M … committed` entry to the session, so progress survives even when the live widget is missed. The pinned widget only exists while a run is actionable (running or paused); a completed or cancelled run releases it and leaves a chat summary with the run id, phase count, and branch, so the same Main Pi session stays clean for the next plan. A normal start blocker does not trigger an automatic Main Pi diagnostic turn.
+
+## Full native Agent CLI sessions
+
+Built-in routes:
+
+- `claude/<selector>`
+- `codex/<model>`
+- `opencode/<provider>/<model>`
+- `pi/<provider>/<model>`
+
+Executor and Reviewer are real independent ACP/CLI processes, not Main Pi subagents. The plugin preserves the selected CLI's normal model routing, gateway/provider environment, native user configuration, plugins/MCP/tool configuration, shell tools, proxies, and normal network access inside a private runtime copy.
+
+For example, `claude/sonnet` means “use the Claude CLI and select its `sonnet` slot”. If the user's Claude configuration maps that slot to another gateway model, that native mapping remains valid.
+
+The plugin does **not** disable Claude Agent/Task/WebSearch/WebFetch and does not force Claude Code's native Bash sandbox. It therefore does **not** require `socat` by itself. If your own Claude Code configuration enables its native Bash sandbox (for example `sandbox.enabled: true` or `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`), Claude Code may require `socat` on Linux/WSL; setup detects this condition and explains that it is a Claude Code dependency rather than a plugin dependency.
+
+## Setup UX
+
+Run:
 
 ```bash
-npm install
+/plan-execute setup
+```
+
+Setup is **project-scoped**, not Pi-session-scoped. A new Pi conversation in the same Git project automatically reuses the previously approved setup; you do not need to run setup again just because the conversation changed.
+
+If `/plan-execute setup` is run again and the existing project setup is valid, the plugin first shows the current Executor/Reviewer routes, reasoning levels, review limit, permission mode, execution timeout, and approval time, then offers:
+
+- **Keep current setup** — exits immediately without CLI discovery, model probing, provider calls, or config writes;
+- **Run health check** — optionally sends the small potentially-billable READY probes through the currently saved routes; pass, failure, or skip never rewrites the saved setup;
+- **Reconfigure** — warns about frozen-run compatibility and only then enters the full setup wizard;
+- **Cancel** — leaves everything unchanged.
+
+Reconfiguration changes the project default for future plans/runs. Existing approved runs keep their own frozen settings and never silently switch to the newly selected agents; a frozen run with mismatched settings must use a matching setup again or be replaced by a new run. The execution timeout is an operational policy rather than frozen provenance, so raising it takes effect the next time a paused run is started or resumed.
+
+Setup performs an environment preflight before saving configuration:
+
+- Git initialization is offered only if the directory is not already a repository and still requires explicit consent;
+- plugin runtime/config is ignored through repository-local `.git/info/exclude`; setup does **not** create or modify project `.gitignore`, stage files, or create a project diff;
+- a trusted platform-native isolation provider is available:
+  - Linux/WSL: root-owned `bubblewrap` plus usable unprivileged user namespaces;
+  - macOS: Apple's system `/usr/bin/sandbox-exec` Seatbelt launcher;
+- the selected isolation provider passes its preflight before any Executor/Reviewer session can start;
+- installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi;
+- Executor model/reasoning and Reviewer model/reasoning are chosen independently;
+- an optional live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable; choosing **No** skips the check and setup still completes normally;
+- if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
+- review-loop limit and permission handling are explained and selected;
+- the whole-run execution timeout is selected from 5 minutes, 15 minutes, 30 minutes (recommended default), a custom 1–1440 minute value, or no timeout at all;
+- the final networking behavior is shown before consent is saved.
+
+### Review-loop limit
+
+The configured number is the maximum **Executor → Reviewer cycles per phase**. The remaining budget is injected into both agents every round so they can converge rather than defer work or findings until later rounds.
+
+Default: **5 rounds per phase**.
+
+If the limit is exhausted without Reviewer `PASS`, the workflow pauses for the user instead of looping indefinitely.
+
+### Agent permission handling
+
+Two modes are available:
+
+- **Autonomous** — keeps all CLI tools available, prefers a one-time allow option, and falls back to another CLI-advertised allow option when necessary. This is intended for trusted repositories and unattended execution.
+- **Ask me** — keeps the same CLI capabilities but pauses on each ACP permission request and displays the exact options advertised by that CLI in Pi. The user's selected option ID is returned unchanged.
+
+The selected permission mode and review limit are frozen into each approved run. Changing setup later cannot silently change an active/frozen run.
+
+### Execution timeout
+
+The execution timeout is the total Execution & Review budget for the whole run across every phase, including Executor, Reviewer, and acceptance work. The recommended default is **30 minutes**; setup also offers 5 minutes, 15 minutes, a custom 1–1440 minute value, and no timeout.
+
+When the budget expires, the run pauses as a resumable `TIMEOUT` checkpoint instead of running unattended without a bound. Raising the timeout through a new human-approved `/plan-execute setup` takes effect for the next start or resume of a paused run; it is an operational resource policy and is not part of the frozen artifact provenance. Headless runs without a project profile can set `PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS` explicitly (`0`, `none`, `unlimited`, or `off` mean no timeout).
+
+Every pause is classified in the persisted state and the `workflow_paused` run event: `TIMEOUT`, `HUMAN_STOP`, `SESSION_ABORT`, `PROCESS_RESTART`, `HARNESS_ERROR`, evidence/safety failures, and so on, together with `stage`, `round`, and whether the checkpoint is resumable. `/plan-execute status` and the Pi state entry show the code; the live widget also shows the remaining budget (`12m left`) so a timeout is visible before it fires.
+
+## Isolation model
+
+The common `IsolationProvider` is platform-native. Linux/WSL uses `bubblewrap`; macOS uses Apple's Seatbelt policy through the system-owned `/usr/bin/sandbox-exec`. Its job is **containment**, not capability reduction.
+
+Both providers fail closed: if the trusted OS sandbox is unavailable or the boundary self-test fails, Execution & Review does not start. The macOS `sandbox-exec` command is deprecated by Apple, so it is treated as an implementation detail rather than a permanent API contract; the provider validates the system binary and actual read/write boundary on every execution path instead of silently falling back to unsandboxed agents.
+
+It provides:
+
+- a run-scoped dedicated branch/worktree;
+- Executor project access as read/write;
+- Reviewer project access as read-only;
+- Golden plan/acceptance files as read-only;
+- a private runtime HOME/tmp/config copy instead of exposing the host HOME directly;
+- native Agent CLI state copied into run-private scratch;
+- unrelated host files/directories hidden;
+- trusted system/runtime binaries mounted read-only;
+- normal Agent CLI and acceptance-command networking.
+
+Acceptance commands use the same filesystem/worktree boundary and normal networking, so integration tests that need localhost or external services are not artificially broken.
+
+The plugin-owned phase commit is cross-checked against the phase base, expected commit subject/evidence, Reviewer-approved diff hash, final acceptance evidence, and completion record.
+
+## Requirements
+
+Supported hosts:
+
+- Linux / WSL
+- macOS
+- Node.js 22+
+- Git
+- whichever Agent CLIs you plan to select
+
+Linux/WSL additionally requires `bubblewrap` and usable unprivileged user namespaces:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y bubblewrap
+
+which bwrap
+unshare -Ur true
+```
+
+macOS uses the system Seatbelt launcher and does not require Homebrew or a third-party sandbox package:
+
+```bash
+test -x /usr/bin/sandbox-exec
+/usr/bin/sandbox-exec -p '(version 1) (allow default)' /usr/bin/true
+```
+
+The macOS provider uses a default-deny Seatbelt profile, keeps the dedicated Executor worktree writable, mounts no host filesystem root, keeps the Reviewer worktree and Golden Package read-only, uses a run-private HOME/tmp/config area, exposes only required system/runtime paths, and preserves normal Agent CLI networking. If a future macOS release removes or disables `sandbox-exec`, the plugin fails closed until another macOS provider is available.
+
+No extra firewall, proxy, provider-specific daemon, or `socat` is required by this plugin itself.
+
+Claude-specific exception: if **your own Claude Code settings** enable Claude's native Bash sandbox, Linux/WSL Claude Code may require `socat`. In that case setup reports the exact reason and you can install it with:
+
+```bash
+sudo apt-get install -y socat
+```
+
+On macOS this Linux-specific `socat` preflight is not applied. The plugin does not enable Claude's native sandbox on your behalf.
+
+## Development validation
+
+Common checks:
+
+```bash
+npm ci
 npm run check
-npm test
 npm run build
-# In a Linux sandbox CI with trusted bwrap + usable namespaces:
-npm run test:sandbox:required
-# With saved provider auth and explicit routed models (calls live providers):
-PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 PI_PLAN_EXECUTE_ACP_TEST_EXECUTOR_MODEL=opencode/<model> PI_PLAN_EXECUTE_ACP_TEST_REVIEWER_MODEL=codex/<model> npm run test:acp:required
+npm test
 ```
 
-The package is loadable directly by Pi through the `pi` manifest. Stage B requires Linux bubblewrap (`bwrap`) with user namespaces available, installed as a root-owned non-writable binary in `/usr/bin` or `/usr/local/bin`, a dedicated worktree outside `/tmp`, and explicit `claude/`, `codex/`, `opencode/`, or `pi/` routes. Because ACP tool networking remains unrestricted, interactive Stage B requires separate consent in `/plan-execute setup` for a **non-sensitive** Git repository. This is acknowledgement, **not network isolation**. `npm run test:sandbox:required` fails rather than skipping trusted mount tests. The existing `test:acp:required` incurs real provider calls and validates Codex/OpenCode sessions plus a complete one-phase workflow. `test:acp:builtins:required` separately targets Claude and Pi (Executor, Reviewer, full one-phase workflow); its overall result **currently fails in this environment** because Claude's current host authentication is environment-only and is intentionally unavailable to isolated ACP tools (see below). `PI_PLAN_EXECUTE_BWRAP` accepts only a trusted system binary.
-
-### Real ACP validation status
-
-- **Codex + OpenCode:** live sandboxed tests and real one-phase completion pass (3/3 with explicitly selected models at `high`).
-- **Claude:** the host CLI now answers a real `claude -p --model sonnet` request, but its success depends on an inherited `ANTHROPIC_AUTH_TOKEN` environment variable (an `ANTHROPIC_BASE_URL` override is also present). With the token variable removed, `claude auth status` reports `loggedIn: false`; no isolated saved `.credentials.json` exists. The OS-sandboxed Claude ACP deliberately does **not** forward environment credentials to model-accessible tools, so its Executor, Reviewer, and full-stage tests remain **0/3** and fail before startup. This host CLI success is not isolated ACP acceptance; an earlier exploratory full-config staging attempt returned `AUTH_REQUIRED` and was removed. Feasible unified Claude authentication options and the unimplemented host-side credential-proxy design are assessed in [`docs/claude-unified-access-assessment.md`](docs/claude-unified-access-assessment.md). No credentials are requested or logged.
-- **Pi:** the `provider_error` was caused by Node fetch not using the host's required credential-free HTTP proxy inside the sandbox. Enabling Node's env-proxy mode for the vetted forwarded proxy resolves this without leaving credentials on disk. Real sandboxed `pi/openai-codex/gpt-5.5` Executor, Reviewer and one-phase acceptance/commit pass at `high` (**3/3**); the host's saved provider auth is still deleted inside the Pi ACP bootstrap before the first turn. Other Pi providers/models are not proven by these runs.
-
-Custom AgentPrism backends are not accepted automatically: each needs an individually reviewed OS/credential boundary and real ACP validation.
-
-### Install and use in a disposable Git repository
+Linux/WSL sandbox gate:
 
 ```bash
-cd /path/to/new-non-sensitive-git-repository
-pi install -l /home/zyq/projects/pi-plan-execute-auto
-pi list
-pi
+npm run test:sandbox:required
 ```
 
-Approve Pi project trust when prompted, then use `/plan-execute setup`. If the current directory has no `.git`, the wizard offers to initialize Git **only with your explicit choice**; it can optionally create an **empty** baseline commit after a separate confirmation. It never stages or commits your files. If Pi was started inside an existing repository's subdirectory, restart Pi from that repository's root instead of initializing a nested repo. Choose the installed CLIs, the exact Executor/Reviewer models (candidate lists are not provider authentication tests), and a shared advertised effort level (`low`, `medium`, `high`, `max` when supported, or backend default). Read and explicitly accept the preliminary model-discovery network warning and the final per-project network warning **only for non-sensitive repositories**; neither setup nor CLI discovery starts an implementation phase. Catalog probes may open ACP sessions but do not submit a model turn or mount the project. Claude/Pi selections additionally require a separately approved billable connectivity turn in a synthetic repository. The project preference cache is `.pi-plan-execute-auto/config.json`; add `.pi-plan-execute-auto/` to your reviewed `.gitignore` before Stage B, while the approved fingerprint/network consent remain in Pi's user directory. Use `/plan-execute config` to inspect the stored choice or `/plan-execute reset-config` to revoke it. Discuss the plan with Main Pi, then enter `/plan-execute` (no argument). Before **Approve & Start**, make sure Git has a baseline commit and the source worktree is clean; commit or ignore untracked files (such as local `.pi/settings.json`) yourself. Review the Golden Package and choose **Approve & Start** before Stage B creates a dedicated branch/worktree or phase commit. `/plan-execute status <run-id>` inspects progress. Model paths in the saved profile are bound to the frozen run; changing setup afterward cannot silently change that run.
+macOS sandbox gate:
 
-`pi install -l` records this local package for this project; it does not publish it to npm or install it globally. Development-only use: `pi -e /home/zyq/projects/pi-plan-execute-auto/extensions/index.ts` loads one extension for one Pi invocation. Headless CI, without interactive setup, can explicitly supply `PI_PLAN_EXECUTE_EXECUTOR_MODEL`, `PI_PLAN_EXECUTE_REVIEWER_MODEL`, optional `PI_PLAN_EXECUTE_REASONING_EFFORT=low|medium|high|max`, and `PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1`. These are fallback overrides, not the normal UI workflow.
+```bash
+npm run test:sandbox:macos:required
+```
 
-Use `/plan-execute stop <run-id>` to cancel an active run. Stage B applies bounded agent, Git, acceptance-command, and whole-run timeouts. It remains intentionally opt-in because it executes contract-supplied commands and external coding harnesses.
+GitHub Actions runs both OS-specific sandbox gates on their native hosts.
 
-**Network trust boundary:** plugin-run acceptance shell commands use an unshared network namespace and cannot reach host TCP services or the Internet; acceptance contracts requiring network services currently fail closed. ACP servers and their tool subprocesses still share the host network namespace for model-provider access. Only credential-free proxy URLs are forwarded, but arbitrary ACP-tool egress is not yet isolated or allowlisted. Do not use Stage B for sensitive repositories until an OS-enforced provider-only egress route exists. `npm run test:sandbox:required` fails if trusted `bwrap` is missing; ordinary `npm test` skips the real mount tests only when trusted `bwrap` is missing. Neither is a substitute for a real provider-call test for each selected backend and role.
+Real provider validation is intentionally separate because it can incur charges:
+
+```bash
+# OpenCode Executor + Codex Reviewer
+PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 \
+PI_PLAN_EXECUTE_ACP_TEST_EXECUTOR_MODEL=opencode/<provider>/<model> \
+PI_PLAN_EXECUTE_ACP_TEST_REVIEWER_MODEL=codex/<model> \
+npm run test:acp:required
+
+# Claude
+PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 \
+PI_PLAN_EXECUTE_ACP_TEST_CLAUDE_MODEL=claude/<selector> \
+npm run test:acp:claude:required
+
+# Pi
+PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 \
+PI_PLAN_EXECUTE_ACP_TEST_PI_MODEL=pi/<provider>/<model> \
+npm run test:acp:pi:required
+```
+
+Headless execution can additionally set:
+
+- `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=low|medium|high|max` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=low|medium|high|max` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides;
+- `PI_PLAN_EXECUTE_PERMISSION_MODE=autonomous|ask`;
+- `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`.
+
+Interactive setup remains the normal workflow.
+
+Non-billable CI is necessary but does not replace a real provider-call test for the selected CLI/model/gateway. Real provider gates may incur charges; rerun them on the current head before relying on earlier validation results.
