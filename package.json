@@ -1,16 +1,38 @@
 {
   "name": "pi-plan-execute-auto",
   "version": "0.1.0",
-  "description": "Pi-native phased planning, review, and phase-commit workflow extension",
+  "description": "Plan-and-execute workflow for Pi coding agent: human-approved phased plans, isolated per-phase execution, independent Executor and Reviewer agent CLI sessions, deterministic acceptance, rework loops, one validated git commit per phase, and resumable pause/stop.",
   "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/ZyqAlwaysCool/pi-plan-execute-auto#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZyqAlwaysCool/pi-plan-execute-auto.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZyqAlwaysCool/pi-plan-execute-auto/issues"
+  },
   "engines": {
     "node": ">=22"
   },
   "keywords": [
     "pi-package",
+    "pi",
+    "pi-coding-agent",
     "pi-extension",
+    "extension",
     "workflow",
-    "coding-agents"
+    "coding-agents",
+    "plan",
+    "planning",
+    "plan-execute",
+    "review",
+    "acceptance",
+    "git",
+    "commit",
+    "isolation",
+    "sandbox",
+    "subagents"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && cp src/pi-acp-bootstrap.mjs dist/src/pi-acp-bootstrap.mjs",
