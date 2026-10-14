@@ -159,6 +159,24 @@ test("a non-resumable pause says resume is refused", () => {
   assert.match(lines[3]!, /<error>Resume refused/);
 });
 
+test("a repairable evidence pause advertises repair-and-resume", () => {
+  const { model, now } = testClock();
+  const snapshot = plan(["phase-1"], ["paused"]);
+  model.setPlan(snapshot);
+  model.applyStatus({
+    phase_id: "phase-1",
+    round: 1,
+    executor_status: "interrupted",
+    reviewer_status: "interrupted",
+    message: "[WORKSPACE_SYMLINK_ESCAPE] link escapes",
+    pause: createPauseRecord({ code: "WORKSPACE_SYMLINK_ESCAPE", summary: "link escapes", stage: "unknown" }),
+    plan: snapshot,
+  });
+  const lines = formatActivityLines(model.snapshot(now()), theme, 200, now());
+  assert.match(lines[3]!, /Repair & resume: \/plan-execute resume/);
+  assert.doesNotMatch(lines[3]!, /Resume refused/);
+});
+
 test("full checklist names truncate proportionally when the width is tight", () => {
   const snapshot = plan(
     ["phase-1-core-sim", "phase-2-render", "phase-3-shell"],

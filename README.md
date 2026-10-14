@@ -38,7 +38,7 @@ The process continues until all phases have development, self-test, independent 
 
 Only integrity/execution failures that genuinely require human attention are persisted as `paused`—for example package/evidence tampering, worktree identity mismatch, broken completion evidence, or an execution process restart that would violate the same-session invariant. Ordinary start prerequisites remain retryable with `/plan-execute start <run-id>`.
 
-Gitignored dependency and build artifacts (for example `node_modules/` and `dist/`) are outside the phase commit boundary. Executor installs/builds and deterministic acceptance may create or update them without pausing the run, and the Executor's ignored-tree summary is surfaced to the Reviewer as advisory evidence. Git history, branch refs, reflogs, unreachable objects, the index, and every Reviewer workspace byte (including ignored files) remain fail-closed.
+Gitignored dependency and build artifacts (for example `node_modules/` and `dist/`) are outside the phase commit boundary. Executor installs/builds and deterministic acceptance may create or update them without pausing the run, and the Executor's ignored-tree summary is surfaced to the Reviewer as advisory evidence. Git history, branch refs, reflogs, unreachable objects, the index, and every Reviewer workspace byte (including ignored files) remain fail-closed. Symlinks stay fail-closed as well, with two narrow exceptions: `bin/python*` entries that resolve to an executable system interpreter in `/usr/bin`, `/usr/local/bin`, `/bin`, or `/opt/homebrew/bin` (standard virtualenv/uv layouts), and absolute links that resolve back inside the dedicated worktree (for example uv cache entries). Any other external target fails with `WORKSPACE_SYMLINK_ESCAPE`.
 
 ## Commands
 
@@ -58,7 +58,7 @@ The normal command surface is intentionally small:
 - `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout in one full wizard.
 - `settings [run-id]` reopens only the individual settings as a menu, without repeating the whole wizard. With no run id it targets project defaults; with a run id it also syncs that frozen run's persisted settings so an explicit resume stays allowed. Model/effort changes apply to sessions created after the next resume; the timeout is operational and never invalidates a frozen run.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
-- `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint.
+- `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint. Repairable evidence pauses (currently `WORKSPACE_SYMLINK_ESCAPE`) re-verify the exact reported evidence before resuming and stay paused with a `workflow_repair_failed` event when it still fails.
 - `stop <run-id>` (or the `Ctrl+Shift+X` shortcut) requests a safe stop of an active execution and pauses without committing.
 - `status <run-id>` shows a compact status summary plus the workflow-timeline path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
 
@@ -182,7 +182,7 @@ The execution timeout is the total Execution & Review budget for the whole run a
 
 When the budget expires, the run pauses as a resumable `TIMEOUT` checkpoint instead of running unattended without a bound. Raising the timeout through a new human-approved `/plan-execute setup` takes effect for the next start or resume of a paused run; it is an operational resource policy and is not part of the frozen artifact provenance. Headless runs without a project profile can set `PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS` explicitly (`0`, `none`, `unlimited`, or `off` mean no timeout).
 
-Every pause is classified in the persisted state and the `workflow_paused` run event: `TIMEOUT`, `HUMAN_STOP`, `SESSION_ABORT`, `PROCESS_RESTART`, `HARNESS_ERROR`, evidence/safety failures, and so on, together with `stage`, `round`, and whether the checkpoint is resumable. `/plan-execute status` and the Pi state entry show the code; the live widget also shows the remaining budget (`12m left`) so a timeout is visible before it fires.
+Every pause is classified in the persisted state and the `workflow_paused` run event: `TIMEOUT`, `HUMAN_STOP`, `SESSION_ABORT`, `PROCESS_RESTART`, `HARNESS_ERROR`, evidence/safety failures, and so on, together with `stage`, `round`, and whether the checkpoint is resumable. Repairable evidence pauses advertise a repair-and-resume path instead of outright refusal; a verified repair records `workflow_repair_verified` and an `EVIDENCE_REPAIRED` resumable checkpoint. `/plan-execute status` and the Pi state entry show the code; the live widget also shows the remaining budget (`12m left`) so a timeout is visible before it fires.
 
 ## Isolation model
 

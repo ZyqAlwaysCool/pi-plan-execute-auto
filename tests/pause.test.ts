@@ -1,27 +1,43 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  REPAIR_VERIFIED_CODE,
+  REPAIRABLE_PAUSE_CODES,
   RESUMABLE_PAUSE_CODES,
   abortPauseInput,
   createPauseRecord,
   formatDuration,
   formatDurationShort,
+  formatPauseDetails,
   formatPauseHeadline,
   formatPauseReason,
   formatStageTimeout,
   isStageBAbortReason,
   parseStageTimeoutValue,
+  pauseRepairable,
   pauseResumable,
 } from "../src/pause.js";
 
 test("resumability is explicit and only covers execution interruptions", () => {
-  for (const code of ["ABORTED", "TIMEOUT", "HUMAN_STOP", "SESSION_ABORT", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED"]) {
+  for (const code of ["ABORTED", "TIMEOUT", "HUMAN_STOP", "SESSION_ABORT", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED", REPAIR_VERIFIED_CODE]) {
     assert.equal(pauseResumable(code), true, code);
     assert.ok(RESUMABLE_PAUSE_CODES.has(code), code);
   }
-  for (const code of ["MAX_REVIEW_ROUNDS", "STARTUP_EVIDENCE", "REVIEWER_CHANGED_WORKSPACE", "UNKNOWN_CODE", undefined]) {
+  for (const code of ["MAX_REVIEW_ROUNDS", "STARTUP_EVIDENCE", "REVIEWER_CHANGED_WORKSPACE", "WORKSPACE_SYMLINK_ESCAPE", "UNKNOWN_CODE", undefined]) {
     assert.equal(pauseResumable(code), false, String(code));
   }
+});
+
+test("repairable evidence pauses are re-verified instead of being refused outright", () => {
+  assert.ok(REPAIRABLE_PAUSE_CODES.has("WORKSPACE_SYMLINK_ESCAPE"));
+  assert.equal(pauseRepairable("WORKSPACE_SYMLINK_ESCAPE"), true);
+  for (const code of ["MAX_REVIEW_ROUNDS", "STARTUP_EVIDENCE", "TIMEOUT", undefined]) {
+    assert.equal(pauseRepairable(code), false, String(code));
+  }
+  const repairable = formatPauseDetails(createPauseRecord({ code: "WORKSPACE_SYMLINK_ESCAPE", summary: "link", resumable: false }));
+  assert.ok(repairable.some((line) => /requires repair; an explicit resume re-verifies/.test(line)));
+  const terminal = formatPauseDetails(createPauseRecord({ code: "STARTUP_EVIDENCE", summary: "bad", resumable: false }));
+  assert.ok(terminal.some((line) => /resume is refused until the evidence is restored/.test(line)));
 });
 
 test("createPauseRecord fills defaults and keeps explicit overrides", () => {

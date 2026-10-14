@@ -214,7 +214,8 @@ export type KnownPauseCode =
   | "HARNESS_ERROR" | "STAGE_B_ERROR" | "PROCESS_RESTART" | "PROCESS_RESTART_RECONCILED"
   | "PROCESS_RESTART_EVIDENCE" | "STARTUP_EVIDENCE" | "WORKTREE_IDENTITY_MISMATCH"
   | "COMPLETION_GIT_EVIDENCE" | "WORKTREE_SETUP" | "EXECUTION_UNHANDLED"
-  | "MAX_REVIEW_ROUNDS" | "ACCEPTANCE_FAILED";
+  | "MAX_REVIEW_ROUNDS" | "ACCEPTANCE_FAILED"
+  | "WORKSPACE_SYMLINK_ESCAPE" | "EVIDENCE_REPAIRED";
 export type PauseStage =
   | "executor" | "reviewer" | "acceptance" | "commit" | "phase" | "setup" | "preflight" | "unknown";
 

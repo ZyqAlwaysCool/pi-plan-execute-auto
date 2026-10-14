@@ -7,12 +7,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createDraftState, loadValidatedRun } from "../src/workflow-state.js";
-import { reconcilePersistedCompletions } from "../extensions/index.js";
+import { reconcilePersistedCompletions, repairResumeEvidence } from "../extensions/index.js";
 import { createLocalGitOperations, ensureDedicatedWorktree, GitWorkspace, provisionDedicatedEnvironment } from "../src/git.js";
+import { createPauseRecord } from "../src/pause.js";
 import { validatePhaseCompletionRecord } from "../src/completion.js";
 import { StageBController } from "../src/stage-b.js";
 import { readWorkflowState, validatePackageDirectory, writeValidatedPackage, writeWorkflowState } from "../src/package-validator.js";
-import type { AcceptanceCommandRunner, FinalizeInput, GitCommandResult, HarnessPair, ReviewReport, ExecutionReport, PhasePackage, StageBAbortReason, StageBStatusEvent } from "../src/types.js";
+import type { AcceptanceCommandRunner, FinalizeInput, GitCommandResult, HarnessPair, ReviewReport, ExecutionReport, PhasePackage, StageBAbortReason, StageBStatusEvent, WorkflowState } from "../src/types.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -880,6 +881,157 @@ test("controlled dependency symlink topology is still visible", async () => {
     await symlink("../", join(setup.cwd, "node_modules", "link"));
     const after = await workspace.snapshot();
     assert.notEqual(before.ignored, after.ignored);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+const SYSTEM_PYTHON = "/usr/bin/python3";
+
+async function hasSystemPython(): Promise<boolean> {
+  try {
+    await access(SYSTEM_PYTHON);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("workspace snapshots accept standard virtualenv and uv interpreter symlinks", async (t) => {
+  if (!(await hasSystemPython())) {
+    t.skip(`no ${SYSTEM_PYTHON} on this host`);
+    return;
+  }
+  const setup = await setupRepo();
+  try {
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\n.cache/\npython/\n", "utf8");
+    await mkdir(join(setup.cwd, "python", "parser_runtime", ".venv", "bin"), { recursive: true });
+    await mkdir(join(setup.cwd, ".cache", "uv", "archive-v0", "1B-archive", "bin"), { recursive: true });
+    await symlink(SYSTEM_PYTHON, join(setup.cwd, "python", "parser_runtime", ".venv", "bin", "python"));
+    await symlink("python", join(setup.cwd, "python", "parser_runtime", ".venv", "bin", "python3"));
+    await symlink("python", join(setup.cwd, "python", "parser_runtime", ".venv", "bin", "python3.12"));
+    await symlink(SYSTEM_PYTHON, join(setup.cwd, ".cache", "uv", "archive-v0", "1B-archive", "bin", "python"));
+    await symlink("python", join(setup.cwd, ".cache", "uv", "archive-v0", "1B-archive", "bin", "python3"));
+    const workspace = new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd });
+    assert.ok((await workspace.snapshot()).ignored);
+    await workspace.auditWorkspaceSymlinks();
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("workspace snapshots accept absolute symlinks that resolve inside the worktree", async () => {
+  const setup = await setupRepo();
+  try {
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\n.cache/\n", "utf8");
+    const target = join(setup.cwd, ".cache", "uv", "archive-v0", "archive-target");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "package.txt"), "wheel\n", "utf8");
+    await mkdir(join(setup.cwd, ".cache", "uv", "wheels-v6"), { recursive: true });
+    const link = join(setup.cwd, ".cache", "uv", "wheels-v6", "package");
+    await symlink(target, link);
+    const workspace = new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd });
+    const before = await workspace.snapshot();
+    await workspace.auditWorkspaceSymlinks();
+    await rm(link);
+    await mkdir(join(setup.cwd, ".cache", "uv", "archive-v0", "other-target"), { recursive: true });
+    await symlink(join(setup.cwd, ".cache", "uv", "archive-v0", "other-target"), link);
+    const after = await workspace.snapshot();
+    assert.notEqual(before.ignored, after.ignored);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("workspace snapshots reject escaping symlinks that are not trusted interpreters", async (t) => {
+  if (!(await hasSystemPython())) {
+    t.skip(`no ${SYSTEM_PYTHON} on this host`);
+    return;
+  }
+  const setup = await setupRepo();
+  try {
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\n.cache/\n", "utf8");
+    const workspace = new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd });
+    const cases = [
+      { name: "secret target", parent: ".cache/case-a/bin", link: "python", target: "/etc/passwd" },
+      { name: "renamed entry", parent: ".cache/case-b/bin", link: "python-wrapper", target: SYSTEM_PYTHON },
+      { name: "outside bin directory", parent: ".cache/case-c/lib", link: "python", target: SYSTEM_PYTHON },
+      { name: "dangling interpreter", parent: ".cache/case-d/bin", link: "python", target: "/usr/bin/python-not-installed" },
+      { name: "directory target", parent: ".cache/case-e/bin", link: "python", target: "/usr/bin" },
+      { name: "relative escape", parent: ".cache/case-f/bin", link: "python", target: "../../../../../../etc/passwd" },
+    ];
+    for (const entry of cases) {
+      const parent = join(setup.cwd, entry.parent);
+      await mkdir(parent, { recursive: true });
+      const link = join(parent, entry.link);
+      await symlink(entry.target, link);
+      await assert.rejects(
+        workspace.snapshot(),
+        (error: unknown) => error instanceof Error && (error as { code?: string }).code === "WORKSPACE_SYMLINK_ESCAPE",
+        entry.name,
+      );
+      await assert.rejects(
+        workspace.auditWorkspaceSymlinks(),
+        (error: unknown) => error instanceof Error && (error as { code?: string }).code === "WORKSPACE_SYMLINK_ESCAPE",
+        `${entry.name} (audit)`,
+      );
+      await rm(link);
+    }
+
+    // A relative alias is still rejected when its chain ends outside the trusted interpreter set.
+    const chainDir = join(setup.cwd, ".cache", "case-g", "bin");
+    await mkdir(chainDir, { recursive: true });
+    await symlink("/etc/passwd", join(chainDir, "python"));
+    await symlink("python", join(chainDir, "python3"));
+    await assert.rejects(
+      workspace.snapshot(),
+      (error: unknown) => error instanceof Error && (error as { code?: string }).code === "WORKSPACE_SYMLINK_ESCAPE",
+      "relative alias to untrusted target",
+    );
+    await rm(join(chainDir, "python3"));
+    await rm(join(chainDir, "python"));
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("repair verification clears a repairable workspace pause and records events", async () => {
+  const setup = await setupRepo();
+  try {
+    const workspace = new GitWorkspace({ run: (args, options) => git(setup.cwd, args) }, { cwd: setup.cwd });
+    const state = {
+      version: 1,
+      run_id: "repair-test",
+      package_hash: "a".repeat(64),
+      package_dir: setup.packageRoot,
+      status: "paused",
+      created_at: new Date(0).toISOString(),
+      phases: [{ phase_id: "phase-01", status: "paused", review_rounds: 1, execution_report_paths: [], review_report_paths: [], unresolved_findings: [] }],
+      pause: createPauseRecord({ code: "WORKSPACE_SYMLINK_ESCAPE", summary: "link escapes", resumable: false }),
+      pause_reason: "[WORKSPACE_SYMLINK_ESCAPE] link escapes",
+    } as WorkflowState;
+
+    await repairResumeEvidence(setup.packageRoot, state, workspace, "WORKSPACE_SYMLINK_ESCAPE");
+    assert.equal(state.pause?.code, "EVIDENCE_REPAIRED");
+    assert.equal(state.pause?.resumable, true);
+    assert.equal((await readWorkflowState(setup.packageRoot))?.pause?.code, "EVIDENCE_REPAIRED");
+
+    await writeFile(join(setup.cwd, ".gitignore"), ".pi-plan-execute-auto/\n.cache/\n", "utf8");
+    await mkdir(join(setup.cwd, ".cache", "case", "bin"), { recursive: true });
+    await symlink("/usr/bin/python-not-installed", join(setup.cwd, ".cache", "case", "bin", "python"));
+    state.pause = createPauseRecord({ code: "WORKSPACE_SYMLINK_ESCAPE", summary: "still escaping", resumable: false });
+    await assert.rejects(
+      repairResumeEvidence(setup.packageRoot, state, workspace, "WORKSPACE_SYMLINK_ESCAPE"),
+      /escapes the dedicated worktree/,
+    );
+    assert.equal(state.pause?.code, "WORKSPACE_SYMLINK_ESCAPE");
+    const events = await readFile(join(setup.packageRoot, ".runtime", "events.jsonl"), "utf8");
+    assert.match(events, /workflow_repair_failed/);
+
+    await assert.rejects(
+      repairResumeEvidence(setup.packageRoot, state, workspace, "MAX_REVIEW_ROUNDS"),
+      /not repairable/,
+    );
   } finally {
     await rm(setup.cwd, { recursive: true, force: true });
   }

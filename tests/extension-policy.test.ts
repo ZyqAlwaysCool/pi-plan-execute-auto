@@ -253,6 +253,52 @@ test("safe resume accepts only execution-interruption checkpoints with remaining
   assert.equal(evaluateResumeEligibility({ ...structured, pause: { ...structured.pause!, code: "STARTUP_EVIDENCE", resumable: false } } as WorkflowState).ok, false);
 });
 
+test("repairable workspace evidence pauses resume through repair verification", () => {
+  const base = {
+    version: 1,
+    run_id: "repair-test",
+    package_hash: "a".repeat(64),
+    package_dir: "/tmp/repair-test",
+    status: "paused",
+    created_at: new Date(0).toISOString(),
+    review_round_limit: 5,
+    branch_name: "pi-plan-execute-auto/repair-test",
+    worktree_path: "/tmp/repair-worktree",
+    phases: [{
+      phase_id: "phase-01",
+      status: "paused",
+      review_rounds: 2,
+      execution_report_paths: [],
+      review_report_paths: [],
+      unresolved_findings: [],
+    }],
+  } as WorkflowState;
+  const repairable = {
+    ...base,
+    pause: { code: "WORKSPACE_SYMLINK_ESCAPE", summary: "link escapes", stage: "unknown", resumable: false, at: new Date(0).toISOString() },
+    pause_reason: "[WORKSPACE_SYMLINK_ESCAPE] link escapes",
+    phases: base.phases.map((phase) => ({ ...phase })),
+  } as WorkflowState;
+  const result = evaluateResumeEligibility(repairable);
+  assert.equal(result.ok, true);
+  assert.ok(result.ok && result.repairRequired === true);
+
+  // Non-repairable safety pauses stay refused even with the same exhausted-checkpoint shape.
+  const refused = evaluateResumeEligibility({
+    ...repairable,
+    pause: { ...repairable.pause!, code: "STARTUP_EVIDENCE" },
+  } as WorkflowState);
+  assert.equal(refused.ok, false);
+
+  // A repaired checkpoint is an ordinary resumable interruption with no repair flag.
+  const repaired = evaluateResumeEligibility({
+    ...repairable,
+    pause: { ...repairable.pause!, code: "EVIDENCE_REPAIRED", resumable: true },
+  } as WorkflowState);
+  assert.equal(repaired.ok, true);
+  assert.ok(repaired.ok && repaired.repairRequired === undefined);
+});
+
 test("the budget warning event fires once the run consumes 80% of its budget", () => {
   assert.deepEqual(budgetWarningEvent("run-1", 30 * 60 * 1000), {
     run_id: "run-1",

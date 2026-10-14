@@ -13,7 +13,7 @@ import {
   rm,
   symlink,
 } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import type { BigIntStats } from "node:fs";
 import { promisify } from "node:util";
 import { Transform } from "node:stream";
@@ -33,6 +33,15 @@ export interface GitFileStatus {
 // Only roots that the provisioning step actually copies may be treated as disposable.
 // Generic build/dist/coverage names remain visible to workspace policy checks.
 export const CONTROLLED_ENVIRONMENT_PATHS = ["node_modules", ".venv", "venv"] as const;
+
+/**
+ * System interpreter directories that standard virtualenv/uv layouts may reference from
+ * inside the worktree. Only `bin/python*` entry points resolving to an executable regular
+ * file in one of these admin-owned directories are accepted; every other external target
+ * stays fail-closed. The snapshot only hashes the link text, it never reads or runs it.
+ */
+export const TRUSTED_INTERPRETER_DIRS = ["/usr/bin", "/usr/local/bin", "/bin", "/opt/homebrew/bin"] as const;
+const PYTHON_INTERPRETER_NAME = /^python(\d+(\.\d+)*)?$/u;
 
 export interface GitWorkspaceOptions {
   cwd: string;
@@ -482,13 +491,20 @@ export class GitWorkspace {
     const lexicalTarget = isAbsolute(link) ? resolve(link) : resolve(dirname(absolute), link);
     const lexicalRoot = resolve(this.cwd);
     const relativeTarget = relative(lexicalRoot, lexicalTarget);
-    if (isAbsolute(link) || relativeTarget.startsWith("..") || isAbsolute(relativeTarget)) {
+    const lexicallyContained = !relativeTarget.startsWith("..") && !isAbsolute(relativeTarget);
+    if (!lexicallyContained) {
+      // External links are tolerated only for standard virtualenv/uv interpreter entry
+      // points backed by a trusted system interpreter; everything else fails closed.
+      if (await this.isTrustedInterpreterLink(absolute)) return;
       throw new GitPolicyError(`Workspace symlink escapes the dedicated worktree: ${path} -> ${link}.`, "WORKSPACE_SYMLINK_ESCAPE");
     }
     try {
       const [realRoot, realTarget] = await Promise.all([realpath(this.cwd), realpath(absolute)]);
       const realRelative = relative(realRoot, realTarget);
       if (realRelative.startsWith("..") || isAbsolute(realRelative)) {
+        // Relative interpreter aliases (for example `bin/python3 -> python`) resolve through
+        // the same trusted target and are accepted on the exact same terms.
+        if (await this.isTrustedInterpreterLink(absolute)) return;
         throw new GitPolicyError(`Workspace symlink resolves outside the dedicated worktree: ${path}.`, "WORKSPACE_SYMLINK_ESCAPE");
       }
     } catch (error) {
@@ -497,6 +513,56 @@ export class GitWorkspace {
         throw new GitPolicyError(`Unable to verify workspace symlink target: ${path}.`, "WORKSPACE_SYMLINK_CHECK_FAILED");
       }
       // A dangling contained link is still observable as a normal workspace change.
+    }
+  }
+
+  /**
+   * `bin/python*` links created by virtualenv/uv point (possibly through relative aliases such
+   * as `python3 -> python`) at a system interpreter outside the worktree. Accept them only when
+   * the resolved target is an executable regular file in a trusted system bin directory.
+   * Dangling chains, directories, renamed entries, and any other external target stay rejected.
+   */
+  private async isTrustedInterpreterLink(absolute: string): Promise<boolean> {
+    if (basename(dirname(absolute)) !== "bin") return false;
+    if (!PYTHON_INTERPRETER_NAME.test(basename(absolute))) return false;
+    try {
+      const realTarget = await realpath(absolute);
+      const target = await lstat(realTarget);
+      if (!target.isFile() || (target.mode & 0o111) === 0) return false;
+      return TRUSTED_INTERPRETER_DIRS.some((dir) => dirname(realTarget) === dir);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Re-verify the workspace symlink policy without hashing file bytes. This is the cheap
+   * evidence re-check used by the repair path for a persisted WORKSPACE_SYMLINK_ESCAPE pause;
+   * it enumerates the same tracked/untracked plus gitignored path set as `snapshot()` and
+   * throws the same GitPolicyError codes.
+   */
+  async auditWorkspaceSymlinks(options?: { signal?: AbortSignal; timeout?: number }): Promise<void> {
+    const commandOptions = options;
+    const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...this.pathspecs()];
+    const statusResult = await this.git.run(statusArgs, commandOptions);
+    if (statusResult.code !== 0) throw commandError(statusArgs, statusResult);
+    const ignoredFilesArgs = ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...this.pathspecs()];
+    const ignoredFilesResult = await this.git.run(ignoredFilesArgs, commandOptions);
+    if (ignoredFilesResult.code !== 0) throw commandError(ignoredFilesArgs, ignoredFilesResult);
+    const paths = uniqueSorted([
+      ...parseStatus(statusResult.stdout).map((entry) => entry.path),
+      ...parseNullSeparatedNames(ignoredFilesResult.stdout),
+    ]);
+    for (const path of paths) {
+      const absolute = resolve(this.cwd, path);
+      let entry;
+      try {
+        entry = await lstat(absolute);
+      } catch (error) {
+        if (isMissingFileError(error)) continue;
+        throw new GitPolicyError(`Unable to inspect workspace entry: ${path}.`, "WORKSPACE_SNAPSHOT_FAILED");
+      }
+      if (entry.isSymbolicLink()) await this.assertContainedSymlink(path);
     }
   }
 

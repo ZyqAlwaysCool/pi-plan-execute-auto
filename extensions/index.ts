@@ -57,6 +57,7 @@ import { agentSessionTranscriptRelativePath, appendRunEvent, captureMainPiSessio
 import { StageBController } from "../src/stage-b.js";
 import { StageBActivityModel, StageBActivityWidget, formatPlanChecklist } from "../src/status-widget.js";
 import {
+  REPAIR_VERIFIED_CODE,
   createPauseRecord,
   formatPauseDetails,
   formatPauseHeadline,
@@ -64,6 +65,7 @@ import {
   formatStageTimeout,
   isStageBAbortReason,
   parseStageTimeoutValue,
+  pauseRepairable,
   pauseResumable,
 } from "../src/pause.js";
 import {
@@ -1259,7 +1261,7 @@ function pauseCode(reason: string | undefined): string | undefined {
 export function evaluateResumeEligibility(
   state: WorkflowState,
   options?: { allowOrphanedRunning?: boolean },
-): { ok: true; code: string; currentPhase: string } | { ok: false; reason: string } {
+): { ok: true; code: string; currentPhase: string; repairRequired?: boolean } | { ok: false; reason: string } {
   if (state.status !== "paused" && !(options?.allowOrphanedRunning && state.status === "running")) {
     return { ok: false, reason: `Run is ${state.status}; only a paused run or an orphaned persisted running run can be resumed.` };
   }
@@ -1274,13 +1276,19 @@ export function evaluateResumeEligibility(
   }
   const code = state.status === "running" ? "PROCESS_RESTART" : state.pause?.code ?? pauseCode(state.pause_reason);
   const resumable = state.status === "paused" && state.pause ? state.pause.resumable : pauseResumable(code);
-  if (!code || !resumable) {
+  const repairable = state.status === "paused" && pauseRepairable(code);
+  if (!code || (!resumable && !repairable)) {
     return {
       ok: false,
       reason: `Pause reason ${state.pause_reason ?? "(missing)"} is not an execution-interruption checkpoint. Safety/evidence failures require human repair or a new reviewed run.`,
     };
   }
-  return { ok: true, code, currentPhase: current.phase_id };
+  return {
+    ok: true,
+    code,
+    currentPhase: current.phase_id,
+    ...(!resumable ? { repairRequired: true } : {}),
+  };
 }
 
 async function verifyResumeCheckpoint(
@@ -1323,6 +1331,52 @@ async function verifyResumeCheckpoint(
   }
 }
 
+/**
+ * Controlled evidence re-verification for a repairable pause before resume. Only the exact
+ * evidence class that failed is re-checked (currently the workspace symlink policy); the
+ * caller still runs `verifyResumeCheckpoint` for identity/HEAD/index/scope. On success the
+ * persisted pause becomes a resumable EVIDENCE_REPAIRED checkpoint; failure records
+ * `workflow_repair_failed` and rethrows without touching the paused checkpoint.
+ */
+export async function repairResumeEvidence(
+  pkgRoot: string,
+  state: WorkflowState,
+  git: GitWorkspace,
+  code: string,
+  options?: { signal?: AbortSignal; timeout?: number },
+): Promise<void> {
+  if (!pauseRepairable(code)) throw new Error(`Pause code ${code} is not repairable.`);
+  const current = state.phases.find((phase) => phase.status !== "completed");
+  try {
+    await git.auditWorkspaceSymlinks(options);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    await appendRunEvent(pkgRoot, "workflow_repair_failed", {
+      run_id: state.run_id,
+      code,
+      current_phase: current?.phase_id ?? null,
+      reason,
+    }).catch(() => undefined);
+    throw error;
+  }
+  const previous = state.pause;
+  state.pause = createPauseRecord({
+    code: REPAIR_VERIFIED_CODE,
+    stage: previous?.stage ?? "unknown",
+    summary: `Repair verified: ${code} evidence re-check passed.`,
+    ...(previous?.phase_id !== undefined ? { phase_id: previous.phase_id } : {}),
+    ...(previous?.round !== undefined ? { round: previous.round } : {}),
+  });
+  state.pause_reason = formatPauseReason(state.pause);
+  await writeWorkflowState(pkgRoot, state);
+  await appendRunEvent(pkgRoot, "workflow_repair_verified", {
+    run_id: state.run_id,
+    code,
+    recovered_code: REPAIR_VERIFIED_CODE,
+    current_phase: current?.phase_id ?? null,
+  }).catch(() => undefined);
+}
+
 /** Human-facing pause summary used for the notification and timeline. */
 function escalationSummary(state: WorkflowState, pause: PauseRecord): string {
   const phase = state.phases.find((entry) => entry.status !== "completed");
@@ -1330,15 +1384,18 @@ function escalationSummary(state: WorkflowState, pause: PauseRecord): string {
   const acceptanceFailures = phase?.acceptance_results
     ?.filter((result) => result.required && !result.passed)
     .map((result) => result.id).join(", ") || "none";
+  const repairable = !pause.resumable && pauseRepairable(pause.code);
   return [
-    `pi-plan-execute-auto paused run ${state.run_id} · ${pause.resumable ? "resumable interruption" : "requires human repair"}`,
+    `pi-plan-execute-auto paused run ${state.run_id} · ${pause.resumable ? "resumable interruption" : repairable ? "repair required (re-verified on resume)" : "requires human repair"}`,
     ...formatPauseDetails(pause),
     `Phase: ${phase?.phase_id ?? "none"} · round ${phase?.review_rounds ?? 0}`,
     `Unresolved findings: ${findings}`,
     `Acceptance failures: ${acceptanceFailures}`,
     ...(pause.resumable
       ? [`Resume: /plan-execute resume ${state.run_id}`]
-      : ["Resume is refused for this pause; restore the reported evidence first."]),
+      : repairable
+        ? [`Repair & resume: /plan-execute resume ${state.run_id} (the reported evidence is re-verified first)`]
+        : ["Resume is refused for this pause; restore the reported evidence first."]),
     `Diagnostics: ${pkgDiagnosticsPath(state)}`,
   ].join("\n");
 }
@@ -1883,13 +1940,26 @@ async function startStageB(
     if (resumeRequested) {
       const eligibility = evaluateResumeEligibility(state, { allowOrphanedRunning: true });
       if (!eligibility.ok) return { status: "not_started", state, reason: `Resume refused: ${eligibility.reason}` };
+      let resumeCode = eligibility.code;
+      if (eligibility.repairRequired) {
+        try {
+          await repairResumeEvidence(pkg.root, state, git, eligibility.code, {
+            signal: linked.signal,
+            timeout: operationTimeoutMs,
+          });
+          resumeCode = REPAIR_VERIFIED_CODE;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return { status: "not_started", state, reason: `Repair verification failed: ${reason}` };
+        }
+      }
       try {
         await verifyResumeCheckpoint(pkg, state, git);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         await appendRunEvent(pkg.root, "workflow_resume_rejected", {
           run_id: runId,
-          code: eligibility.code,
+          code: resumeCode,
           current_phase: eligibility.currentPhase,
           reason,
           pause_reason: state.pause_reason ?? null,
@@ -1899,7 +1969,7 @@ async function startStageB(
       await appendRunEvent(pkg.root, "workflow_resumed", {
         run_id: runId,
         from_status: state.status,
-        resume_code: eligibility.code,
+        resume_code: resumeCode,
         previous_pause_reason: state.pause_reason ?? null,
         current_phase: eligibility.currentPhase,
         review_rounds: state.phases.find((phase) => phase.phase_id === eligibility.currentPhase)?.review_rounds ?? 0,
@@ -2444,6 +2514,14 @@ async function commandResume(pi: ExtensionAPI, ctx: ExtensionCommandContext, run
       notify(ctx, `Run ${runId} cannot be safely resumed: ${eligibility.reason}`, "warning");
       return;
     }
+    if (eligibility.repairRequired) {
+      await appendRunEvent(loaded.package.root, "workflow_repair_requested", {
+        run_id: runId,
+        code: eligibility.code,
+        current_phase: eligibility.currentPhase,
+        pause_reason: loaded.state.pause_reason ?? null,
+      }).catch(() => undefined);
+    }
     await appendRunEvent(loaded.package.root, "workflow_resume_requested", {
       run_id: runId,
       from_status: loaded.state.status,
@@ -2453,7 +2531,7 @@ async function commandResume(pi: ExtensionAPI, ctx: ExtensionCommandContext, run
     }).catch(() => undefined);
     notify(
       ctx,
-      `Resuming ${runId} from persisted checkpoint at ${eligibility.currentPhase}. Completed phases will be re-verified and skipped; fresh Executor/Reviewer ACP sessions will be created for unfinished work. Stop with /plan-execute stop ${runId} or ${STOP_SHORTCUT_LABEL}.`,
+      `Resuming ${runId} from persisted checkpoint at ${eligibility.currentPhase}.${eligibility.repairRequired ? ` Repair verification re-checks the ${eligibility.code} evidence before the run continues.` : ""} Completed phases will be re-verified and skipped; fresh Executor/Reviewer ACP sessions will be created for unfinished work. Stop with /plan-execute stop ${runId} or ${STOP_SHORTCUT_LABEL}.`,
       "info",
     );
     startStageBInBackground({
@@ -2529,7 +2607,9 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
         `Workflow timeline: ${eventDisplay}`,
         ...(state?.status === "paused" || state?.status === "running"
           ? [resume?.ok
-              ? `Resume: /plan-execute resume ${runId} (checkpoint ${resume.currentPhase})`
+              ? resume.repairRequired
+                ? `Resume: /plan-execute resume ${runId} (repair verification, checkpoint ${resume.currentPhase})`
+                : `Resume: /plan-execute resume ${runId} (checkpoint ${resume.currentPhase})`
               : `Resume: blocked · ${resume?.reason ?? "state unavailable"}`]
           : []),
         ...(executorDisplay ? [`Latest Executor transcript: ${executorDisplay}`] : []),

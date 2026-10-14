@@ -28,7 +28,7 @@
  */
 import { stripTerminalSequences, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { formatDurationShort, formatPauseHeadline } from "./pause.js";
+import { formatDurationShort, formatPauseHeadline, pauseRepairable } from "./pause.js";
 import type { PauseRecord, StageBPlanSnapshot, StageBStatusEvent } from "./types.js";
 
 /**
@@ -267,7 +267,9 @@ export function formatActivityLines(
     lines.push(truncateToWidth(
       snapshot.pause.resumable
         ? ` ${theme.fg("muted", `Resume: /plan-execute resume ${snapshot.runId}`)}`
-        : ` ${theme.fg("error", "Resume refused; repair the reported evidence first.")}`,
+        : pauseRepairable(snapshot.pause.code)
+          ? ` ${theme.fg("warning", `Repair & resume: /plan-execute resume ${snapshot.runId} (evidence re-verified first)`)}`
+          : ` ${theme.fg("error", "Resume refused; repair the reported evidence first.")}`,
       width,
       "",
     ));

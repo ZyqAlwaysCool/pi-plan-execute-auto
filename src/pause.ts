@@ -17,6 +17,18 @@ import {
   type StageBAbortReason,
 } from "./types.js";
 
+/**
+ * Evidence/safety failures that an explicit resume may clear after controlled re-verification
+ * of the exact reported evidence. These are NOT ordinary interruptions; the resume path must
+ * re-run the corresponding check and stay paused when it still fails.
+ */
+export const REPAIRABLE_PAUSE_CODES: ReadonlySet<string> = new Set([
+  "WORKSPACE_SYMLINK_ESCAPE",
+]);
+
+/** Checkpoint code recorded after a repairable pause passes evidence re-verification. */
+export const REPAIR_VERIFIED_CODE = "EVIDENCE_REPAIRED";
+
 /** Interruptions that carry no evidence/safety failure and may be explicitly resumed. */
 export const RESUMABLE_PAUSE_CODES: ReadonlySet<string> = new Set([
   "ABORTED",
@@ -26,10 +38,15 @@ export const RESUMABLE_PAUSE_CODES: ReadonlySet<string> = new Set([
   "HARNESS_ERROR",
   "PROCESS_RESTART",
   "PROCESS_RESTART_RECONCILED",
+  REPAIR_VERIFIED_CODE,
 ]);
 
 export function pauseResumable(code: PauseCode | undefined): boolean {
   return typeof code === "string" && RESUMABLE_PAUSE_CODES.has(code);
+}
+
+export function pauseRepairable(code: PauseCode | undefined): boolean {
+  return typeof code === "string" && REPAIRABLE_PAUSE_CODES.has(code);
 }
 
 export function isStageBAbortReason(value: unknown): value is StageBAbortReason {
@@ -124,7 +141,9 @@ export function formatPauseDetails(record: PauseRecord): string[] {
     `Stage: ${record.stage}${record.round !== undefined ? ` · round ${record.round}` : ""}`,
     record.resumable
       ? "This is a resumable interruption; completed phases are re-verified and skipped on resume."
-      : "This pause requires human repair; resume is refused until the evidence is restored.",
+      : pauseRepairable(record.code)
+        ? "This pause requires repair; an explicit resume re-verifies the reported evidence before continuing."
+        : "This pause requires human repair; resume is refused until the evidence is restored.",
   ];
 }
 
