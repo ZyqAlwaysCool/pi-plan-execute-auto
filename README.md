@@ -120,6 +120,8 @@ Executor and Reviewer are real independent ACP/CLI processes, not Main Pi subage
 
 For example, `claude/sonnet` means “use the Claude CLI and select its `sonnet` slot”. If the user's Claude configuration maps that slot to another gateway model, that native mapping remains valid.
 
+For Codex, the isolated session runs the host `codex` CLI's native app-server when a trusted install is found on `PATH`. The model catalog — including account-gated models — therefore matches the CLI you use interactively, and the setup "codex model" list is built from that catalog. The plugin mounts the resolved platform vendor tree read-only so Codex keeps its own bundled tools (for example `rg`). If the host CLI is missing, or its runtime tree fails provenance validation (for example a `codex` installed inside the sandboxed project tree), the isolated session keeps the Codex app-server bundled with the pinned ACP adapter instead. A `CODEX_PATH` value from your shell is never forwarded into the sandbox; when a host CLI is used, the plugin sets `CODEX_PATH` to its own verified read-only mount.
+
 The plugin does **not** disable Claude Agent/Task/WebSearch/WebFetch and does not force Claude Code's native Bash sandbox. It therefore does **not** require `socat` by itself. If your own Claude Code configuration enables its native Bash sandbox (for example `sandbox.enabled: true` or `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`), Claude Code may require `socat` on Linux/WSL; setup detects this condition and explains that it is a Claude Code dependency rather than a plugin dependency.
 
 ## Setup UX

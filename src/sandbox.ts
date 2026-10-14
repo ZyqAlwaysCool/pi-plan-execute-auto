@@ -19,6 +19,8 @@ import {
   accessSync,
   constants as fsConstants,
   createWriteStream,
+  lstatSync,
+  readdirSync,
   realpathSync,
   statSync,
 } from "node:fs";
@@ -41,6 +43,8 @@ const RUNTIME_ROOT = "/agent-runtime";
 const RUNTIME_NODE_BIN = `${RUNTIME_ROOT}/node-bin`;
 const RUNTIME_NODE_MODULES = `${RUNTIME_ROOT}/node_modules`;
 const RUNTIME_CODEX_ACP = "@automatalabs/codex-acp";
+const RUNTIME_CODEX_VENDOR = `${RUNTIME_ROOT}/codex-vendor`;
+const RUNTIME_CODEX_HOST = `${RUNTIME_ROOT}/codex-host`;
 const RUNTIME_CLAUDE_ACP = "@agentclientprotocol/claude-agent-acp/dist/index.js";
 const RUNTIME_PI_ACP = "@automatalabs/pi-acp";
 const ALLOWED_BWRAP_DIRS = new Set(["/usr/bin", "/usr/local/bin"]);
@@ -78,6 +82,8 @@ interface BackendRuntime {
   extraBinary?: { source: string; target: string };
   nodeModulesRoot?: string;
   useNodeEnvProxy?: boolean;
+  /** Extra sandbox environment entries; runtime paths are mapped back to host paths on macOS. */
+  env?: Array<[string, string]>;
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -216,8 +222,8 @@ export function findMacOSSandboxExec(): string {
   return validateMacOSSandboxExec(MACOS_SANDBOX_EXEC);
 }
 
-function findExecutable(name: string): string {
-  for (const directory of (process.env.PATH ?? "").split(":")) {
+function tryFindExecutable(name: string, pathValue = process.env.PATH ?? ""): string | undefined {
+  for (const directory of pathValue.split(":")) {
     if (!directory) continue;
     const candidate = join(directory, name);
     try {
@@ -228,7 +234,13 @@ function findExecutable(name: string): string {
       // Continue searching PATH.
     }
   }
-  throw new Error(`Required ACP executable was not found on PATH: ${name}`);
+  return undefined;
+}
+
+function findExecutable(name: string): string {
+  const found = tryFindExecutable(name);
+  if (!found) throw new Error(`Required ACP executable was not found on PATH: ${name}`);
+  return found;
 }
 
 function gitEnvironment(home: string): NodeJS.ProcessEnv {
@@ -387,6 +399,72 @@ function outerNodeModulesRoot(entry: string): string {
     throw new Error(`Cannot safely expose ACP package dependencies from ${entry}.`);
   }
   return outermost;
+}
+
+const CODEX_PLATFORM_PACKAGES: Record<string, string> = {
+  "linux:x64": "@openai/codex-linux-x64",
+  "linux:arm64": "@openai/codex-linux-arm64",
+  "darwin:x64": "@openai/codex-darwin-x64",
+  "darwin:arm64": "@openai/codex-darwin-arm64",
+};
+
+export interface HostCodexRuntime {
+  /** Native Codex executable on the host. */
+  binary: string;
+  /** Read-only mount source: the platform vendor tree, or the executable itself for standalone installs. */
+  mountSource: string;
+  /** Where the executable appears inside the sandbox. */
+  sandboxExecutable: string;
+  /** True when the mount keeps codex-path/codex-resources next to the binary. */
+  mountAsDirectory: boolean;
+}
+
+/**
+ * Prefer the host Codex CLI so the isolated session exposes the same model
+ * catalog, including account-gated models, as a normal `codex` session. An npm
+ * install exposes the native app-server below the platform package's vendor
+ * tree; mounting that tree keeps bundled tools (ripgrep, sandbox helpers) next
+ * to the executable. The ACP adapter is still the pinned plugin dependency and
+ * only the `CODEX_PATH` it spawns changes.
+ */
+export function resolveHostCodexRuntime(pathValue = process.env.PATH ?? ""): HostCodexRuntime | undefined {
+  const entry = tryFindExecutable("codex", pathValue);
+  if (!entry) return undefined;
+  if (!entry.endsWith(".js")) {
+    // A standalone native install has no ACP-compatible package layout to
+    // mirror; expose the executable itself and let Codex resolve its own data.
+    return { binary: entry, mountSource: entry, sandboxExecutable: RUNTIME_CODEX_HOST, mountAsDirectory: false };
+  }
+  const platformPackage = CODEX_PLATFORM_PACKAGES[`${process.platform}:${process.arch}`];
+  if (!platformPackage) return undefined;
+  let platformRoot: string;
+  try {
+    platformRoot = dirname(createRequire(entry).resolve(`${platformPackage}/package.json`));
+  } catch {
+    return undefined;
+  }
+  const vendorRoot = join(platformRoot, "vendor");
+  let triples: string[];
+  try {
+    triples = readdirSync(vendorRoot).sort();
+  } catch {
+    return undefined;
+  }
+  for (const triple of triples) {
+    const binary = join(vendorRoot, triple, "bin", "codex");
+    try {
+      if (!statSync(binary).isFile()) continue;
+    } catch {
+      continue;
+    }
+    return {
+      binary,
+      mountSource: realpathSync(join(vendorRoot, triple)),
+      sandboxExecutable: `${RUNTIME_CODEX_VENDOR}/bin/codex`,
+      mountAsDirectory: true,
+    };
+  }
+  return undefined;
 }
 
 function backendRuntime(backend: SupportedAcpBackend): BackendRuntime {
@@ -604,6 +682,11 @@ function addMinimalFilesystem(
     args.push("--ro-bind", source, target);
   }
   const backendEnv = nativeBackendEnvironment(backendId);
+  for (const [key, value] of runtime.env ?? []) {
+    if (!key || key.includes("=") || key.includes("\0") || value.includes("\0")) {
+      throw new Error(`Invalid sandbox environment entry: ${key}`);
+    }
+  }
   args.push(
     "--clearenv",
     "--setenv", "HOME", `${runtimeHome}/home`,
@@ -623,6 +706,7 @@ function addMinimalFilesystem(
     "--setenv", "TERM", "dumb",
     ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? ["--setenv", "NODE_USE_ENV_PROXY", "1"] : []),
     ...backendEnv.flatMap(([key, value]) => ["--setenv", key, value]),
+    ...(runtime.env ?? []).flatMap(([key, value]) => ["--setenv", key, value]),
     ...proxies.flatMap(([key, value]) => ["--setenv", key, value]),
     "--setenv", "GIT_OPTIONAL_LOCKS", "0",
     "--setenv", "GIT_CONFIG_NOSYSTEM", "1",
@@ -688,6 +772,14 @@ function canonicalExistingPath(path: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function mapSandboxRuntimePath(runtime: BackendRuntime, value: string): string {
+  const extra = runtime.extraBinary;
+  if (!extra) return value;
+  if (value === extra.target) return extra.source;
+  if (value.startsWith(`${extra.target}/`)) return join(extra.source, value.slice(extra.target.length + 1));
+  return value;
 }
 
 function macHostRuntime(runtime: BackendRuntime): { command: string; args: string[] } {
@@ -758,6 +850,7 @@ function macSandboxEnvironment(
     ["GIT_WORK_TREE", resolve(options.cwd)],
     ...(runtime.useNodeEnvProxy && hasNodeHttpProxy ? [["NODE_USE_ENV_PROXY", "1"] as [string, string]] : []),
     ...nativeBackendEnvironment(backendId),
+    ...(runtime.env ?? []).map(([key, value]) => [key, mapSandboxRuntimePath(runtime, value)] as [string, string]),
     ...proxies,
   ];
   for (const [key, value] of entries) {
@@ -1079,27 +1172,16 @@ async function prepareCredentials(
   return staged;
 }
 
-function assertTrustedExternalAgentBinary(
-  source: string,
-  roots: readonly string[],
-): string {
-  const real = realpathSync(source);
-  const stat = statSync(real);
-  if (!stat.isFile() || accessSync(real, fsConstants.X_OK) !== undefined || (stat.mode & 0o022) !== 0) {
-    throw new Error(`Refusing mutable or non-executable external agent binary: ${source}`);
-  }
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (uid !== undefined && stat.uid !== 0 && stat.uid !== uid) {
-    throw new Error(`Refusing external agent binary owned by another user: ${source}`);
-  }
+function assertTrustedExternalPath(real: string, roots: readonly string[], label: string): string {
   for (const root of roots) {
     if (isWithin(root, real)) {
-      throw new Error(`External agent binary may not come from the project/worktree/Golden roots: ${real}`);
+      throw new Error(`${label} may not come from the project/worktree/Golden roots: ${real}`);
     }
   }
   if (isWithin("/tmp", real) || isWithin("/var/tmp", real)) {
-    throw new Error(`External agent binary may not come from a temporary directory: ${real}`);
+    throw new Error(`${label} may not come from a temporary directory: ${real}`);
   }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   let cursor = dirname(real);
   while (cursor !== dirname(cursor)) {
     const parent = statSync(cursor);
@@ -1113,15 +1195,74 @@ function assertTrustedExternalAgentBinary(
     // by the current trusted user. Root/foreign-owned group-writable directories
     // remain untrusted because another principal can replace path components.
     if ((parent.mode & 0o002) !== 0) {
-      throw new Error(`External agent binary has a world-writable parent directory: ${cursor}`);
+      throw new Error(`${label} has a world-writable parent directory: ${cursor}`);
     }
     if ((parent.mode & 0o020) !== 0 && (uid === undefined || parent.uid !== uid)) {
-      throw new Error(`External agent binary has a group-writable parent directory not owned by the current user: ${cursor}`);
+      throw new Error(`${label} has a group-writable parent directory not owned by the current user: ${cursor}`);
     }
     if (uid !== undefined && parent.uid !== 0 && parent.uid !== uid) {
-      throw new Error(`External agent binary has a parent directory owned by another user: ${cursor}`);
+      throw new Error(`${label} has a parent directory owned by another user: ${cursor}`);
     }
     cursor = dirname(cursor);
+  }
+  return real;
+}
+
+function assertTrustedExternalAgentBinary(
+  source: string,
+  roots: readonly string[],
+): string {
+  const real = realpathSync(source);
+  const stat = statSync(real);
+  if (!stat.isFile() || accessSync(real, fsConstants.X_OK) !== undefined || (stat.mode & 0o022) !== 0) {
+    throw new Error(`Refusing mutable or non-executable external agent binary: ${source}`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && stat.uid !== 0 && stat.uid !== uid) {
+    throw new Error(`Refusing external agent binary owned by another user: ${source}`);
+  }
+  return assertTrustedExternalPath(real, roots, "External agent binary");
+}
+
+/**
+ * A directory-mounted external runtime (the Codex platform vendor tree) is
+ * mounted read-only, but its contents still execute inside the sandbox. Refuse
+ * symlinks, foreign owners, and group/world-writable entries instead of
+ * trusting the whole tree because the entry executable passed validation.
+ */
+function assertTrustedExternalAgentRuntimeTree(source: string, roots: readonly string[]): string {
+  const real = realpathSync(source);
+  const stat = statSync(real);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (!stat.isDirectory() || (stat.mode & 0o022) !== 0 ||
+    (uid !== undefined && stat.uid !== 0 && stat.uid !== uid)) {
+    throw new Error(`Refusing mutable or foreign-owned external agent runtime tree: ${source}`);
+  }
+  assertTrustedExternalPath(real, roots, "External agent runtime tree");
+  const pending: Array<{ path: string; depth: number }> = [{ path: real, depth: 0 }];
+  let visited = 0;
+  while (pending.length > 0) {
+    const current = pending.pop() as { path: string; depth: number };
+    if (current.depth > 8 || ++visited > 20_000) {
+      throw new Error(`Refusing external agent runtime tree with unexpected size: ${source}`);
+    }
+    for (const name of readdirSync(current.path)) {
+      const entry = join(current.path, name);
+      const entryStat = lstatSync(entry);
+      if (entryStat.isSymbolicLink()) {
+        throw new Error(`External agent runtime tree contains a symlink: ${entry}`);
+      }
+      if ((entryStat.mode & 0o022) !== 0) {
+        throw new Error(`External agent runtime tree contains a group/world-writable entry: ${entry}`);
+      }
+      if (uid !== undefined && entryStat.uid !== 0 && entryStat.uid !== uid) {
+        throw new Error(`External agent runtime tree contains an entry owned by another user: ${entry}`);
+      }
+      if (entryStat.isDirectory()) pending.push({ path: entry, depth: current.depth + 1 });
+      else if (!entryStat.isFile()) {
+        throw new Error(`External agent runtime tree contains an unsupported entry: ${entry}`);
+      }
+    }
   }
   return real;
 }
@@ -1219,6 +1360,31 @@ interface PreparedSandboxRuntime {
   credentials: string[];
 }
 
+/**
+ * Codex host-CLI priority: use the user's `codex` CLI when it resolves to a
+ * trusted npm or standalone install, otherwise keep the ACP-bundled runtime.
+ * A rejected host binary is a preference failure, not a run failure: the pinned
+ * bundled runtime still provides a contained session.
+ */
+function withHostCodexRuntime(runtime: BackendRuntime, roots: readonly string[]): BackendRuntime | undefined {
+  try {
+    const host = resolveHostCodexRuntime();
+    if (!host) return undefined;
+    const binary = assertTrustedExternalAgentBinary(host.binary, roots);
+    const source = host.mountAsDirectory
+      ? assertTrustedExternalAgentRuntimeTree(host.mountSource, roots)
+      : binary;
+    if (host.mountAsDirectory && !isWithin(source, binary)) return undefined;
+    return {
+      ...runtime,
+      extraBinary: { source, target: host.mountAsDirectory ? RUNTIME_CODEX_VENDOR : RUNTIME_CODEX_HOST },
+      env: [["CODEX_PATH", host.sandboxExecutable]],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 async function prepareSandboxRuntime(
   options: SandboxOptions,
   backendId: SupportedAcpBackend,
@@ -1237,6 +1403,9 @@ async function prepareSandboxRuntime(
   if (trustedOpenCodeBinary && runtime.extraBinary) {
     const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
     runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
+  }
+  if (backendId === "codex") {
+    runtime = withHostCodexRuntime(runtime, [cwd, sourceRoot, goldenRoot]) ?? runtime;
   }
   if (options.includeProviderCredentials && nativeStateCount === 0) {
     if (backendId === "pi") {

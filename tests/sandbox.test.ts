@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createSandboxedBackend, findBubblewrap, prepareReadOnlyGitMirror, runSandboxedCommand, stageSelectedOpenCodeProviderConfig, validateBubblewrapBinary, verifySandboxBoundary } from "../src/sandbox.js";
+import { createSandboxedBackend, findBubblewrap, prepareReadOnlyGitMirror, resolveHostCodexRuntime, runSandboxedCommand, stageSelectedOpenCodeProviderConfig, validateBubblewrapBinary, verifySandboxBoundary } from "../src/sandbox.js";
+import { codexPlatformPackage, writeFakeCodexInstall } from "./fixtures/fake-codex.js";
 
 const execFile = promisify(execFileCallback);
 const requireBubblewrapTests = process.env.PI_PLAN_EXECUTE_REQUIRE_BWRAP_TESTS === "1";
@@ -104,6 +105,43 @@ test("OpenCode stages only the selected provider/model, not unrelated config or 
   }
 });
 
+test("host Codex resolution prefers the native app-server of an npm install", {
+  skip: !codexPlatformPackage() && "unsupported test platform for the npm Codex layout",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-host-codex-unit-"));
+  try {
+    const install = await writeFakeCodexInstall(root);
+    const resolved = resolveHostCodexRuntime(install.pathDir);
+    assert.ok(resolved);
+    assert.equal(resolved.mountAsDirectory, true);
+    assert.equal(resolved.binary, install.binary);
+    assert.equal(resolved.mountSource, install.vendorRoot);
+    assert.equal(resolved.sandboxExecutable, "/agent-runtime/codex-vendor/bin/codex");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("host Codex resolution ignores a missing CLI and supports standalone executables", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-host-codex-unit-"));
+  try {
+    const empty = join(root, "empty");
+    await mkdir(empty, { recursive: true });
+    assert.equal(resolveHostCodexRuntime(empty), undefined);
+    const nativeDir = join(root, "native");
+    await mkdir(nativeDir, { recursive: true });
+    await writeFile(join(nativeDir, "codex"), "#!/bin/sh\nexit 0\n");
+    await chmod(join(nativeDir, "codex"), 0o755);
+    const resolved = resolveHostCodexRuntime(nativeDir);
+    assert.ok(resolved);
+    assert.equal(resolved.mountAsDirectory, false);
+    assert.equal(resolved.binary, join(nativeDir, "codex"));
+    assert.equal(resolved.sandboxExecutable, "/agent-runtime/codex-host");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 let bubblewrapAvailable = true;
 try {
   findBubblewrap();
@@ -142,6 +180,123 @@ test("ACP backend command uses minimal mounts and a scrubbed environment", {
       await sandbox.cleanup();
     }
   } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Codex sessions prefer a trusted host CLI over the bundled ACP runtime", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-codex-host-"));
+  const previousPath = process.env.PATH;
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    const install = await writeFakeCodexInstall(join(fixture, "install"));
+    const cwd = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+    process.env.PATH = `${install.pathDir}:${previousPath ?? ""}`;
+    sandbox = await createSandboxedBackend({
+      role: "reviewer",
+      model: "codex/gpt-6.1-sol",
+      cwd,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+    });
+    const args = sandbox.config.args ?? [];
+    const bindIndex = args.findIndex((value, index) => value === "--ro-bind" && args[index + 1] === install.vendorRoot);
+    assert.ok(bindIndex >= 0, "the host Codex vendor tree must be mounted read-only");
+    assert.equal(args[bindIndex + 2], "/agent-runtime/codex-vendor");
+    const envIndex = args.findIndex((value, index) => value === "--setenv" && args[index + 1] === "CODEX_PATH");
+    assert.ok(envIndex >= 0, "CODEX_PATH must select the isolated host runtime");
+    assert.equal(args[envIndex + 2], "/agent-runtime/codex-vendor/bin/codex");
+    // Prove the mounted app-server actually executes inside the sandbox boundary.
+    const separator = args.indexOf("--");
+    assert.ok(separator > 0);
+    const probe = await execFile(findBubblewrap(), [...args.slice(0, separator), "--", "/agent-runtime/codex-vendor/bin/codex", "mounted"], {
+      timeout: 15_000,
+      maxBuffer: 256 * 1024,
+    });
+    assert.match(probe.stdout, /fake-codex:mounted/);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await sandbox?.cleanup();
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Codex sessions support a standalone host CLI executable", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-codex-host-"));
+  const previousPath = process.env.PATH;
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    const nativeDir = join(fixture, "native");
+    await mkdir(nativeDir, { recursive: true });
+    await writeFile(join(nativeDir, "codex"), "#!/bin/sh\nprintf 'native-codex:%s\\n' \"$1\"\n");
+    await chmod(join(nativeDir, "codex"), 0o755);
+    const cwd = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+    process.env.PATH = `${nativeDir}:${previousPath ?? ""}`;
+    sandbox = await createSandboxedBackend({
+      role: "reviewer",
+      model: "codex/gpt-6.1-sol",
+      cwd,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+    });
+    const args = sandbox.config.args ?? [];
+    const bindIndex = args.findIndex((value, index) => value === "--ro-bind" && args[index + 1] === join(nativeDir, "codex"));
+    assert.ok(bindIndex >= 0, "the standalone host executable must be mounted read-only");
+    assert.equal(args[bindIndex + 2], "/agent-runtime/codex-host");
+    const envIndex = args.findIndex((value, index) => value === "--setenv" && args[index + 1] === "CODEX_PATH");
+    assert.equal(args[envIndex + 2], "/agent-runtime/codex-host");
+    const separator = args.indexOf("--");
+    const probe = await execFile(findBubblewrap(), [...args.slice(0, separator), "--", "/agent-runtime/codex-host", "standalone"], { timeout: 15_000, maxBuffer: 256 * 1024 });
+    assert.match(probe.stdout, /native-codex:standalone/);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await sandbox?.cleanup();
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Codex ignores an untrusted host CLI and keeps the bundled ACP runtime", {
+  skip: !requireBubblewrapTests && !bubblewrapAvailable && "trusted system bwrap is unavailable",
+}, async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-codex-host-"));
+  const previousPath = process.env.PATH;
+  try {
+    const cwd = await makeGitWorktree(fixture, { "package.json": "{}\n" });
+    const settings = {
+      role: "reviewer" as const,
+      model: "codex/gpt-6.1-sol",
+      cwd,
+      sourceRoot: process.cwd(),
+      goldenRoot: join(process.cwd(), "docs"),
+    };
+    const assertBundledRuntime = async (): Promise<void> => {
+      const sandbox = await createSandboxedBackend(settings);
+      try {
+        const args = sandbox.config.args ?? [];
+        assert.equal(args.some((value, index) => value === "--setenv" && args[index + 1] === "CODEX_PATH"), false);
+        assert.equal(args.includes("/agent-runtime/codex-vendor"), false);
+      } finally {
+        await sandbox.cleanup();
+      }
+    };
+    // A project-local CLI is never executed, even though it resolves from PATH.
+    const inProject = await writeFakeCodexInstall(join(cwd, ".host-codex"));
+    process.env.PATH = `${inProject.pathDir}:${previousPath ?? ""}`;
+    await assertBundledRuntime();
+    // A tampered vendor tree falls back instead of executing an unverified app-server.
+    const tampered = await writeFakeCodexInstall(join(fixture, "tampered"));
+    await chmod(join(tampered.vendorRoot, "codex-path", "rg"), 0o777);
+    process.env.PATH = `${tampered.pathDir}:${previousPath ?? ""}`;
+    await assertBundledRuntime();
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
     await rm(fixture, { recursive: true, force: true });
   }
 });

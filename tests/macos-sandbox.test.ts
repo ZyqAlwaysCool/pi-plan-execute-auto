@@ -12,6 +12,7 @@ import {
   runSandboxedCommand,
   verifySandboxBoundary,
 } from "../src/sandbox.js";
+import { writeFakeCodexInstall } from "./fixtures/fake-codex.js";
 
 const execFile = promisify(execFileCallback);
 const requireMacSandboxTests = process.env.PI_PLAN_EXECUTE_REQUIRE_MACOS_SANDBOX_TESTS === "1";
@@ -57,8 +58,9 @@ test("macOS backend uses the trusted Seatbelt launcher instead of bubblewrap", {
   const originalCodexPath = process.env.CODEX_PATH;
   let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
   try {
-    // The isolated adapter must use its package-compatible bundled Codex runtime,
-    // never a host CODEX_PATH override that may point at a different CLI version.
+    // A host CODEX_PATH override must never leak into the isolated environment;
+    // the plugin resolves a trusted host `codex` from PATH itself and otherwise
+    // keeps its package-compatible bundled Codex runtime.
     process.env.CODEX_PATH = "/opt/homebrew/bin/codex-host-version-must-not-leak";
     sandbox = await createSandboxedBackend({
       role: "reviewer",
@@ -77,12 +79,45 @@ test("macOS backend uses the trusted Seatbelt launcher instead of bubblewrap", {
     assert.ok(args.includes("-i"));
     assert.ok(args.some((value) => value.startsWith("HOME=")));
     assert.ok(args.some((value) => value.startsWith("GIT_DIR=")));
-    assert.equal(args.some((value) => value.startsWith("CODEX_PATH=")), false);
+    assert.equal(args.some((value) => value.includes("codex-host-version-must-not-leak")), false);
     assert.equal(args.includes("bwrap"), false);
   } finally {
     await sandbox?.cleanup();
     if (originalCodexPath === undefined) delete process.env.CODEX_PATH;
     else process.env.CODEX_PATH = originalCodexPath;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("macOS Codex sessions prefer a trusted host CLI through the Seatbelt profile", {
+  skip: process.platform !== "darwin" || (!requireMacSandboxTests && !macSandboxAvailable)
+    ? "macOS sandbox-exec is unavailable"
+    : false,
+}, async () => {
+  const fixture = await makeFixture();
+  const previousPath = process.env.PATH;
+  let sandbox: Awaited<ReturnType<typeof createSandboxedBackend>> | undefined;
+  try {
+    const install = await writeFakeCodexInstall(join(fixture.root, "install"));
+    process.env.PATH = `${install.pathDir}:${previousPath ?? ""}`;
+    sandbox = await createSandboxedBackend({
+      role: "reviewer",
+      model: "codex/gpt-6.1-sol",
+      cwd: fixture.cwd,
+      sourceRoot: fixture.sourceRoot,
+      goldenRoot: fixture.goldenRoot,
+    });
+    const args = sandbox.config.args ?? [];
+    assert.ok(args.includes(`CODEX_PATH=${install.binary}`), "CODEX_PATH must select the host app-server on macOS");
+    const profile = await readFile(join(sandbox.scratchPath, "run", "seatbelt.sb"), "utf8");
+    assert.ok(
+      profile.includes(`(subpath ${JSON.stringify(install.vendorRoot)})`),
+      "Seatbelt must be able to read the host Codex vendor tree",
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await sandbox?.cleanup();
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
