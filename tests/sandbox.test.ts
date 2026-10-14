@@ -1,4 +1,5 @@
 import { access, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
@@ -135,7 +136,7 @@ test("host Codex resolution ignores a missing CLI and supports standalone execut
     const resolved = resolveHostCodexRuntime(nativeDir);
     assert.ok(resolved);
     assert.equal(resolved.mountAsDirectory, false);
-    assert.equal(resolved.binary, join(nativeDir, "codex"));
+    assert.equal(resolved.binary, realpathSync(join(nativeDir, "codex")));
     assert.equal(resolved.sandboxExecutable, "/agent-runtime/codex-host");
   } finally {
     await rm(root, { recursive: true, force: true });

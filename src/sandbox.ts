@@ -458,7 +458,7 @@ export function resolveHostCodexRuntime(pathValue = process.env.PATH ?? ""): Hos
       continue;
     }
     return {
-      binary,
+      binary: realpathSync(binary),
       mountSource: realpathSync(join(vendorRoot, triple)),
       sandboxExecutable: `${RUNTIME_CODEX_VENDOR}/bin/codex`,
       mountAsDirectory: true,
