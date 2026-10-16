@@ -16,6 +16,7 @@ import {
   parseStageTimeoutValue,
   pauseRepairable,
   pauseResumable,
+  roundLimitResumeAllowed,
 } from "../src/pause.js";
 
 test("resumability is explicit and only covers execution interruptions", () => {
@@ -103,6 +104,30 @@ test("pause formatting is stable and resumability-aware", () => {
   );
   const fatal = createPauseRecord({ code: "STARTUP_EVIDENCE", summary: "bad evidence", stage: "setup" });
   assert.equal(formatPauseHeadline(fatal), "STARTUP_EVIDENCE · bad evidence (setup) · needs repair");
+});
+
+test("round-limit pauses become resumable only with remaining budget under the effective limit", () => {
+  assert.equal(roundLimitResumeAllowed("MAX_REVIEW_ROUNDS", 12, 20), true);
+  assert.equal(roundLimitResumeAllowed("MAX_REVIEW_ROUNDS", 0, 5), true);
+  assert.equal(roundLimitResumeAllowed("MAX_REVIEW_ROUNDS", 12, 12), false);
+  assert.equal(roundLimitResumeAllowed("MAX_REVIEW_ROUNDS", 20, 12), false);
+  assert.equal(roundLimitResumeAllowed("HUMAN_STOP", 12, 20), false);
+  assert.equal(roundLimitResumeAllowed(undefined, 12, 20), false);
+});
+
+test("pause headline accepts a recomputed resumability override", () => {
+  const pause = createPauseRecord({
+    code: "MAX_REVIEW_ROUNDS",
+    summary: "Phase did not pass deterministic validation after 12 review rounds.",
+    stage: "acceptance",
+    round: 12,
+  });
+  assert.equal(
+    formatPauseHeadline(pause),
+    "MAX_REVIEW_ROUNDS · Phase did not pass deterministic validation after 12 review rounds. (acceptance, round 12) · needs repair",
+  );
+  assert.match(formatPauseHeadline(pause, { resumable: true }), /resumable$/);
+  assert.match(formatPauseHeadline(pause, { resumable: false }), /needs repair$/);
 });
 
 test("duration and stage-timeout formatting cover minutes, hours, and unlimited", () => {

@@ -457,7 +457,7 @@ export class StageBController {
     const lines = [
       "You are the Executor Agent in pi-plan-execute-auto.",
       "Implement CURRENT PHASE ONLY. Do not implement later phases, edit Golden Docs, or create any commit.",
-      `The sandbox exposes a read-only, shallow Git metadata mirror containing only phase base ${baseCommit} and its tree; use Git to inspect status/diff, but never stage or commit. The plugin owns all commits.`,
+      `The sandbox exposes a read-only Git metadata mirror for the run's own history (planning baseline through the current phase base ${baseCommit}); it never mounts the shared host Git directory or unrelated history. Use Git to inspect status/diff, but never stage or commit. The plugin owns all commits.`,
       "You must work in the supplied workspace, inspect the source yourself, and execute every required self-test in the frozen acceptance contract on every round.",
       "Your structured self_tests entries must exactly copy every required test id and command and report passed only after actually running it.",
       "The plugin, not you, owns phase commits.",
@@ -522,7 +522,7 @@ export class StageBController {
       "You are the independent Reviewer Agent in pi-plan-execute-auto.",
       "Review CURRENT PHASE ONLY. Do not modify files, stage files, or create a commit. Any requested write permission must be rejected.",
       "You must independently read the frozen Golden Docs, current phase spec, current acceptance contract, relevant source and tests, and inspect the actual workspace.",
-      `Use ${baseCommit} as the phase base. The sandbox provides a read-only shallow Git metadata mirror containing exactly this commit and its tree, not the shared host Git directory or earlier history. Independently run git status and generate tracked changes with git diff --no-ext-diff --no-textconv --no-renames --binary ${baseCommit}; include each untracked path with git diff --no-index --binary -- /dev/null <path>. Ignore plugin runtime artifacts under .pi-plan-execute-auto/. Compare the result with the complete immutable plugin-generated diff below and inspect relevant source/tests. Never stage or commit.`,
+      `Use ${baseCommit} as the phase base. The sandbox provides a read-only Git metadata mirror for the run's own history up to this commit, not the shared host Git directory or unrelated pre-run history. Independently run git status and generate tracked changes with git diff --no-ext-diff --no-textconv --no-renames --binary ${baseCommit}; include each untracked path with git diff --no-index --binary -- /dev/null <path>. Ignore plugin runtime artifacts under .pi-plan-execute-auto/. Compare the result with the complete immutable plugin-generated diff below and inspect relevant source/tests. Never stage or commit.`,
       `complete_canonical_diff_path: ${diffEvidencePath}`,
       `complete_canonical_diff_sha256: ${diffSha256}`,
       "Verify the supplied complete patch SHA-256 against the stated hash before review; report any mismatch as a blocking finding.",

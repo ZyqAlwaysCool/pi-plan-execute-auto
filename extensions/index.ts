@@ -67,6 +67,7 @@ import {
   parseStageTimeoutValue,
   pauseRepairable,
   pauseResumable,
+  roundLimitResumeAllowed,
 } from "../src/pause.js";
 import {
   DEFAULT_MAX_REVIEW_ROUNDS,
@@ -344,14 +345,15 @@ function stateLines(state: WorkflowState): string[] {
   const currentRound = plan.current_index >= 0
     ? Math.min((state.phases[plan.current_index]?.review_rounds ?? 0) + 1, plan.review_round_limit)
     : undefined;
+  const pauseResumable = pause ? evaluateResumeEligibility(state, { allowOrphanedRunning: true }).ok : false;
   return [
     `Execution & Review · ${state.run_id} · ${state.status} · ${completed}/${state.phases.length} phases` +
       (state.stage_timeout_ms !== undefined ? ` · timeout ${formatStageTimeout(state.stage_timeout_ms)}` : ""),
     `  ${formatPlanChecklist(plan, 240, currentRound !== undefined ? { round: currentRound } : {})}`,
     ...(pause
       ? [
-          formatPauseHeadline(pause),
-          ...(pause.resumable
+          formatPauseHeadline(pause, pauseResumable ? { resumable: true } : undefined),
+          ...(pauseResumable
             ? [`Resume: /plan-execute resume ${state.run_id}`]
             : ["Resume is refused; repair the reported evidence first."]),
         ]
@@ -1123,15 +1125,22 @@ async function commandSettings(ctx: ExtensionCommandContext, runIdArg?: string):
   }
 }
 
-function makeAcceptanceRunner(cwd: string, sourceRoot: string, goldenRoot: string): AcceptanceCommandRunner {
+function makeAcceptanceRunner(
+  cwd: string,
+  sourceRoot: string,
+  goldenRoot: string,
+  historyRootCommit?: () => string | undefined,
+): AcceptanceCommandRunner {
   return {
     async run(command, options) {
+      const historyRoot = historyRootCommit?.();
       return defaultIsolationProvider.runAcceptanceCommand({
         cwd,
         sourceRoot,
         goldenRoot,
         command,
         ...(options?.signal ? { signal: options.signal } : {}),
+        ...(historyRoot ? { historyRootCommit: historyRoot } : {}),
         timeout: options?.timeout ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS,
       });
     },
@@ -1275,7 +1284,8 @@ export function evaluateResumeEligibility(
     return { ok: false, reason: `Current phase already consumed review_round_limit=${limit}; resume cannot create extra hidden review rounds.` };
   }
   const code = state.status === "running" ? "PROCESS_RESTART" : state.pause?.code ?? pauseCode(state.pause_reason);
-  const resumable = state.status === "paused" && state.pause ? state.pause.resumable : pauseResumable(code);
+  const resumable = (state.status === "paused" && state.pause ? state.pause.resumable : pauseResumable(code))
+    || roundLimitResumeAllowed(code, current.review_rounds, limit);
   const repairable = state.status === "paused" && pauseRepairable(code);
   if (!code || (!resumable && !repairable)) {
     return {
@@ -1329,6 +1339,36 @@ async function verifyResumeCheckpoint(
   if (outOfScope.length > 0) {
     throw new Error(`Resume checkpoint has out-of-scope changes for ${current.phase_id}: ${outOfScope.join(", ")}.`);
   }
+}
+
+/**
+ * Persist the round-limit checkpoint as resumable once a human-approved settings change
+ * raised `review_round_limit` above the rounds the current phase already consumed. The
+ * pause keeps its `MAX_REVIEW_ROUNDS` code because that is what stopped the run; only
+ * its resumability is recomputed for the raised limit, so the existing paused run can
+ * continue without hand-edited state or a new run.
+ */
+export async function acknowledgeRoundLimitResume(pkgRoot: string, state: WorkflowState): Promise<boolean> {
+  const pause = state.pause;
+  const current = state.phases.find((phase) => phase.status !== "completed");
+  if (!pause || !current || pause.resumable) return false;
+  const limit = state.review_round_limit ?? DEFAULT_MAX_REVIEW_ROUNDS;
+  if (!roundLimitResumeAllowed(pause.code, current.review_rounds, limit)) return false;
+  state.pause = {
+    ...pause,
+    resumable: true,
+    detail: `${pause.detail ? `${pause.detail} ` : ""}Review round limit raised to ${limit}; the remaining rounds may continue.`,
+  };
+  state.pause_reason = formatPauseReason(state.pause);
+  await writeWorkflowState(pkgRoot, state);
+  await appendRunEvent(pkgRoot, "workflow_round_limit_resumed", {
+    run_id: state.run_id,
+    code: pause.code,
+    phase_id: current.phase_id,
+    review_rounds: current.review_rounds,
+    review_round_limit: limit,
+  }).catch(() => undefined);
+  return true;
 }
 
 /**
@@ -1763,6 +1803,7 @@ async function startStageB(
       }).catch(() => undefined);
       return { status: "not_started", state, reason: `Resume refused: ${eligibility.reason}` };
     }
+    await acknowledgeRoundLimitResume(pkg.root, state);
     resumeApproved = true;
   }
   const disposition = stageBStartDisposition(state, resumeApproved);
@@ -2015,6 +2056,7 @@ async function startStageB(
       cwd: dedicated.path,
       sourceRoot: ctx.cwd,
       goldenRoot: pkg.root,
+      historyRootCommit: () => state.phases[0]?.base_commit_sha,
       executorModel,
       reviewerModel,
       ...(configuredReasoningEffort ? { reasoningEffort: configuredReasoningEffort } : {}),
@@ -2053,7 +2095,12 @@ async function startStageB(
       package: pkg,
       state,
       git,
-      acceptanceRunner: makeAcceptanceRunner(dedicated.path, ctx.cwd, pkg.root),
+      acceptanceRunner: makeAcceptanceRunner(
+        dedicated.path,
+        ctx.cwd,
+        pkg.root,
+        () => state.phases[0]?.base_commit_sha,
+      ),
       harness: sessionPair,
       signal: linked.signal,
       acceptanceTimeoutMs: acceptanceTimeoutMs(),
@@ -2602,7 +2649,7 @@ async function commandStatus(ctx: ExtensionCommandContext, runId: string): Promi
       [
         `Run ${status.run_id}: ${status.status} · ${status.completed_phases}/${status.total_phases} phases${status.current_phase ? ` · current ${status.current_phase}` : ""}`,
         ...(state?.status === "paused"
-          ? [state.pause ? `Pause: ${formatPauseHeadline(state.pause)}` : `Pause: ${status.pause_reason ?? "reason unavailable"}`]
+          ? [state.pause ? `Pause: ${formatPauseHeadline(state.pause, resume?.ok ? { resumable: true } : undefined)}` : `Pause: ${status.pause_reason ?? "reason unavailable"}`]
           : []),
         `Workflow timeline: ${eventDisplay}`,
         ...(state?.status === "paused" || state?.status === "running"

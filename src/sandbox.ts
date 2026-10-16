@@ -64,6 +64,13 @@ export interface SandboxOptions {
   signal?: AbortSignal;
   /** Internal: stage stored provider auth in run-private scratch, then remove it before the first turn. */
   includeProviderCredentials?: boolean;
+  /**
+   * Run's planning baseline commit. When it is an ancestor of HEAD, the read-only Git
+   * mirror exposes the run's own history (baseline through HEAD) so contract commands
+   * such as `git diff <planning-baseline> -- path` can run without mounting the shared
+   * host Git directory or unrelated pre-run history.
+   */
+  historyRootCommit?: string;
 }
 
 export interface SandboxedBackend {
@@ -336,32 +343,59 @@ async function writeGitPack(
   }
 }
 
-export async function prepareReadOnlyGitMirror(cwd: string, scratchPath: string, signal?: AbortSignal): Promise<void> {
+export async function prepareReadOnlyGitMirror(
+  cwd: string,
+  scratchPath: string,
+  signal?: AbortSignal,
+  historyRootCommit?: string,
+): Promise<void> {
   const home = join(scratchPath, "run", "home");
   const format = (await runGit(cwd, ["rev-parse", "--show-object-format"], home, signal)).trim();
   if (format !== "sha1" && format !== "sha256") throw new Error(`Unsupported Git object format: ${format}`);
   const head = (await runGit(cwd, ["rev-parse", "--verify", "HEAD"], home, signal)).trim();
   const oidLength = format === "sha1" ? 40 : 64;
   if (!new RegExp(`^[0-9a-f]{${oidLength}}$`).test(head)) throw new Error("Dedicated worktree HEAD is not a valid full Git object ID.");
-  const tree = (await runGit(cwd, ["rev-parse", "--verify", `${head}^{tree}`], home, signal)).trim();
-  const listing = await runGit(cwd, ["ls-tree", "-r", "-t", "-z", tree], home, signal, MAX_GIT_MIRROR_TREE_LIST_BYTES);
-  const objects = new Map<string, string>([[head, "commit"], [tree, "tree"]]);
-  for (const record of listing.split("\0")) {
-    if (!record) continue;
-    const tab = record.indexOf("\t");
-    if (tab < 0) throw new Error("Git returned a malformed tree entry while preparing the read-only metadata mirror.");
-    const fields = record.slice(0, tab).split(" ");
-    const type = fields[1];
-    const oid = fields[2];
-    if (type !== "blob" && type !== "tree" && type !== "commit") {
-      throw new Error("Git returned an unsupported object type while preparing the read-only metadata mirror.");
+  const historyRoot = await resolveHistoryRoot(cwd, home, head, oidLength, historyRootCommit, signal);
+
+  const objects = new Map<string, string>();
+  const addTreeSnapshot = async (treeish: string): Promise<void> => {
+    const tree = (await runGit(cwd, ["rev-parse", "--verify", treeish], home, signal)).trim();
+    objects.set(tree, "tree");
+    const listing = await runGit(cwd, ["ls-tree", "-r", "-t", "-z", tree], home, signal, MAX_GIT_MIRROR_TREE_LIST_BYTES);
+    for (const record of listing.split("\0")) {
+      if (!record) continue;
+      const tab = record.indexOf("\t");
+      if (tab < 0) throw new Error("Git returned a malformed tree entry while preparing the read-only metadata mirror.");
+      const fields = record.slice(0, tab).split(" ");
+      const type = fields[1];
+      const oid = fields[2];
+      if (type !== "blob" && type !== "tree" && type !== "commit") {
+        throw new Error("Git returned an unsupported object type while preparing the read-only metadata mirror.");
+      }
+      if (!oid || !new RegExp(`^[0-9a-f]{${oidLength}}$`).test(oid)) {
+        throw new Error("Git returned an invalid object ID while preparing the read-only metadata mirror.");
+      }
+      if (type === "commit") continue;
+      objects.set(oid, type);
+      if (objects.size > MAX_GIT_MIRROR_OBJECTS) throw new Error("Read-only Git mirror exceeds the configured object-count limit.");
     }
-    if (!oid || !new RegExp(`^[0-9a-f]{${oidLength}}$`).test(oid)) {
-      throw new Error("Git returned an invalid object ID while preparing the read-only metadata mirror.");
+  };
+
+  objects.set(head, "commit");
+  await addTreeSnapshot(`${head}^{tree}`);
+  if (historyRoot) {
+    objects.set(historyRoot, "commit");
+    await addTreeSnapshot(`${historyRoot}^{tree}`);
+    const range = await runGit(cwd, ["rev-list", "--objects", `${historyRoot}..${head}`], home, signal, MAX_GIT_MIRROR_TREE_LIST_BYTES);
+    for (const line of range.split("\n")) {
+      const oid = line.split(" ", 1)[0]?.trim();
+      if (!oid) continue;
+      if (!new RegExp(`^[0-9a-f]{${oidLength}}$`).test(oid)) {
+        throw new Error("Git returned an invalid object ID while preparing the read-only metadata mirror.");
+      }
+      if (!objects.has(oid)) objects.set(oid, "object");
+      if (objects.size > MAX_GIT_MIRROR_OBJECTS) throw new Error("Read-only Git mirror exceeds the configured object-count limit.");
     }
-    if (type === "commit") continue;
-    objects.set(oid, type);
-    if (objects.size > MAX_GIT_MIRROR_OBJECTS) throw new Error("Read-only Git mirror exceeds the configured object-count limit.");
   }
 
   const mirror = join(scratchPath, "run", "git-mirror");
@@ -372,18 +406,43 @@ export async function prepareReadOnlyGitMirror(cwd: string, scratchPath: string,
     mkdir(join(mirror, "refs", "heads"), { recursive: true, mode: 0o700 }),
   ]);
   await writeFile(join(mirror, "HEAD"), `${head}\n`, { mode: 0o400 });
-  await writeFile(join(mirror, "shallow"), `${head}\n`, { mode: 0o400 });
+  await writeFile(join(mirror, "shallow"), `${historyRoot ?? head}\n`, { mode: 0o400 });
   const config = join(mirror, "config");
   const repositoryFormatVersion = format === "sha1" ? 0 : 1;
   const formatExtension = format === "sha256" ? `\n[extensions]\n\tobjectFormat = sha256\n` : "";
   await writeFile(config, `[core]\n\trepositoryformatversion = ${repositoryFormatVersion}\n\tfilemode = true\n\tbare = false\n${formatExtension}`, { mode: 0o600 });
   await runGit(cwd, ["config", "--file", config, "core.worktree", cwd], home, signal);
 
-  const packPath = join(objectDirectory, "pack", "pack-phase-base.pack");
+  const packPath = join(objectDirectory, "pack", "pack-run-history.pack");
   await writeGitPack(cwd, [...objects.keys()], packPath, home, signal);
   await runGit(cwd, [`--git-dir=${mirror}`, "index-pack", packPath], home, signal);
   await runGit(cwd, [`--git-dir=${mirror}`, `--work-tree=${cwd}`, "read-tree", head], home, signal);
   await writeFile(join(scratchPath, "run", "git-pointer"), "gitdir: /tmp/run/git-mirror\n", { mode: 0o400 });
+}
+
+/**
+ * Resolve the run's planning baseline into a mirror history root. Only an exact commit
+ * object that is a strict ancestor of HEAD qualifies; anything else (missing object,
+ * tag, unrelated commit, HEAD itself) falls back to the phase-base-only mirror.
+ */
+async function resolveHistoryRoot(
+  cwd: string,
+  home: string,
+  head: string,
+  oidLength: number,
+  candidate: string | undefined,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  if (!candidate || candidate === head) return undefined;
+  if (!new RegExp(`^[0-9a-f]{${oidLength}}$`).test(candidate)) return undefined;
+  try {
+    const resolved = (await runGit(cwd, ["rev-parse", "--verify", `${candidate}^{commit}`], home, signal)).trim();
+    if (resolved !== candidate) return undefined;
+    await runGit(cwd, ["merge-base", "--is-ancestor", candidate, head], home, signal);
+    return candidate;
+  } catch {
+    return undefined;
+  }
 }
 
 function outerNodeModulesRoot(entry: string): string {
@@ -1398,7 +1457,7 @@ async function prepareSandboxRuntime(
     ? assertTrustedExternalAgentBinary(runtime.extraBinary.source, [cwd, sourceRoot, goldenRoot])
     : undefined;
   const credentials: string[] = [];
-  await prepareScratchLayout(scratchPath, cwd, options.signal);
+  await prepareScratchLayout(scratchPath, cwd, options.signal, options.historyRootCommit);
   const nativeStateCount = await stageNativeCliState(runtime, scratchPath);
   if (trustedOpenCodeBinary && runtime.extraBinary) {
     const stagedBinary = await stageTrustedExternalAgentBinary(trustedOpenCodeBinary, scratchPath);
@@ -1542,9 +1601,9 @@ async function prepareScratchDirectories(scratchPath: string): Promise<void> {
   }
 }
 
-async function prepareScratchLayout(scratchPath: string, cwd: string, signal?: AbortSignal): Promise<void> {
+async function prepareScratchLayout(scratchPath: string, cwd: string, signal?: AbortSignal, historyRootCommit?: string): Promise<void> {
   await prepareScratchDirectories(scratchPath);
-  await prepareReadOnlyGitMirror(cwd, scratchPath, signal);
+  await prepareReadOnlyGitMirror(cwd, scratchPath, signal, historyRootCommit);
 }
 
 async function prepareProbeScratch(scratchPath: string): Promise<void> {
@@ -1709,6 +1768,8 @@ export interface SandboxedCommandOptions {
   command: string;
   signal?: AbortSignal;
   timeout?: number;
+  /** Run's planning baseline commit; see `SandboxOptions.historyRootCommit`. */
+  historyRootCommit?: string;
 }
 
 function outputText(value: unknown): string {
@@ -1725,6 +1786,7 @@ async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promi
     sourceRoot: options.sourceRoot,
     goldenRoot: options.goldenRoot,
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.historyRootCommit ? { historyRootCommit: options.historyRootCommit } : {}),
   };
   const runtime: BackendRuntime = { command: "/bin/bash", args: [], credentialSources: [] };
   const cwd = await realpath(options.cwd);
@@ -1736,7 +1798,7 @@ async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promi
   const sandboxExec = findMacOSSandboxExec();
   const scratchPath = await realpath(await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-acceptance-")));
   try {
-    await prepareScratchLayout(scratchPath, cwd, options.signal);
+    await prepareScratchLayout(scratchPath, cwd, options.signal, options.historyRootCommit);
     const hostRuntime = macHostRuntime(runtime);
     const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
     const environment = macSandboxEnvironment(normalized, scratchPath, runtime);
@@ -1781,6 +1843,7 @@ export async function runSandboxedCommand(options: SandboxedCommandOptions): Pro
     sourceRoot: options.sourceRoot,
     goldenRoot: options.goldenRoot,
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.historyRootCommit ? { historyRootCommit: options.historyRootCommit } : {}),
   };
   const runtime: BackendRuntime = { command: "/bin/bash", args: [], credentialSources: [] };
   const cwd = await realpath(options.cwd);
@@ -1792,7 +1855,7 @@ export async function runSandboxedCommand(options: SandboxedCommandOptions): Pro
   const bwrap = findBubblewrap();
   const scratchPath = await mkdtemp(join(SCRATCH_ROOT, "pi-plan-execute-acceptance-"));
   try {
-    await prepareScratchLayout(scratchPath, cwd, options.signal);
+    await prepareScratchLayout(scratchPath, cwd, options.signal, options.historyRootCommit);
     // Acceptance commands keep normal networking just like the Agent CLI sessions.
     // The same filesystem/worktree boundary still applies.
     const args = ["--die-with-parent", "--new-session", "--unshare-pid"];

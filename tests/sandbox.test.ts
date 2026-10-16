@@ -68,6 +68,39 @@ test("read-only Git metadata mirror supports baseline diff without shared histor
   }
 });
 
+test("read-only Git metadata mirror exposes the run's own history but not pre-run history", async () => {
+  const fixture = await mkdtemp(join(dirname(process.cwd()), ".peac-git-history-test-"));
+  const worktree = await makeGitWorktree(fixture, { "src/value.ts": "export const value = 1;\n" });
+  const scratch = await mkdtemp(join(tmpdir(), "peac-git-history-scratch-"));
+  try {
+    await mkdir(join(scratch, "run", "home"), { recursive: true });
+    const baseline = (await execFile("git", ["-C", worktree, "rev-parse", "HEAD"])).stdout.trim();
+    const preRun = (await execFile("git", ["-C", worktree, "rev-parse", "HEAD~1"])).stdout.trim();
+    await writeFile(join(worktree, "src/value.ts"), "export const value = 2;\n", "utf8");
+    await execFile("git", ["-C", worktree, "add", "src/value.ts"]);
+    await execFile("git", ["-C", worktree, "commit", "--quiet", "-m", "phase"]);
+    await prepareReadOnlyGitMirror(worktree, scratch, undefined, baseline);
+    const mirror = join(scratch, "run", "git-mirror");
+    const gitPointer = join(worktree, ".git");
+    const originalPointer = await readFile(gitPointer);
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" };
+    try {
+      await writeFile(gitPointer, `gitdir: ${mirror}\n`, "utf8");
+      // Contract-style baseline commands must diff the run's planning baseline without the host repo.
+      const baselineDiff = await execFile("git", ["-C", worktree, "diff", baseline, "--", "src/value.ts"], { cwd: worktree, env });
+      assert.match(baselineDiff.stdout, /export const value = 2/);
+      const log = await execFile("git", ["-C", worktree, "log", "--format=%s"], { cwd: worktree, env });
+      assert.deepEqual(log.stdout.trim().split("\n"), ["phase", "base"]);
+      await assert.rejects(execFile("git", ["-C", worktree, "cat-file", "-e", preRun], { cwd: worktree, env }));
+    } finally {
+      await writeFile(gitPointer, originalPointer);
+    }
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 test("OpenCode stages only the selected provider/model, not unrelated config or credentials", async () => {
   const fixture = await mkdtemp(join(tmpdir(), "peac-opencode-config-"));
   const configRoot = join(fixture, "host-config");

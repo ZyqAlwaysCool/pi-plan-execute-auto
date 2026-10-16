@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { StageBStatusEvent, WorkflowState } from "../src/types.js";
 import planExecuteAuto, {
+  acknowledgeRoundLimitResume,
   applyProfileToFrozenState,
   approvalStartsStageB,
   budgetWarningEvent,
@@ -220,11 +224,31 @@ test("safe resume accepts only execution-interruption checkpoints with remaining
     assert.equal(result.ok, true, code);
   }
 
-  for (const code of ["MAX_REVIEW_ROUNDS", "HEAD_CHANGED", "GOLDEN_PACKAGE_CHANGED", "REVIEWER_CHANGED_WORKSPACE", "COMPLETION_EVIDENCE_INVALID"]) {
+  for (const code of ["HEAD_CHANGED", "GOLDEN_PACKAGE_CHANGED", "REVIEWER_CHANGED_WORKSPACE", "COMPLETION_EVIDENCE_INVALID"]) {
     const state = { ...base, pause_reason: `[${code}] unsafe checkpoint`, phases: base.phases.map((phase) => ({ ...phase })) };
     const result = evaluateResumeEligibility(state);
     assert.equal(result.ok, false, code);
   }
+
+  // A round-limit pause resumes only while the effective (possibly raised) limit still
+  // leaves rounds available; a structured, stale `resumable: false` record does not block it.
+  const elevatedRoundLimit = {
+    ...base,
+    review_round_limit: 20,
+    pause: createPauseRecord({
+      code: "MAX_REVIEW_ROUNDS",
+      summary: "Phase did not pass deterministic validation after 12 review rounds.",
+      stage: "acceptance",
+      resumable: false,
+      phase_id: "phase-01",
+      round: 12,
+    }),
+    pause_reason: "[MAX_REVIEW_ROUNDS] Phase did not pass deterministic validation after 12 review rounds.",
+    phases: [{ ...base.phases[0]!, review_rounds: 12 }],
+  } as WorkflowState;
+  assert.equal(evaluateResumeEligibility(elevatedRoundLimit).ok, true);
+  assert.equal(evaluateResumeEligibility({ ...elevatedRoundLimit, review_round_limit: 12 } as WorkflowState).ok, false);
+  assert.equal(evaluateResumeEligibility({ ...elevatedRoundLimit, review_round_limit: 5 } as WorkflowState).ok, false);
 
   const exhausted = {
     ...base,
@@ -251,6 +275,56 @@ test("safe resume accepts only execution-interruption checkpoints with remaining
   } as WorkflowState;
   assert.equal(evaluateResumeEligibility(structured).ok, true);
   assert.equal(evaluateResumeEligibility({ ...structured, pause: { ...structured.pause!, code: "STARTUP_EVIDENCE", resumable: false } } as WorkflowState).ok, false);
+});
+
+test("a raised review limit turns the persisted round-limit pause into a resumable checkpoint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-round-limit-"));
+  try {
+    await mkdir(root, { recursive: true });
+    const state = {
+      version: 1,
+      run_id: "run-round-limit",
+      package_hash: "a".repeat(64),
+      package_dir: root,
+      status: "paused",
+      created_at: new Date(0).toISOString(),
+      review_round_limit: 20,
+      branch_name: "pi-plan-execute-auto/run-round-limit",
+      worktree_path: "/tmp/round-limit-worktree",
+      pause: createPauseRecord({
+        code: "MAX_REVIEW_ROUNDS",
+        summary: "Phase did not pass deterministic validation after 12 review rounds.",
+        stage: "acceptance",
+        resumable: false,
+        phase_id: "phase-01",
+        round: 12,
+      }),
+      pause_reason: "[MAX_REVIEW_ROUNDS] Phase did not pass deterministic validation after 12 review rounds.",
+      phases: [{
+        phase_id: "phase-01",
+        status: "paused",
+        review_rounds: 12,
+        execution_report_paths: [],
+        review_report_paths: [],
+        unresolved_findings: [],
+      }],
+    } as WorkflowState;
+
+    assert.equal(evaluateResumeEligibility(state).ok, true);
+    assert.equal(await acknowledgeRoundLimitResume(root, state), true);
+    const persisted = JSON.parse(await readFile(join(root, ".state.json"), "utf8")) as WorkflowState;
+    assert.equal(persisted.pause?.resumable, true);
+    assert.match(persisted.pause?.detail ?? "", /limit raised to 20/);
+    assert.match(persisted.pause_reason ?? "", /^\[MAX_REVIEW_ROUNDS\]/);
+    // Idempotent: a second resume attempt must not rewrite or duplicate the checkpoint.
+    assert.equal(await acknowledgeRoundLimitResume(root, persisted), false);
+
+    const unchanged = { ...state, review_round_limit: 12, pause: { ...state.pause! }, pause_reason: state.pause_reason } as WorkflowState;
+    assert.equal(evaluateResumeEligibility(unchanged).ok, false);
+    assert.equal(await acknowledgeRoundLimitResume(root, unchanged), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("repairable workspace evidence pauses resume through repair verification", () => {

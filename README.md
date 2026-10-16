@@ -58,7 +58,7 @@ The normal command surface is intentionally small:
 - `setup` configures Executor/Reviewer CLI routes, reasoning levels, review limit, permission mode, and the whole-run execution timeout in one full wizard.
 - `settings [run-id]` reopens only the individual settings as a menu, without repeating the whole wizard. With no run id it targets project defaults; with a run id it also syncs that frozen run's persisted settings so an explicit resume stays allowed. Model/effort changes apply to sessions created after the next resume; the timeout is operational and never invalidates a frozen run.
 - `start <run-id>` reviews/approves a draft when needed, or retries an already-approved run whose start prerequisite has since been fixed.
-- `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint. Repairable evidence pauses (currently `WORKSPACE_SYMLINK_ESCAPE`) re-verify the exact reported evidence before resuming and stay paused with a `workflow_repair_failed` event when it still fails.
+- `resume <run-id>` rebuilds fresh Executor/Reviewer sessions from a persisted, resumable pause checkpoint. Repairable evidence pauses (currently `WORKSPACE_SYMLINK_ESCAPE`) re-verify the exact reported evidence before resuming and stay paused with a `workflow_repair_failed` event when it still fails. A `MAX_REVIEW_ROUNDS` pause becomes resumable after a human-approved settings change (`/plan-execute settings <run-id>`) raises `review_round_limit` above the rounds the phase already consumed; the plugin re-verifies the checkpoint, reopens the persisted pause without hand-edited state, and continues with the remaining rounds in the same run.
 - `stop <run-id>` (or the `Ctrl+Shift+X` shortcut) requests a safe stop of an active execution and pauses without committing.
 - `status <run-id>` shows a compact status summary plus the workflow-timeline path and latest Executor/Reviewer transcript paths. In interactive Pi it also offers previews of those diagnostic files.
 
@@ -165,7 +165,7 @@ The configured number is the maximum **Executor → Reviewer cycles per phase**.
 
 Default: **5 rounds per phase**.
 
-If the limit is exhausted without Reviewer `PASS`, the workflow pauses for the user instead of looping indefinitely.
+If the limit is exhausted without Reviewer `PASS`, the workflow pauses for the user instead of looping indefinitely. Raise the limit through `/plan-execute settings <run-id>` and run `/plan-execute resume <run-id>` to continue in the same run: the checkpoint is re-verified and the persisted round-limit pause is reopened for the remaining rounds.
 
 ### Agent permission handling
 
@@ -196,6 +196,7 @@ It provides:
 - Executor project access as read/write;
 - Reviewer project access as read-only;
 - Golden plan/acceptance files as read-only;
+- a read-only Git metadata mirror of the run's own history (planning baseline through the current phase base) for agent and acceptance commands, never the shared host Git directory or unrelated pre-run history;
 - a private runtime HOME/tmp/config copy instead of exposing the host HOME directly;
 - native Agent CLI state copied into run-private scratch;
 - unrelated host files/directories hidden;

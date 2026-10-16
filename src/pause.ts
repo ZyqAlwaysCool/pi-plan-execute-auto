@@ -49,6 +49,17 @@ export function pauseRepairable(code: PauseCode | undefined): boolean {
   return typeof code === "string" && REPAIRABLE_PAUSE_CODES.has(code);
 }
 
+/**
+ * Round-limit pauses are an operational policy check, not an evidence/safety failure.
+ * When a human-approved settings change raises `review_round_limit` above the rounds a
+ * phase already consumed, an explicit resume may run the remaining rounds. The persisted
+ * `resumable: false` from the original pause keeps recording why the run stopped and is
+ * deliberately overridden by this recomputation.
+ */
+export function roundLimitResumeAllowed(code: PauseCode | undefined, reviewRounds: number, limit: number): boolean {
+  return code === "MAX_REVIEW_ROUNDS" && reviewRounds < limit;
+}
+
 export function isStageBAbortReason(value: unknown): value is StageBAbortReason {
   if (value === null || typeof value !== "object") return false;
   const candidate = value as Partial<StageBAbortReason>;
@@ -124,13 +135,13 @@ export function formatPauseReason(record: PauseRecord): string {
 }
 
 /** "TIMEOUT · Stage B timed out after 30 minutes. (executor, round 2) · resumable" */
-export function formatPauseHeadline(record: PauseRecord): string {
+export function formatPauseHeadline(record: PauseRecord, options?: { resumable?: boolean }): string {
   const where = [
     record.stage !== "unknown" ? record.stage : undefined,
     record.round !== undefined ? `round ${record.round}` : undefined,
   ].filter((value): value is string => value !== undefined).join(", ");
   const headline = `${record.code} · ${record.summary}${where ? ` (${where})` : ""}`;
-  return `${headline} · ${record.resumable ? "resumable" : "needs repair"}`;
+  return `${headline} · ${(options?.resumable ?? record.resumable) ? "resumable" : "needs repair"}`;
 }
 
 /** Bounded diagnostic lines for notifications and escalation summaries. */

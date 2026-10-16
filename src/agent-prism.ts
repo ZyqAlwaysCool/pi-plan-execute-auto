@@ -159,6 +159,11 @@ export interface AgentPrismSessionPairOptions {
   permissionMode?: AgentPermissionMode;
   /** Run root for local diagnostic transcripts; no provider credential material is intentionally recorded. */
   runRoot?: string;
+  /**
+   * Run's planning baseline commit resolver. Evaluated when a sandbox is created so a
+   * fresh run also exposes the baseline after the first phase records it.
+   */
+  historyRootCommit?: () => string | undefined;
   onPermissionChoice?: (
     role: "executor" | "reviewer",
     request: RequestPermissionRequest,
@@ -238,6 +243,7 @@ export class AgentPrismSessionPair implements HarnessPair {
     if (this.executor && this.executorBaseCommit !== phaseBaseCommit) await this.closeExecutorSession();
     if (!this.executor) {
       const model = this.options.executorModel;
+      const historyRootCommit = this.options.historyRootCommit?.();
       const sandboxOptions = {
         role: "executor" as const,
         model: model ?? "",
@@ -246,6 +252,7 @@ export class AgentPrismSessionPair implements HarnessPair {
         goldenRoot: this.options.goldenRoot,
         includeProviderCredentials: true,
         ...(signal ? { signal } : {}),
+        ...(historyRootCommit ? { historyRootCommit } : {}),
       };
       const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
       let agent: AcpAgent | undefined;
@@ -363,6 +370,7 @@ export class AgentPrismSessionPair implements HarnessPair {
     requireAcpNetworkRiskAcknowledgement(this.options.networkRiskApproved);
     const cwd = this.options.reviewerCwd ?? this.options.cwd;
     const model = this.options.reviewerModel;
+    const historyRootCommit = this.options.historyRootCommit?.();
     const sandboxOptions = {
       role: "reviewer" as const,
       model: model ?? "",
@@ -371,6 +379,7 @@ export class AgentPrismSessionPair implements HarnessPair {
       goldenRoot: this.options.goldenRoot,
       includeProviderCredentials: true,
       ...(options?.signal ? { signal: options.signal } : {}),
+      ...(historyRootCommit ? { historyRootCommit } : {}),
     };
     const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
     let reviewer: AcpAgent | undefined;
