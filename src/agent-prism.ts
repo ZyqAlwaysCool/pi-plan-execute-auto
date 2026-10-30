@@ -21,7 +21,8 @@ import {
 } from "./reports.js";
 import { defaultIsolationProvider } from "./isolation-provider.js";
 import type { SandboxedBackend } from "./sandbox.js";
-import { appendAgentSessionEvent, summarizeAgentPrompt, summarizeAgentTurn } from "./run-log.js";
+import { appendAgentSessionEvent, appendRunEvent, summarizeAgentPrompt, summarizeAgentTurn } from "./run-log.js";
+import { configureAcpAgent } from "./acp-configuration.js";
 
 const EXECUTION_SCHEMA = Type.Object({
   phase_id: Type.String({ maxLength: MAX_FINDING_ID_LENGTH }),
@@ -123,23 +124,6 @@ export function requireAcpNetworkRiskAcknowledgement(approvedProjectProfile = fa
   }
 }
 
-async function requireReasoningEffort(agent: AcpAgent, effort: ReasoningEffort): Promise<void> {
-  const option = agent.configOptions.find((entry) =>
-    (entry.id === "reasoning_effort" || entry.category === "thought_level" || entry.id === "variant") &&
-    entry.type === "select" && entry.options.some((choice) =>
-      "value" in choice ? choice.value === effort : choice.options.some((item) => item.value === effort),
-    ),
-  );
-  if (!option) {
-    throw new Error(`ACP backend ${agent.backendId} did not advertise a ${effort} reasoning option for ${agent.model ?? "default model"}.`);
-  }
-  await agent.setConfigOptions({ [option.id]: effort });
-  const selected = agent.configOptions.find((entry) => entry.id === option.id);
-  if (selected?.currentValue !== effort) {
-    throw new Error(`ACP backend ${agent.backendId} did not confirm ${option.id}=${effort} after setting it.`);
-  }
-}
-
 export interface AgentPrismSessionPairOptions {
   cwd: string;
   sourceRoot: string;
@@ -238,58 +222,91 @@ export class AgentPrismSessionPair implements HarnessPair {
     };
   }
 
+  private async setupEvent(type: string, details: Record<string, unknown>): Promise<void> {
+    if (this.options.runRoot) await appendRunEvent(this.options.runRoot, type, details).catch(() => undefined);
+  }
+
+  /** Same initialization for probes and real sessions; only execution sends a prompt. */
+  private async openAgent(
+    role: "executor" | "reviewer",
+    signal: AbortSignal | undefined,
+    purpose: "preflight" | "execution",
+    phaseBaseCommit?: string,
+  ): Promise<{ agent: AcpAgent; sandbox: SandboxedBackend }> {
+    const cwd = role === "reviewer" ? this.options.reviewerCwd ?? this.options.cwd : this.options.cwd;
+    const model = role === "reviewer" ? this.options.reviewerModel : this.options.executorModel;
+    const effort = (role === "reviewer" ? this.options.reviewerReasoningEffort : this.options.executorReasoningEffort)
+      ?? this.options.reasoningEffort;
+    const historyRootCommit = this.options.historyRootCommit?.();
+    const sandboxOptions = {
+      role, model: model ?? "", cwd, sourceRoot: this.options.sourceRoot, goldenRoot: this.options.goldenRoot,
+      includeProviderCredentials: true,
+      ...(signal ? { signal } : {}),
+      ...(historyRootCommit ? { historyRootCommit } : {}),
+    };
+    let sandbox: SandboxedBackend | undefined;
+    let agent: AcpAgent | undefined;
+    let operation = "sandbox creation";
+    try {
+      sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
+      await this.setupEvent("agent_runtime_selected", { role, purpose, model, runtime: sandbox.runtimeInfo });
+      operation = "filesystem boundary verification";
+      await defaultIsolationProvider.verifyBoundary(sandboxOptions);
+      // The verified OS read-only mount enforces Reviewer writes, not the ACP mode label.
+      const mode = role === "reviewer"
+        ? this.options.reviewerMode ?? (sandbox.backendId === "codex" ? "agent-full-access" : undefined)
+        : this.options.executorMode;
+      agent = new AcpAgent({
+        cwd, model: sandbox.backendId,
+        backends: { [sandbox.backendId]: sandbox.config },
+        label: `pi-plan-execute-auto/${role}`,
+        schema: schemaForBackend(role === "reviewer" ? REVIEW_SCHEMA : EXECUTION_SCHEMA, sandbox.backendId),
+        schemaRetries: this.options.schemaRetries ?? 2,
+        permissions: { defaultOutcome: "deny" },
+        ...(signal ? { signal } : {}),
+        onPermissionRequest: this.permissionResolver(role),
+        retainHistory: role === "executor",
+      });
+      await configureAcpAgent(agent, { role, model, mode, effort, runtime: sandbox.runtimeInfo }, (step) => { operation = step; });
+      await sandbox.scrubCredentials();
+      await this.audit("agent_session_started", {
+        role, purpose, session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
+        ...(phaseBaseCommit ? { phase_base_commit: phaseBaseCommit } : {}),
+      });
+      await this.setupEvent("agent_configuration_verified", { role, purpose, model: agent.model, mode, effort, runtime: sandbox.runtimeInfo });
+      return { agent, sandbox };
+    } catch (error) {
+      await this.setupEvent("agent_setup_failed", {
+        role, purpose, operation, model, runtime: sandbox?.runtimeInfo,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await agent?.close({ keep: true }).catch(() => undefined);
+      await sandbox?.cleanup();
+      throw error;
+    }
+  }
+
+  /** Check BOTH roles on every start/resume, before any expensive Executor turn. No provider turn. */
+  async preflight(options?: { signal?: AbortSignal | undefined }): Promise<void> {
+    requireAcpNetworkRiskAcknowledgement(this.options.networkRiskApproved);
+    for (const role of ["reviewer", "executor"] as const) {
+      // Bound each probe even when the human selected an unlimited whole-run budget.
+      const timeout = AbortSignal.timeout(90_000);
+      const signal = options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+      const { agent, sandbox } = await this.openAgent(role, signal, "preflight");
+      try { await agent.close({ keep: false }); }
+      finally { await sandbox.cleanup(); }
+    }
+  }
+
   private async getExecutor(signal: AbortSignal | undefined, phaseBaseCommit: string): Promise<AcpAgent> {
     requireAcpNetworkRiskAcknowledgement(this.options.networkRiskApproved);
     if (this.executor && this.executorBaseCommit !== phaseBaseCommit) await this.closeExecutorSession();
     if (!this.executor) {
-      const model = this.options.executorModel;
-      const historyRootCommit = this.options.historyRootCommit?.();
-      const sandboxOptions = {
-        role: "executor" as const,
-        model: model ?? "",
-        cwd: this.options.cwd,
-        sourceRoot: this.options.sourceRoot,
-        goldenRoot: this.options.goldenRoot,
-        includeProviderCredentials: true,
-        ...(signal ? { signal } : {}),
-        ...(historyRootCommit ? { historyRootCommit } : {}),
-      };
-      const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
-      let agent: AcpAgent | undefined;
-      try {
-        await defaultIsolationProvider.verifyBoundary(sandboxOptions);
-        agent = new AcpAgent({
-          cwd: this.options.cwd,
-          ...(model ? { model } : {}),
-          ...(this.options.executorMode ? { mode: this.options.executorMode } : {}),
-          backends: { [sandbox.backendId]: sandbox.config },
-          label: "pi-plan-execute-auto/executor",
-          schema: schemaForBackend(EXECUTION_SCHEMA, sandbox.backendId),
-          schemaRetries: this.options.schemaRetries ?? 2,
-          permissions: { defaultOutcome: "deny" },
-          ...(signal ? { signal } : {}),
-          onPermissionRequest: this.permissionResolver("executor"),
-          retainHistory: true,
-        });
-        await agent.ready();
-        const effort = this.options.executorReasoningEffort ?? this.options.reasoningEffort;
-        if (effort) await requireReasoningEffort(agent, effort);
-        if (this.options.executorMode && agent.modes?.currentModeId !== this.options.executorMode) {
-          throw new Error(`Executor backend ${agent.backendId} did not enter the required ${this.options.executorMode} mode.`);
-        }
-        await sandbox.scrubCredentials();
-        await this.audit("agent_session_started", {
-          role: "executor", session_id: agent.sessionId, backend: agent.backendId, model: agent.model,
-          phase_base_commit: phaseBaseCommit,
-        });
-        this.executor = agent;
-        this.executorSandbox = sandbox;
-        this.executorBaseCommit = phaseBaseCommit;
-      } catch (error) {
-        await agent?.close({ keep: true }).catch(() => undefined);
-        await sandbox.cleanup();
-        throw error;
-      }
+      const { agent, sandbox } = await this.openAgent("executor", signal, "execution", phaseBaseCommit);
+      this.executor = agent;
+      this.executorSandbox = sandbox;
+      this.executorBaseCommit = phaseBaseCommit;
     }
     return this.executor;
   }
@@ -368,56 +385,9 @@ export class AgentPrismSessionPair implements HarnessPair {
 
   async review(prompt: string, _round: number, options?: { signal?: AbortSignal }): Promise<ReviewReport> {
     requireAcpNetworkRiskAcknowledgement(this.options.networkRiskApproved);
-    const cwd = this.options.reviewerCwd ?? this.options.cwd;
-    const model = this.options.reviewerModel;
-    const historyRootCommit = this.options.historyRootCommit?.();
-    const sandboxOptions = {
-      role: "reviewer" as const,
-      model: model ?? "",
-      cwd,
-      sourceRoot: this.options.sourceRoot,
-      goldenRoot: this.options.goldenRoot,
-      includeProviderCredentials: true,
-      ...(options?.signal ? { signal: options.signal } : {}),
-      ...(historyRootCommit ? { historyRootCommit } : {}),
-    };
-    const sandbox = await defaultIsolationProvider.createBackend(sandboxOptions);
-    let reviewer: AcpAgent | undefined;
-    this.reviewer = undefined;
+    const { agent: reviewer, sandbox } = await this.openAgent("reviewer", options?.signal, "execution");
+    this.reviewer = reviewer;
     try {
-      await defaultIsolationProvider.verifyBoundary(sandboxOptions);
-      // codex-acp's "read-only" mode actually requests workspaceWrite and runs a
-      // second bubblewrap that must mkdir .agents under the OS-read-only worktree.
-      // That inner sandbox fails before even read-only Git commands can run. Use
-      // the adapter's no-inner-sandbox mode ONLY after verifying our own trusted
-      // bubblewrap read-only mount; ACP permissions are never the write boundary.
-      const reviewerMode = this.options.reviewerMode ?? (sandbox.backendId === "codex" ? "agent-full-access" : undefined);
-      reviewer = new AcpAgent({
-        cwd,
-        ...(model ? { model } : {}),
-        ...(reviewerMode ? { mode: reviewerMode } : {}),
-        backends: { [sandbox.backendId]: sandbox.config },
-        label: "pi-plan-execute-auto/reviewer",
-        schema: schemaForBackend(REVIEW_SCHEMA, sandbox.backendId),
-        schemaRetries: this.options.schemaRetries ?? 2,
-        // The OS read-only mount is the security boundary; each permission request
-        // receives only a one-shot grant, never a persistent allow_always grant.
-        permissions: { defaultOutcome: "deny" },
-        ...(options?.signal ? { signal: options.signal } : {}),
-        onPermissionRequest: this.permissionResolver("reviewer"),
-        retainHistory: false,
-      });
-      this.reviewer = reviewer;
-      await reviewer.ready();
-      const effort = this.options.reviewerReasoningEffort ?? this.options.reasoningEffort;
-      if (effort) await requireReasoningEffort(reviewer, effort);
-      if (reviewerMode && reviewer.modes?.currentModeId !== reviewerMode) {
-        throw new Error(`Reviewer backend ${reviewer.backendId} did not enter the configured ${reviewerMode} mode.`);
-      }
-      await sandbox.scrubCredentials();
-      await this.audit("agent_session_started", {
-        role: "reviewer", session_id: reviewer.sessionId, backend: reviewer.backendId, model: reviewer.model,
-      });
       const turn = await this.streamPrompt(reviewer, "reviewer", prompt, options);
       const value = parseTurn(turn);
       if (value === undefined) throw invalidStructuredTurn("reviewer", turn);

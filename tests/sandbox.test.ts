@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createSandboxedBackend, findBubblewrap, prepareReadOnlyGitMirror, resolveHostCodexRuntime, runSandboxedCommand, stageSelectedOpenCodeProviderConfig, validateBubblewrapBinary, verifySandboxBoundary } from "../src/sandbox.js";
+import { createSandboxedBackend, findBubblewrap, prepareReadOnlyGitMirror, codexPathCandidates, resolveHostCodexRuntime, runSandboxedCommand, stageSelectedOpenCodeProviderConfig, validateBubblewrapBinary, verifySandboxBoundary } from "../src/sandbox.js";
 import { codexPlatformPackage, writeFakeCodexInstall } from "./fixtures/fake-codex.js";
 
 const execFile = promisify(execFileCallback);
@@ -156,6 +156,20 @@ test("host Codex resolution prefers the native app-server of an npm install", {
   }
 });
 
+test("duplicate Codex installs are reported in PATH order without selecting the newest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peac-codex-path-"));
+  try {
+    const old = await writeFakeCodexInstall(join(root, "old"));
+    const newer = await writeFakeCodexInstall(join(root, "new"));
+    const path = `${old.pathDir}:${newer.pathDir}:${old.pathDir}`;
+    assert.equal(resolveHostCodexRuntime(path)?.binary, old.binary);
+    const candidates = codexPathCandidates(path);
+    assert.equal(candidates.length, 2);
+    assert.ok(candidates[0]?.includes("/old/"));
+    assert.ok(candidates[1]?.includes("/new/"));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("host Codex resolution ignores a missing CLI and supports standalone executables", async () => {
   const root = await mkdtemp(join(tmpdir(), "peac-host-codex-unit-"));
   try {
@@ -242,6 +256,10 @@ test("Codex sessions prefer a trusted host CLI over the bundled ACP runtime", {
     const envIndex = args.findIndex((value, index) => value === "--setenv" && args[index + 1] === "CODEX_PATH");
     assert.ok(envIndex >= 0, "CODEX_PATH must select the isolated host runtime");
     assert.equal(args[envIndex + 2], "/agent-runtime/codex-vendor/bin/codex");
+    assert.equal(sandbox.runtimeInfo?.cli_source, "host");
+    assert.equal(sandbox.runtimeInfo?.cli_path, install.binary);
+    assert.equal(sandbox.runtimeInfo?.cli_version, "codex-cli 0.0.0");
+    assert.ok(sandbox.runtimeInfo?.path_candidates[0]?.endsWith("/bin/codex.js"));
     // Prove the mounted app-server actually executes inside the sandbox boundary.
     const separator = args.indexOf("--");
     assert.ok(separator > 0);
@@ -287,6 +305,7 @@ test("Codex sessions support a standalone host CLI executable", {
     const separator = args.indexOf("--");
     const probe = await execFile(findBubblewrap(), [...args.slice(0, separator), "--", "/agent-runtime/codex-host", "standalone"], { timeout: 15_000, maxBuffer: 256 * 1024 });
     assert.match(probe.stdout, /native-codex:standalone/);
+    assert.equal(sandbox.runtimeInfo?.cli_version, "unknown", "arbitrary --version output must not become metadata");
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
@@ -315,6 +334,8 @@ test("Codex ignores an untrusted host CLI and keeps the bundled ACP runtime", {
         const args = sandbox.config.args ?? [];
         assert.equal(args.some((value, index) => value === "--setenv" && args[index + 1] === "CODEX_PATH"), false);
         assert.equal(args.includes("/agent-runtime/codex-vendor"), false);
+        assert.equal(sandbox.runtimeInfo?.cli_source, "bundled");
+        assert.match(sandbox.runtimeInfo?.fallback_reason ?? "", /Host Codex was rejected/);
       } finally {
         await sandbox.cleanup();
       }

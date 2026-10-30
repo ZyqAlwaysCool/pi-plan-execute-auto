@@ -864,10 +864,10 @@ export class StageBController {
           return this.pause(phase, this.abortPause("executor", "Execution & Review was cancelled during Executor execution."));
         }
         if (error instanceof WorkflowPauseError) throw error;
-        throw new WorkflowPauseError(
-          "HARNESS_ERROR",
-          `Executor harness failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        return this.pause(phase, {
+          code: "HARNESS_ERROR", stage: "executor",
+          summary: `Executor harness failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
       freshResumeTurn = false;
       await this.assertNoHistoryOrIndexMutation(beforeExecutorHistory, "Executor");
@@ -941,10 +941,10 @@ export class StageBController {
           return this.pause(phase, this.abortPause("reviewer", "Execution & Review was cancelled during Reviewer execution."));
         }
         if (error instanceof WorkflowPauseError) throw error;
-        throw new WorkflowPauseError(
-          "HARNESS_ERROR",
-          `Reviewer harness failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        return this.pause(phase, {
+          code: "HARNESS_ERROR", stage: "reviewer",
+          summary: `Reviewer harness failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
       await this.assertReportHashes(beforeReviewReports, "Reviewer");
       const persistedReviewDiff = await readFile(reviewDiffAbsolute);
@@ -1156,6 +1156,33 @@ export class StageBController {
       await this.save();
       if (this.options.requireDedicatedWorktree !== false) await this.options.git.assertDedicatedIdentity();
       await this.assertPackageUnchanged();
+      currentPhase = this.options.package.phases.find((phase) => this.phaseState(phase).status !== "completed");
+      if (currentPhase && this.options.harness.preflight) {
+        this.emit({
+          phase_id: currentPhase.phase.id, round: this.phaseState(currentPhase).review_rounds + 1,
+          executor_status: "pending", reviewer_status: "pending",
+          message: "Checking both Agent CLI runtimes and exact model/mode/reasoning configuration (no model turn).",
+          plan: this.planSnapshot(),
+        });
+        const before = await this.options.git.snapshot(this.gitOptions());
+        let failure: unknown;
+        try { await this.options.harness.preflight({ signal: this.options.signal }); }
+        catch (error) { failure = error; }
+        const after = await this.options.git.snapshot(this.gitOptions());
+        await this.assertNoHistoryOrIndexMutation(before, "Agent configuration preflight");
+        if (!deliverableSnapshotsEqual(before, after)) {
+          throw new WorkflowPauseError("PREFLIGHT_CHANGED_WORKSPACE", "Agent configuration preflight changed project deliverables; no reset was attempted.");
+        }
+        await this.assertPackageUnchanged();
+        if (failure !== undefined) {
+          if (this.options.signal?.aborted) return this.pause(currentPhase, this.abortPause("preflight", "Execution & Review was cancelled during Agent configuration preflight."));
+          return this.pause(currentPhase, {
+            code: "HARNESS_ERROR", stage: "preflight",
+            summary: `Agent configuration preflight failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+            detail: "No Executor turn, acceptance command, or new review round was started. Fix the reported runtime/configuration and explicitly resume.",
+          });
+        }
+      }
       for (const phase of this.options.package.phases) {
         currentPhase = phase;
         const result = await this.phase(phase);

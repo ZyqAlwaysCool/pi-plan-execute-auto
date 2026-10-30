@@ -78,6 +78,8 @@ export interface SandboxedBackend {
   backendId: SupportedAcpBackend;
   config: CustomBackendConfig;
   scratchPath: string;
+  /** Diagnostic identity of the Codex runtime actually mounted, never an arbitrary shell CLI. */
+  runtimeInfo?: CodexRuntimeInfo;
   scrubCredentials(): Promise<void>;
   cleanup(): Promise<void>;
 }
@@ -90,6 +92,8 @@ interface BackendRuntime {
   extraBinary?: { source: string; target: string };
   nodeModulesRoot?: string;
   useNodeEnvProxy?: boolean;
+  runtimeInfo?: CodexRuntimeInfo;
+  codexFallbackReason?: string;
   /** Extra sandbox environment entries; runtime paths are mapped back to host paths on macOS. */
   env?: Array<[string, string]>;
 }
@@ -467,6 +471,23 @@ const CODEX_PLATFORM_PACKAGES: Record<string, string> = {
   "darwin:x64": "@openai/codex-darwin-x64",
   "darwin:arm64": "@openai/codex-darwin-arm64",
 };
+
+export interface CodexRuntimeInfo {
+  adapter_path: string;
+  adapter_version: string;
+  cli_source: "host" | "bundled";
+  cli_path: string;
+  cli_version: string;
+  path_candidates: string[];
+  fallback_reason?: string;
+}
+
+/** Keep PATH priority; report duplicates instead of silently choosing a newer CLI. */
+export function codexPathCandidates(pathValue = process.env.PATH ?? ""): string[] {
+  return [...new Set(pathValue.split(":").filter(Boolean)
+    .map((directory) => tryFindExecutable("codex", directory))
+    .filter((entry): entry is string => entry !== undefined))];
+}
 
 export interface HostCodexRuntime {
   /** Native Codex executable on the host. */
@@ -1426,23 +1447,58 @@ interface PreparedSandboxRuntime {
  * A rejected host binary is a preference failure, not a run failure: the pinned
  * bundled runtime still provides a contained session.
  */
-function withHostCodexRuntime(runtime: BackendRuntime, roots: readonly string[]): BackendRuntime | undefined {
+function withHostCodexRuntime(runtime: BackendRuntime, roots: readonly string[]): BackendRuntime {
   try {
     const host = resolveHostCodexRuntime();
-    if (!host) return undefined;
+    if (!host) return { ...runtime, codexFallbackReason: "No supported host Codex install resolved from the Pi process PATH." };
     const binary = assertTrustedExternalAgentBinary(host.binary, roots);
     const source = host.mountAsDirectory
       ? assertTrustedExternalAgentRuntimeTree(host.mountSource, roots)
       : binary;
-    if (host.mountAsDirectory && !isWithin(source, binary)) return undefined;
+    if (host.mountAsDirectory && !isWithin(source, binary)) throw new Error("Codex binary escapes its vendor tree.");
     return {
       ...runtime,
       extraBinary: { source, target: host.mountAsDirectory ? RUNTIME_CODEX_VENDOR : RUNTIME_CODEX_HOST },
       env: [["CODEX_PATH", host.sandboxExecutable]],
     };
-  } catch {
-    return undefined;
+  } catch (error) {
+    return { ...runtime, codexFallbackReason: `Host Codex was rejected by runtime provenance validation: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+async function codexRuntimeInfo(runtime: BackendRuntime): Promise<CodexRuntimeInfo> {
+  const adapterPath = realpathSync(require.resolve(RUNTIME_CODEX_ACP));
+  const adapterRequire = createRequire(adapterPath);
+  const versionOf = async (path: string): Promise<string> => {
+    try {
+      const version: unknown = JSON.parse(await readFile(path, "utf8")).version;
+      return typeof version === "string" && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$/.test(version) ? version : "unknown";
+    } catch { return "unknown"; }
+  };
+  const cliPath = runtime.extraBinary
+    ? join(runtime.extraBinary.source, ...(runtime.extraBinary.target === RUNTIME_CODEX_VENDOR ? ["bin", "codex"] : []))
+    : adapterRequire.resolve("@openai/codex/bin/codex.js");
+  // Native --version is probed only AFTER sandbox construction, inside the same OS boundary.
+  // A user-owned standalone CLI must not gain host execution just for diagnostics.
+  const cliVersion = runtime.extraBinary ? "unknown" : await versionOf(join(dirname(dirname(cliPath)), "package.json"));
+  return {
+    adapter_path: adapterPath,
+    adapter_version: await versionOf(join(dirname(dirname(adapterPath)), "package.json")),
+    cli_source: runtime.extraBinary ? "host" : "bundled",
+    cli_path: cliPath,
+    cli_version: cliVersion,
+    path_candidates: codexPathCandidates().slice(0, 20),
+    ...(runtime.codexFallbackReason ? { fallback_reason: runtime.codexFallbackReason } : {}),
+  };
+}
+
+async function captureCodexVersion(info: CodexRuntimeInfo | undefined, command: string, args: string[]): Promise<void> {
+  if (info?.cli_source !== "host") return;
+  try {
+    const output = (await execFile(command, args, { timeout: 5_000, maxBuffer: 4096 })).stdout.trim();
+    // Do not turn arbitrary CLI output (potentially containing auth data) into diagnostic metadata.
+    info.cli_version = /^codex(?:-cli)?\s+\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$/.test(output) ? output : "unknown";
+  } catch { /* Diagnostics must not change runtime selection or bypass the OS boundary. */ }
 }
 
 async function prepareSandboxRuntime(
@@ -1465,7 +1521,8 @@ async function prepareSandboxRuntime(
     runtime = { ...runtime, extraBinary: { ...runtime.extraBinary, source: stagedBinary } };
   }
   if (backendId === "codex") {
-    runtime = withHostCodexRuntime(runtime, [cwd, sourceRoot, goldenRoot]) ?? runtime;
+    runtime = withHostCodexRuntime(runtime, [cwd, sourceRoot, goldenRoot]);
+    runtime.runtimeInfo = await codexRuntimeInfo(runtime);
   }
   if (options.includeProviderCredentials && nativeStateCount === 0) {
     if (backendId === "pi") {
@@ -1511,6 +1568,8 @@ async function createMacOSSandboxedBackend(options: SandboxOptions): Promise<San
     const hostRuntime = macHostRuntime(runtime);
     const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
     const environment = macSandboxEnvironment(normalized, scratchPath, runtime, backendId);
+    if (runtime.runtimeInfo) await captureCodexVersion(runtime.runtimeInfo, sandboxExec,
+      macSandboxExecArgs(profilePath, environment, cwd, runtime.runtimeInfo.cli_path, ["--version"]));
     const config: CustomBackendConfig = {
       command: sandboxExec,
       args: macSandboxExecArgs(profilePath, environment, cwd, hostRuntime.command, hostRuntime.args),
@@ -1521,6 +1580,7 @@ async function createMacOSSandboxedBackend(options: SandboxOptions): Promise<San
       backendId,
       config,
       scratchPath,
+      ...(runtime.runtimeInfo ? { runtimeInfo: runtime.runtimeInfo } : {}),
       async scrubCredentials() {
         await Promise.all(credentials.map((path) => rm(path, { force: true })));
         credentials.length = 0;
@@ -1567,6 +1627,8 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
       runtime,
       backendId,
     );
+    const codexPath = runtime.env?.find(([key]) => key === "CODEX_PATH")?.[1];
+    if (codexPath) await captureCodexVersion(runtime.runtimeInfo, bwrap, [...commandArgs, "--", codexPath, "--version"]);
     const config: CustomBackendConfig = {
       command: bwrap,
       args: [...commandArgs, "--", runtime.command, ...runtime.args],
@@ -1579,6 +1641,7 @@ export async function createSandboxedBackend(options: SandboxOptions): Promise<S
       backendId,
       config,
       scratchPath,
+      ...(runtime.runtimeInfo ? { runtimeInfo: runtime.runtimeInfo } : {}),
       async scrubCredentials() {
         await Promise.all(credentials.map((path) => rm(path, { force: true })));
         credentials.length = 0;

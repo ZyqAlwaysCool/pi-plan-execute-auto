@@ -9,6 +9,7 @@ import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { AcpAgent } from "@automatalabs/workflows";
 import { createSandboxedBackend, supportedBackendForModel, verifySandboxBoundary } from "./sandbox.js";
+import { configureAcpAgent } from "./acp-configuration.js";
 import { DEFAULT_MAX_REVIEW_ROUNDS, isValidStageTimeoutMs, type AgentPermissionMode, type ReasoningEffort } from "./types.js";
 
 const execFile = promisify(execFileCallback);
@@ -218,11 +219,14 @@ export async function probeAcpConfiguration(
     await verifySandboxBoundary(options);
     // A backend-only route selects the ACP server without guessing a model ID.
     agent = new AcpAgent({
-      cwd, model: selectedModel ?? backend,
-      ...(backend === "codex" ? { mode: "read-only" } : backend === "pi" ? {} : { mode: "plan" }),
+      cwd, model: backend,
       backends: { [backend]: sandbox.config }, permissions: { defaultOutcome: "deny" },
     });
-    await agent.ready();
+    await configureAcpAgent(agent, {
+      role: "catalog", model: selectedModel,
+      mode: backend === "codex" ? "read-only" : backend === "pi" ? undefined : "plan",
+      effort: connectivityCheck?.reasoningEffort, runtime: sandbox.runtimeInfo,
+    });
     const model = agent.configOptions.find((entry) => entry.id === "model" && entry.type === "select");
     const ids = new Set<string>();
     if (model?.type === "select") {
@@ -242,17 +246,6 @@ export async function probeAcpConfiguration(
         for (const leaf of leaves) {
           if (leaf.value === "low" || leaf.value === "medium" || leaf.value === "high" || leaf.value === "max") efforts.add(leaf.value);
         }
-      }
-    }
-    if (connectivityCheck?.reasoningEffort) {
-      const effort = connectivityCheck.reasoningEffort;
-      const option = agent.configOptions.find((entry) => entry.type === "select" &&
-        (entry.id === "reasoning_effort" || entry.category === "thought_level" || entry.id === "variant") &&
-        entry.options.some((choice) => "value" in choice ? choice.value === effort : choice.options.some((item) => item.value === effort)));
-      if (!option) throw new Error(`${backend} ACP did not advertise ${effort} reasoning for ${selectedModel}.`);
-      await agent.setConfigOptions({ [option.id]: effort });
-      if (agent.configOptions.find((entry) => entry.id === option.id)?.currentValue !== effort) {
-        throw new Error(`${backend} ACP did not confirm ${effort} reasoning for ${selectedModel}.`);
       }
     }
     await sandbox.scrubCredentials();

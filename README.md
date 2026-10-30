@@ -34,6 +34,8 @@ For every phase:
 6. On Reviewer `PASS`, the plugin reruns final acceptance and creates exactly one validated phase commit.
 7. The next phase starts with a **new Executor session**.
 
+Before any Executor turn on **every start/resume**, the plugin opens disposable sessions for **both roles**, verifies the OS boundary and exact advertised model/mode/reasoning configuration, then closes them without sending a prompt. This uses normal CLI networking/authentication but makes no model turn. A bounded configuration failure pauses at `stage: preflight` without consuming another review round or rerunning expensive acceptance. Preflight also checks that CLI initialization did not change project deliverables or Git history. Actual sessions repeat the same checks because runtime/catalog/auth state can change after preflight.
+
 The process continues until all phases have development, self-test, independent review, final acceptance, and a phase commit.
 
 Only integrity/execution failures that genuinely require human attention are persisted as `paused`—for example package/evidence tampering, worktree identity mismatch, broken completion evidence, or an execution process restart that would violate the same-session invariant. Ordinary start prerequisites remain retryable with `/plan-execute start <run-id>`.
@@ -97,7 +99,7 @@ plan/...
   completions/...
 ```
 
-Diagnostics are intentionally layered rather than capturing every ACP event. `.runtime/events.jsonl` is a **compact workflow timeline** only: plan revisions/review choices, approval, phase/round transitions, start blockers, and pause/completion state. Agent internals do not duplicate into that global file.
+Diagnostics are intentionally layered rather than capturing every ACP event. `.runtime/events.jsonl` is a **compact workflow timeline** only: plan revisions/review choices, approval, phase/round transitions, start blockers, and pause/completion state. Low-frequency initialization events (`agent_runtime_selected`, `agent_configuration_verified`, `agent_setup_failed`) record role, purpose (`preflight` or `execution`), configuration operation, and the actual Codex executable/version/adapter. These events exist even when initialization fails before a session ID or prompt. High-frequency agent internals do not duplicate into that global file.
 
 `.runtime/main-pi-session.json` is also diagnostic rather than authoritative evidence. It stores only a bounded recent snapshot of the Main Pi branch (at most 120 compacted entries and 512 KiB), with source/retained entry counts and a truncation flag. Large strings, nested collections, and older entries are deliberately omitted instead of mirroring the entire conversation.
 
@@ -121,6 +123,10 @@ Executor and Reviewer are real independent ACP/CLI processes, not Main Pi subage
 For example, `claude/sonnet` means “use the Claude CLI and select its `sonnet` slot”. If the user's Claude configuration maps that slot to another gateway model, that native mapping remains valid.
 
 For Codex, the isolated session runs the host `codex` CLI's native app-server when a trusted install is found on `PATH`. The model catalog — including account-gated models — therefore matches the CLI you use interactively, and the setup "codex model" list is built from that catalog. The plugin mounts the resolved platform vendor tree read-only so Codex keeps its own bundled tools (for example `rg`). If the host CLI is missing, or its runtime tree fails provenance validation (for example a `codex` installed inside the sandboxed project tree), the isolated session keeps the Codex app-server bundled with the pinned ACP adapter instead. A `CODEX_PATH` value from your shell is never forwarded into the sandbox; when a host CLI is used, the plugin sets `CODEX_PATH` to its own verified read-only mount.
+
+The authoritative `PATH` is the **running Pi process's environment**, which can differ from a newly opened terminal (for example an old npm global prefix ahead of NVM). The plugin preserves PATH priority; it never silently selects the newest installation or substitutes another model. Diagnostics include the exact mounted CLI path and version, host/bundled selection and fallback reason, ACP adapter version, and deduplicated PATH candidates. To fix a stale first installation, update/remove it or correct PATH and restart Pi.
+
+Model selection is validated against the runtime's ACP **model config-option catalog**, not guessed from version numbers or legacy model+effort IDs. An unavailable model is rejected before sending the selection RPC, with the requested ID, available IDs, CLI identity and PATH advice. Backend errors retain the failing configuration operation rather than just `Invalid params`. The same validation is used by setup catalog/health checks, start/resume preflight, and actual execution.
 
 The plugin does **not** disable Claude Agent/Task/WebSearch/WebFetch and does not force Claude Code's native Bash sandbox. It therefore does **not** require `socat` by itself. If your own Claude Code configuration enables its native Bash sandbox (for example `sandbox.enabled: true` or `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`), Claude Code may require `socat` on Linux/WSL; setup detects this condition and explains that it is a Claude Code dependency rather than a plugin dependency.
 
@@ -305,7 +311,19 @@ npm run test:sandbox:macos:required
 
 GitHub Actions runs both OS-specific sandbox gates on their native hosts.
 
-Real provider validation is intentionally separate because it can incur charges:
+The real configuration-only gate opens both native roles and checks an unavailable-model failure, without sending a model prompt. It requires explicit network consent, disposable fixture directories and your normal CLI authentication:
+
+```bash
+PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK=1 \
+PI_PLAN_EXECUTE_ACP_TEST_EXECUTOR_MODEL=pi/<provider>/<model> \
+PI_PLAN_EXECUTE_ACP_TEST_REVIEWER_MODEL=codex/<model> \
+PI_PLAN_EXECUTE_ACP_TEST_PATH="$PATH" \
+npm run test:acp:preflight:required
+```
+
+`PI_PLAN_EXECUTE_ACP_TEST_PATH` is a test-only override to retain the caller's PATH: `npm run` otherwise prepends `node_modules/.bin`, which can itself contain an older transitive Codex install. Production runtime selection never rewrites PATH.
+
+Real provider **turn** validation is intentionally separate because it can incur charges:
 
 ```bash
 # OpenCode Executor + Codex Reviewer

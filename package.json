@@ -1,6 +1,6 @@
 {
   "name": "pi-plan-execute-auto",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Plan-and-execute workflow for Pi coding agent: human-approved phased plans, isolated per-phase execution, independent Executor and Reviewer agent CLI sessions, deterministic acceptance, rework loops, one validated git commit per phase, and resumable pause/stop.",
   "type": "module",
   "license": "MIT",
@@ -42,6 +42,7 @@
     "test:sandbox:required": "PI_PLAN_EXECUTE_REQUIRE_BWRAP_TESTS=1 tsx --test tests/sandbox.test.ts",
     "test:sandbox:macos:required": "PI_PLAN_EXECUTE_REQUIRE_MACOS_SANDBOX_TESTS=1 tsx --test tests/macos-sandbox.test.ts",
     "test:acp:required": "tsx --test tests/real-acp.integration.ts",
+    "test:acp:preflight:required": "tsx --test tests/real-acp.preflight.integration.ts",
     "test:acp:builtins:required": "tsx --test tests/real-acp.builtins.integration.ts",
     "test:acp:claude:required": "PI_PLAN_EXECUTE_ACP_TEST_BUILTINS=claude tsx --test tests/real-acp.builtins.integration.ts",
     "test:acp:pi:required": "PI_PLAN_EXECUTE_ACP_TEST_BUILTINS=pi tsx --test tests/real-acp.builtins.integration.ts",

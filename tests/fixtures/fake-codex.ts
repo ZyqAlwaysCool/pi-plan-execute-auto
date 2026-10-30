@@ -44,7 +44,7 @@ export async function writeFakeCodexInstall(root: string): Promise<FakeCodexInst
   const vendorRoot = join(platformRoot, "vendor", triple);
   const binary = join(vendorRoot, "bin", "codex");
   await mkdir(join(vendorRoot, "bin"), { recursive: true });
-  await writeFile(binary, "#!/bin/sh\nprintf 'fake-codex:%s\\n' \"$1\"\n");
+  await writeFile(binary, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.0.0\\n'; else printf 'fake-codex:%s\\n' \"$1\"; fi\n");
   await chmod(binary, 0o755);
   await mkdir(join(vendorRoot, "codex-path"), { recursive: true });
   await writeFile(join(vendorRoot, "codex-path", "rg"), "#!/bin/sh\nexit 0\n");

@@ -335,6 +335,8 @@ export interface AcceptanceCommandRunner {
 }
 
 export interface HarnessPair {
+  /** Open/configure both roles without sending a model turn. Called on every start/resume. */
+  preflight?(options?: { signal?: AbortSignal | undefined }): Promise<void>;
   execute(
     prompt: string,
     round: number,

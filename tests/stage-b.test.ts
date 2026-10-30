@@ -2013,3 +2013,79 @@ test("an identical acceptance failure pauses instead of consuming the remaining 
     await rm(setup.cwd, { recursive: true, force: true });
   }
 });
+
+test("Reviewer configuration is checked before Executor/acceptance and does not consume a round", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = Object.assign(new FakeHarness(setup.cwd, base), {
+      async preflight() { throw new Error("reviewer: model unavailable in Codex 0.147.0"); },
+    });
+    let acceptanceCalls = 0;
+    const result = await runController(setup, harness, 40, {
+      acceptanceRunner: { async run() { acceptanceCalls += 1; return { stdout: "", stderr: "", code: 0 }; } },
+    });
+    assert.equal(result.state.pause?.code, "HARNESS_ERROR");
+    assert.equal(result.state.pause?.stage, "preflight");
+    assert.equal(result.state.pause?.resumable, true);
+    assert.match(result.reason ?? "", /Codex 0\.147\.0/);
+    assert.equal(result.state.phases[0]?.review_rounds, 0);
+    assert.equal(harness.executeCalls + harness.reworkCalls + harness.reviewCalls, 0);
+    assert.equal(acceptanceCalls, 0);
+  } finally { await rm(setup.cwd, { recursive: true, force: true }); }
+});
+
+test("explicit resume rechecks both runtimes; a fixed preflight continues without hidden rounds", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    let fixed = false;
+    let checks = 0;
+    const harness = Object.assign(new FakeHarness(setup.cwd, base), {
+      async preflight() { checks += 1; if (!fixed) throw new Error("Invalid model catalog"); },
+    });
+    harness.rework = async (_prompt: string, round = 1) => {
+      await writeFile(join(setup.cwd, "src/change.txt"), "done\n");
+      return { ...execution(base), round };
+    };
+    const first = await runController(setup, harness);
+    assert.equal(first.state.phases[0]?.review_rounds, 0);
+    fixed = true;
+    const result = await new StageBController({
+      package: setup.pkg, state: first.state,
+      git: new GitWorkspace({ run: (args) => git(setup.cwd, args) }, { cwd: setup.cwd, runtimeRoot: ".pi-plan-execute-auto/stage-b-test" }),
+      harness, acceptanceRunner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+      resumePaused: true, requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+    assert.equal(checks, 2);
+    assert.equal(result.status, "completed", result.reason);
+    assert.equal(result.state.phases[0]?.review_rounds, 1);
+  } finally { await rm(setup.cwd, { recursive: true, force: true }); }
+});
+
+test("configuration preflight cannot mutate project deliverables", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = Object.assign(new FakeHarness(setup.cwd, base), {
+      async preflight() { await writeFile(join(setup.cwd, "src/existing.txt"), "unexpected mutation\n"); },
+    });
+    const result = await runController(setup, harness);
+    assert.equal(result.state.pause?.code, "PREFLIGHT_CHANGED_WORKSPACE");
+    assert.equal(result.state.phases[0]?.review_rounds, 0);
+    assert.equal(harness.executeCalls, 0);
+  } finally { await rm(setup.cwd, { recursive: true, force: true }); }
+});
+
+test("actual Reviewer harness errors retain the reviewer stage instead of unknown", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = new FakeHarness(setup.cwd, base);
+    harness.review = async () => { throw new Error("Invalid params at model selection"); };
+    const result = await runController(setup, harness);
+    assert.equal(result.state.pause?.stage, "reviewer");
+    assert.equal(result.state.pause?.code, "HARNESS_ERROR");
+  } finally { await rm(setup.cwd, { recursive: true, force: true }); }
+});
