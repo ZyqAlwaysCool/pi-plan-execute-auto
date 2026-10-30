@@ -11,6 +11,10 @@ import planExecuteAuto, {
   budgetWarningEvent,
   acceptanceRepeatLimit,
   buildFinalizePrompt,
+  chooseReviewRoundLimit,
+  formatReviewRoundLimitLabel,
+  isValidReviewRoundLimit,
+  parseReviewRoundLimit,
   evaluateResumeEligibility,
   frozenProfileMismatch,
   linkedAbortSignal,
@@ -569,4 +573,92 @@ test("plan_execute_finalize cannot accept a model-supplied run_id", () => {
   assert.equal(Object.prototype.hasOwnProperty.call(schema.properties ?? {}, "run_id"), false);
   assert.equal(schema.additionalProperties, false);
   assert.match((finalizeTool.promptGuidelines ?? []).join("\n"), /plugin exclusively allocates the execution identity/u);
+});
+
+function fakeUiContext(answers: { select?: Array<string | undefined>; input?: Array<string | undefined> }) {
+  const selectQueue = [...(answers.select ?? [])];
+  const inputQueue = [...(answers.input ?? [])];
+  const notices: Array<{ message: string; level?: string | undefined }> = [];
+  const prompts: string[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      select: async (title: string) => {
+        prompts.push(title);
+        return selectQueue.shift();
+      },
+      input: async (title: string) => {
+        prompts.push(title);
+        return inputQueue.shift();
+      },
+      notify: (message: string, level?: string) => {
+        notices.push({ message, level });
+      },
+    },
+  };
+  return { ctx: ctx as unknown as Parameters<typeof chooseReviewRoundLimit>[0], notices, prompts };
+}
+
+test("review round limits accept any whole number in 1..100", () => {
+  for (const good of [1, 2, 37, 99, 100, "1", "37", " 100 "]) {
+    assert.equal(parseReviewRoundLimit(good), typeof good === "string" ? Number(good.trim()) : good, String(good));
+  }
+  for (const bad of [0, -1, 101, 1000, 1.5, "0", "101", "1.5", "abc", "", "  ", undefined, null, {}]) {
+    assert.equal(parseReviewRoundLimit(bad), undefined, String(bad));
+  }
+  assert.equal(isValidReviewRoundLimit(1), true);
+  assert.equal(isValidReviewRoundLimit(100), true);
+  assert.equal(isValidReviewRoundLimit(0), false);
+  assert.equal(isValidReviewRoundLimit(101), false);
+});
+
+test("review round labels mark the recommendation and the current value", () => {
+  assert.equal(formatReviewRoundLimitLabel(5), "5 rounds (recommended default)");
+  assert.equal(formatReviewRoundLimitLabel(8), "8 rounds");
+  assert.equal(formatReviewRoundLimitLabel(8, 8), "8 rounds (current)");
+  assert.equal(formatReviewRoundLimitLabel(5, 5), "5 rounds (recommended default) (current)");
+});
+
+test("setup offers presets plus a custom review round limit", async () => {
+  const preset = fakeUiContext({ select: ["12 rounds"] });
+  assert.equal(await chooseReviewRoundLimit(preset.ctx), 12);
+  assert.ok(preset.prompts[0]?.includes("Maximum review rounds per phase"));
+
+  const custom = fakeUiContext({ select: ["Custom…"], input: ["37"] });
+  assert.equal(await chooseReviewRoundLimit(custom.ctx, 5), 37);
+  assert.equal(custom.notices.length, 0);
+
+  const retry = fakeUiContext({ select: ["Custom…"], input: ["0", "abc", "101", "42"] });
+  assert.equal(await chooseReviewRoundLimit(retry.ctx), 42);
+  assert.equal(retry.notices.length, 3);
+  assert.ok(retry.notices.every((entry) => entry.level === "warning"));
+  assert.match(retry.notices[0]?.message ?? "", /between 1 and 100/u);
+
+  const cancelled = fakeUiContext({ select: ["Cancel"] });
+  assert.equal(await chooseReviewRoundLimit(cancelled.ctx), undefined);
+
+  const abortedInput = fakeUiContext({ select: ["Custom…"], input: [undefined] });
+  assert.equal(await chooseReviewRoundLimit(abortedInput.ctx), undefined);
+});
+
+test("an existing custom limit stays visible and selectable in the editor", async () => {
+  const { ctx, prompts } = fakeUiContext({ select: ["Custom… (current: 37)"], input: ["37"] });
+  let offered: string[] = [];
+  const capturing = {
+    hasUI: true,
+    ui: {
+      select: async (title: string, options: string[]) => {
+        offered = options;
+        prompts.push(title);
+        return options.find((option) => option === "Custom… (current: 37)");
+      },
+      input: async (title: string) => {
+        prompts.push(title);
+        return "37";
+      },
+      notify: () => {},
+    },
+  } as unknown as Parameters<typeof chooseReviewRoundLimit>[0];
+  assert.equal(await chooseReviewRoundLimit(capturing, 37), 37);
+  assert.equal(await chooseReviewRoundLimit(ctx, 37), 37);
 });

@@ -165,6 +165,8 @@ The configured number is the maximum **Executor → Reviewer cycles per phase**.
 
 Default: **5 rounds per phase**.
 
+The setup dialog offers the presets `3 / 5 / 8 / 12 / 20` plus **Custom…**, which accepts any whole number from **1 to 100** (`0` is rejected: a phase needs at least one executor round — bound unattended runs with the execution timeout instead). `/plan-execute settings <run-id>` uses the same dialog for a frozen run.
+
 If the limit is exhausted without Reviewer `PASS`, the workflow pauses for the user instead of looping indefinitely. Raise the limit through `/plan-execute settings <run-id>` and run `/plan-execute resume <run-id>` to continue in the same run: the checkpoint is re-verified and the persisted round-limit pause is reopened for the remaining rounds.
 
 ### Agent permission handling

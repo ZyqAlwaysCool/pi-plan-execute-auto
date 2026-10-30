@@ -97,6 +97,10 @@ const PHASE_ENTRY = "plan-execute-phase";
 /** Persist a timeline warning once this fraction of the whole-run budget is consumed. */
 export const BUDGET_WARNING_RATIO = 0.8;
 const REVIEW_ROUND_CHOICES = [3, 5, 8, 12, 20] as const;
+/** The frozen package and `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS` both enforce this range. */
+export const MIN_REVIEW_ROUND_LIMIT = 1;
+export const MAX_REVIEW_ROUND_LIMIT = 100;
+const CUSTOM_REVIEW_ROUND_LABEL = "Custom…";
 /** Setup-stage whole-run Execution & Review budgets. `0` means no timeout. */
 const STAGE_TIMEOUT_CHOICES = [
   { label: "5 minutes", ms: 5 * 60 * 1000 },
@@ -709,6 +713,66 @@ export async function chooseStageTimeout(ctx: ExtensionCommandContext): Promise<
   }
 }
 
+/** Review-round limits are whole numbers of Executor → Reviewer cycles per phase. */
+export function isValidReviewRoundLimit(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) &&
+    value >= MIN_REVIEW_ROUND_LIMIT && value <= MAX_REVIEW_ROUND_LIMIT;
+}
+
+/** Accepts raw UI/env text and returns a valid limit, or `undefined` when it is not one. */
+export function parseReviewRoundLimit(raw: unknown): number | undefined {
+  if (typeof raw === "number") return isValidReviewRoundLimit(raw) ? raw : undefined;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+  const parsed = Number(trimmed);
+  return isValidReviewRoundLimit(parsed) ? parsed : undefined;
+}
+
+export function formatReviewRoundLimitLabel(value: number, current?: number): string {
+  const parts = [`${value} rounds`];
+  if (value === DEFAULT_MAX_REVIEW_ROUNDS) parts.push("(recommended default)");
+  if (current !== undefined && current === value) parts.push("(current)");
+  return parts.join(" ");
+}
+
+/**
+ * Choose the review-round limit from presets or any custom value in the supported range.
+ *
+ * The presets are a convenience, not a closed set: a phase whose gates are genuinely slow may need
+ * more or fewer cycles than any preset, so the dialog accepts any whole number from 1 to 100.
+ */
+export async function chooseReviewRoundLimit(
+  ctx: ExtensionCommandContext,
+  current?: number,
+): Promise<number | undefined> {
+  const presetLabels = REVIEW_ROUND_CHOICES.map((value) => formatReviewRoundLimitLabel(value, current));
+  const customLabel = current !== undefined && !(REVIEW_ROUND_CHOICES as readonly number[]).includes(current)
+    ? `${CUSTOM_REVIEW_ROUND_LABEL} (current: ${current})`
+    : CUSTOM_REVIEW_ROUND_LABEL;
+  const choice = await ctx.ui.select("Maximum review rounds per phase", [...presetLabels, customLabel, "Cancel"]);
+  if (!choice || choice === "Cancel") return undefined;
+  if (choice === customLabel) {
+    for (;;) {
+      const raw = await ctx.ui.input(
+        `Custom maximum review rounds per phase (${MIN_REVIEW_ROUND_LIMIT}–${MAX_REVIEW_ROUND_LIMIT})`,
+        `e.g. ${current ?? DEFAULT_MAX_REVIEW_ROUNDS}`,
+      );
+      if (raw === undefined) return undefined;
+      const parsed = parseReviewRoundLimit(raw);
+      if (parsed !== undefined) return parsed;
+      ctx.ui.notify(
+        `Enter a whole number between ${MIN_REVIEW_ROUND_LIMIT} and ${MAX_REVIEW_ROUND_LIMIT}. ` +
+        "0 rounds is not a valid limit because a phase needs at least one executor round; " +
+        "bound unattended runs with the execution timeout instead.",
+        "warning",
+      );
+    }
+  }
+  const index = presetLabels.indexOf(choice);
+  return index >= 0 ? REVIEW_ROUND_CHOICES[index] : undefined;
+}
+
 export async function runSetupWizard(
   ctx: ExtensionCommandContext,
   clis: DetectedCli[] | (() => Promise<DetectedCli[]>),
@@ -785,12 +849,8 @@ export async function runSetupWizard(
     "The remaining round budget is injected into both agents every round so they can converge instead of drip-feeding work or findings. " +
     "If the limit is exhausted without PASS, execution pauses for you instead of looping indefinitely.",
     "info");
-  const roundLabels = REVIEW_ROUND_CHOICES.map((value) =>
-    `${value} rounds${value === DEFAULT_MAX_REVIEW_ROUNDS ? " (recommended default)" : ""}`);
-  const roundChoice = await ctx.ui.select("Maximum review rounds per phase", [...roundLabels, "Cancel"]);
-  if (!roundChoice || roundChoice === "Cancel") return undefined;
-  const reviewRoundLimit = REVIEW_ROUND_CHOICES[roundLabels.indexOf(roundChoice)];
-  if (!reviewRoundLimit) return undefined;
+  const reviewRoundLimit = await chooseReviewRoundLimit(ctx);
+  if (reviewRoundLimit === undefined) return undefined;
 
   notify(ctx,
     "Agent permission handling does not remove tools. Autonomous mode automatically accepts one-time tool permission prompts so execution can continue unattended. " +
@@ -1104,11 +1164,8 @@ async function commandSettings(ctx: ExtensionCommandContext, runIdArg?: string):
         if (!chosen || chosen === "Cancel") continue;
         settings.permissionMode = chosen === askLabel ? "ask" : "autonomous";
       } else if (choice.startsWith("Review round limit: ")) {
-        const roundLabels = REVIEW_ROUND_CHOICES.map((value) => `${value} rounds${value === DEFAULT_MAX_REVIEW_ROUNDS ? " (recommended default)" : ""}`);
-        const chosen = await ctx.ui.select("Maximum review rounds per phase", [...roundLabels, "Cancel"]);
-        if (!chosen || chosen === "Cancel") continue;
-        const limit = REVIEW_ROUND_CHOICES[roundLabels.indexOf(chosen)];
-        if (!limit) continue;
+        const limit = await chooseReviewRoundLimit(ctx, settings.reviewRoundLimit);
+        if (limit === undefined) continue;
         settings.reviewRoundLimit = limit;
       } else if (choice.startsWith("Execution timeout: ")) {
         const ms = await chooseStageTimeout(ctx);
@@ -1897,9 +1954,9 @@ async function startStageB(
         throw new Error("PI_PLAN_EXECUTE_PERMISSION_MODE must be autonomous or ask.");
       }
       configuredPermissionMode = permissionMode;
-      const reviewLimit = Number(process.env.PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS ?? DEFAULT_MAX_REVIEW_ROUNDS);
-      if (!Number.isInteger(reviewLimit) || reviewLimit < 1 || reviewLimit > 100) {
-        throw new Error("PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS must be an integer from 1 to 100.");
+      const reviewLimit = parseReviewRoundLimit(process.env.PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS ?? DEFAULT_MAX_REVIEW_ROUNDS);
+      if (reviewLimit === undefined) {
+        throw new Error(`PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS must be an integer from ${MIN_REVIEW_ROUND_LIMIT} to ${MAX_REVIEW_ROUND_LIMIT}.`);
       }
       configuredReviewRoundLimit = reviewLimit;
       requireAcpNetworkRiskAcknowledgement();
