@@ -20,7 +20,7 @@ import {
 } from "../src/pause.js";
 
 test("resumability is explicit and only covers execution interruptions", () => {
-  for (const code of ["ABORTED", "TIMEOUT", "HUMAN_STOP", "SESSION_ABORT", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED", REPAIR_VERIFIED_CODE]) {
+  for (const code of ["ABORTED", "TIMEOUT", "HUMAN_STOP", "SESSION_ABORT", "HARNESS_ERROR", "PROCESS_RESTART", "PROCESS_RESTART_RECONCILED", "ACCEPTANCE_ENVIRONMENT_MISSING", "ACCEPTANCE_BLOCKED_REPEAT", REPAIR_VERIFIED_CODE]) {
     assert.equal(pauseResumable(code), true, code);
     assert.ok(RESUMABLE_PAUSE_CODES.has(code), code);
   }
@@ -152,4 +152,15 @@ test("duration and stage-timeout formatting cover minutes, hours, and unlimited"
   assert.equal(parseStageTimeoutValue(5 * 60_000), 5 * 60_000);
   assert.equal(parseStageTimeoutValue(0), 0);
   assert.equal(parseStageTimeoutValue(undefined), 30 * 60_000);
+});
+
+test("acceptance environment blocks stay resumable and say what to fix", () => {
+  for (const code of ["ACCEPTANCE_ENVIRONMENT_MISSING", "ACCEPTANCE_BLOCKED_REPEAT"]) {
+    assert.equal(pauseResumable(code), true, code);
+    const record = createPauseRecord({ code, summary: "blocked", stage: "preflight", detail: "missing go" });
+    assert.equal(record.resumable, true, code);
+    const details = formatPauseDetails(record);
+    assert.ok(details.some((line) => /resumable interruption/u.test(line)), code);
+    assert.match(formatPauseHeadline(record), /resumable/u);
+  }
 });

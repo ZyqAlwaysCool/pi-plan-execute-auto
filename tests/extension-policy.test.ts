@@ -9,6 +9,7 @@ import planExecuteAuto, {
   applyProfileToFrozenState,
   approvalStartsStageB,
   budgetWarningEvent,
+  acceptanceRepeatLimit,
   buildFinalizePrompt,
   evaluateResumeEligibility,
   frozenProfileMismatch,
@@ -172,6 +173,17 @@ test("inline directive is authoritative for plan selection but never bypasses hu
   assert.match(prompt, /Do not implement code or approve\/freeze/u);
   assert.match(prompt, /end this Main Pi turn with only a brief handoff/u);
   assert.match(prompt, /Do not restate or summarize the draft plan/u);
+  assert.match(prompt, /Acceptance self-tests run inside a minimal sandbox/u);
+  assert.match(prompt, /self_tests\[\]\.requires/u);
+  assert.match(prompt, /self_tests\[\]\.timeout_ms/u);
+});
+
+test("acceptance budget and repeat-limit env knobs are clamped, not trusted", () => {
+  assert.equal(acceptanceRepeatLimit({}), 3);
+  assert.equal(acceptanceRepeatLimit({ PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT: "1" }), 1);
+  assert.equal(acceptanceRepeatLimit({ PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT: "0" }), 3);
+  assert.equal(acceptanceRepeatLimit({ PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT: "999" }), 20);
+  assert.equal(acceptanceRepeatLimit({ PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT: "nope" }), 3);
 });
 
 test("queued human review waits for full agent settlement and never blocks turn_end", () => {

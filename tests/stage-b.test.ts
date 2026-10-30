@@ -1872,3 +1872,144 @@ test("resume after multiple completed phases accepts HEAD descending from earlie
     await rm(setup.cwd, { recursive: true, force: true });
   }
 });
+
+async function setupRepoWithCommand(command: string, requires?: string[]): Promise<Awaited<ReturnType<typeof setupRepo>>> {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-plan-execute-auto-stage-b-env-"));
+  await git(cwd, ["init", "-q"]);
+  await git(cwd, ["config", "user.email", "test@example.invalid"]);
+  await git(cwd, ["config", "user.name", "Stage B Test"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, ".gitignore"), ".pi-plan-execute-auto/\n", "utf8");
+  await writeFile(join(cwd, "src", "existing.txt"), "base\n", "utf8");
+  await git(cwd, ["add", "."]);
+  await git(cwd, ["commit", "-qm", "initial"]);
+  const input: FinalizeInput = {
+    run_id: "stage-b-env-test",
+    manifest: {
+      version: 1,
+      documents: [],
+      phases: [{
+        id: "phase-01",
+        order: 1,
+        spec: "phases/phase-01.md",
+        acceptance: "acceptance/phase-01.yaml",
+        commit: { required: true, message: "pi-plan-execute-auto: complete phase-01" },
+      }],
+    },
+    files: [
+      { path: "phases/phase-01.md", content: "Create src/change.txt.\n" },
+      {
+        path: "acceptance/phase-01.yaml",
+        content: [
+          "version: 1",
+          "phase_id: phase-01",
+          "scope:",
+          "  allowed_paths:",
+          "    - src/**",
+          "self_tests:",
+          "  - id: unit",
+          `    command: ${JSON.stringify(command)}`,
+          "    required: true",
+          ...(requires ? ["    requires:", ...requires.map((entry) => `      - ${entry}`)] : []),
+          "review:",
+          "  require_no_blocking_findings: true",
+          "commit:",
+          "  required: true",
+          "  allow_empty: false",
+          "",
+        ].join("\n"),
+      },
+    ],
+  };
+  const written = await writeValidatedPackage(cwd, input, "stage-b-env-test");
+  const validation = await validatePackageDirectory(written.package.root);
+  if (!validation.package) throw new Error("test package did not validate");
+  return { cwd, packageRoot: written.package.root, pkg: validation.package };
+}
+
+test("acceptance environment preflight pauses before the executor burns a round", async () => {
+  const setup = await setupRepoWithCommand("go test ./...");
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = new FakeHarness(setup.cwd, base);
+    const probed: string[] = [];
+    const result = await runController(setup, harness, 5, {
+      runId: "stage-b-env-test",
+      acceptanceRunner: {
+        async run(command) {
+          probed.push(command);
+          if (command.includes("command -v")) return { stdout: "", stderr: "go: not found", code: 1 };
+          return { stdout: "", stderr: "", code: 0 };
+        },
+      },
+    });
+    assert.equal(result.status, "paused");
+    assert.equal(result.state.pause?.code, "ACCEPTANCE_ENVIRONMENT_MISSING");
+    assert.equal(result.state.pause?.resumable, true);
+    assert.equal(result.state.pause?.stage, "preflight");
+    assert.equal(harness.executeCalls, 0, "executor must not start when the environment cannot run the gate");
+    assert.equal(harness.reviewCalls, 0);
+    assert.deepEqual(probed, ["command -v -- 'go' >/dev/null 2>&1"]);
+    assert.match(result.reason ?? "", /ACCEPTANCE_ENVIRONMENT_MISSING/u);
+    assert.match(result.state.pause?.detail ?? "", /PATH order/u);
+    assert.equal(result.state.phases[0]?.review_rounds, 0);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("acceptance environment preflight accepts declared repository-relative tool paths", async () => {
+  const setup = await setupRepoWithCommand("true", ["./.cache/toolchain/bin/go"]);
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = new FakeHarness(setup.cwd, base);
+    const probed: string[] = [];
+    const result = await runController(setup, harness, 5, {
+      runId: "stage-b-env-test",
+      acceptanceRunner: {
+        async run(command) {
+          probed.push(command);
+          return { stdout: "", stderr: "", code: 0 };
+        },
+      },
+    });
+    assert.equal(result.status, "completed", JSON.stringify({ pause: result.state.pause, probed }));
+    assert.equal(probed[0], "test -x './.cache/toolchain/bin/go'");
+    assert.ok(probed.slice(1).every((command) => command === "true"), JSON.stringify(probed));
+    assert.equal(harness.executeCalls, 1);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});
+
+test("an identical acceptance failure pauses instead of consuming the remaining rounds", async () => {
+  const setup = await setupRepo();
+  try {
+    const base = (await git(setup.cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    const harness = new FakeHarness(setup.cwd, base);
+    const state = createDraftState(setup.pkg, "stage-b-test");
+    state.status = "frozen";
+    const result = await new StageBController({
+      package: setup.pkg,
+      state,
+      git: new GitWorkspace({ run: (args) => git(setup.cwd, args) }, {
+        cwd: setup.cwd,
+        runtimeRoot: ".pi-plan-execute-auto/stage-b-test",
+      }),
+      acceptanceRunner: { async run() { return { stdout: "", stderr: "same failure", code: 2 }; } },
+      harness,
+      maxReviewRounds: 10,
+      acceptanceRepeatLimit: 3,
+      requireDedicatedWorktree: false,
+      saveState: (next) => writeWorkflowState(setup.packageRoot, next),
+    }).run();
+    assert.equal(result.status, "paused");
+    assert.equal(result.state.pause?.code, "ACCEPTANCE_BLOCKED_REPEAT");
+    assert.equal(result.state.pause?.round, 3);
+    assert.equal(result.state.pause?.resumable, true);
+    assert.equal(harness.executeCalls + harness.reworkCalls, 3, "three rounds ran, the rest were not burned");
+    assert.match(result.state.pause?.detail ?? "", /unit/u);
+  } finally {
+    await rm(setup.cwd, { recursive: true, force: true });
+  }
+});

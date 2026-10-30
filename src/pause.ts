@@ -38,6 +38,10 @@ export const RESUMABLE_PAUSE_CODES: ReadonlySet<string> = new Set([
   "HARNESS_ERROR",
   "PROCESS_RESTART",
   "PROCESS_RESTART_RECONCILED",
+  // Environment blocks are host/sandbox conditions, never source evidence. The plugin pauses
+  // before burning more review rounds and lets a human fix the host and resume.
+  "ACCEPTANCE_ENVIRONMENT_MISSING",
+  "ACCEPTANCE_BLOCKED_REPEAT",
   REPAIR_VERIFIED_CODE,
 ]);
 

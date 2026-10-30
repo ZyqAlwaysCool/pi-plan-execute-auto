@@ -32,6 +32,7 @@ import { promisify } from "node:util";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { CustomBackendConfig } from "@automatalabs/workflows";
+import { DEFAULT_ACCEPTANCE_TIMEOUT_MS } from "./acceptance.js";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import type { GitCommandResult } from "./types.js";
 
@@ -1803,7 +1804,7 @@ async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promi
     const profilePath = await writeMacSandboxProfile(normalized, scratchPath, runtime, hostRuntime);
     const environment = macSandboxEnvironment(normalized, scratchPath, runtime);
     await exerciseMacOSFilesystemBoundary(normalized, "acceptance", sandboxExec, profilePath, environment);
-    const timeout = options.timeout ?? 120_000;
+    const timeout = options.timeout ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS;
     try {
       const result = await execFile(
         sandboxExec,
@@ -1818,11 +1819,13 @@ async function runMacOSSandboxedCommand(options: SandboxedCommandOptions): Promi
       return { stdout: result.stdout, stderr: result.stderr, code: 0 };
     } catch (error) {
       const failure = error as { code?: unknown; killed?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown };
+      const timedOut = failure.code === "ETIMEDOUT";
       return {
         stdout: outputText(failure.stdout),
         stderr: outputText(failure.stderr),
         code: typeof failure.code === "number" ? failure.code : -1,
-        ...(failure.killed || failure.signal || failure.code === "ETIMEDOUT" || failure.code === "ABORT_ERR" ? { killed: true } : {}),
+        ...(timedOut ? { timed_out: true } : {}),
+        ...(failure.killed || failure.signal || timedOut || failure.code === "ABORT_ERR" ? { killed: true } : {}),
       };
     }
   } finally {
@@ -1861,7 +1864,7 @@ export async function runSandboxedCommand(options: SandboxedCommandOptions): Pro
     const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
     addMinimalFilesystem(args, normalized, scratchPath, runtime);
     await exerciseFilesystemBoundary(normalized, "acceptance", bwrap, args);
-    const timeout = options.timeout ?? 120_000;
+    const timeout = options.timeout ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS;
     try {
       const result = await execFile(bwrap, [...args, "--", "/bin/bash", "-lc", options.command], {
         timeout,
@@ -1871,11 +1874,13 @@ export async function runSandboxedCommand(options: SandboxedCommandOptions): Pro
       return { stdout: result.stdout, stderr: result.stderr, code: 0 };
     } catch (error) {
       const failure = error as { code?: unknown; killed?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown };
+      const timedOut = failure.code === "ETIMEDOUT";
       return {
         stdout: outputText(failure.stdout),
         stderr: outputText(failure.stderr),
         code: typeof failure.code === "number" ? failure.code : -1,
-        ...(failure.killed || failure.signal || failure.code === "ETIMEDOUT" || failure.code === "ABORT_ERR" ? { killed: true } : {}),
+        ...(timedOut ? { timed_out: true } : {}),
+        ...(failure.killed || failure.signal || timedOut || failure.code === "ABORT_ERR" ? { killed: true } : {}),
       };
     }
   } finally {

@@ -1,6 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { runAcceptance, requiredAcceptancePassed, formatAcceptanceResults } from "./acceptance.js";
+import {
+  DEFAULT_ACCEPTANCE_TIMEOUT_MS,
+  acceptanceFailureFingerprint,
+  formatAcceptanceDiagnosis,
+  formatAcceptanceResults,
+  requiredAcceptancePassed,
+  runAcceptance,
+} from "./acceptance.js";
+import { describeAcceptanceSandbox, planAcceptanceProbes } from "./acceptance-environment.js";
 import {
   GitPolicyError,
   GitWorkspace,
@@ -59,8 +67,9 @@ import {
 } from "./package-validator.js";
 
 const MAX_SECTION_BYTES = 24_000;
-const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120_000;
 const DEFAULT_GIT_TIMEOUT_MS = 30_000;
+const DEFAULT_ACCEPTANCE_REPEAT_LIMIT = 3;
+const ACCEPTANCE_PROBE_TIMEOUT_MS = 30_000;
 const MAX_PREVIOUS_FINDING_IDS = 512;
 const MAX_PREVIOUS_FINDING_ID_BYTES = 32_000;
 const MAX_REVIEW_HISTORY_REPORTS = 100;
@@ -141,6 +150,11 @@ export interface StageBControllerOptions {
   signal?: AbortSignal | undefined;
   maxReviewRounds?: number | undefined;
   acceptanceTimeoutMs?: number | undefined;
+  /**
+   * Stop repeating an identical, unfixable acceptance failure. `1` disables the guard; the default
+   * is 3 consecutive identical fingerprints.
+   */
+  acceptanceRepeatLimit?: number | undefined;
   gitTimeoutMs?: number | undefined;
   /** Extension entry points set this; unit tests may use an explicitly in-memory harness. */
   requireDedicatedWorktree?: boolean;
@@ -156,14 +170,20 @@ export class StageBController {
   private readonly options: StageBControllerOptions;
   private readonly maxReviewRounds: number;
   private readonly acceptanceTimeoutMs: number;
+  private readonly acceptanceRepeatLimit: number;
   private readonly gitTimeoutMs: number;
   private readonly state: WorkflowState;
+  /** Phases whose acceptance environment preflight already passed in this controller instance. */
+  private readonly acceptanceEnvironmentVerified = new Set<string>();
+  private acceptanceFingerprint: string | undefined;
+  private acceptanceRepeatCount = 0;
 
   constructor(options: StageBControllerOptions) {
     this.options = options;
     this.state = options.state;
     this.maxReviewRounds = options.maxReviewRounds ?? options.state.review_round_limit ?? options.package.manifest.max_review_rounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
     this.acceptanceTimeoutMs = options.acceptanceTimeoutMs ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS;
+    this.acceptanceRepeatLimit = options.acceptanceRepeatLimit ?? DEFAULT_ACCEPTANCE_REPEAT_LIMIT;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
   }
 
@@ -195,6 +215,100 @@ export class StageBController {
       ...(this.options.signal ? { signal: this.options.signal } : {}),
       timeout: this.acceptanceTimeoutMs,
     };
+  }
+
+  /**
+   * Verify — inside the real acceptance sandbox — that every declared requirement and every
+   * command's leading executable resolves, before the executor is started.
+   *
+   * This is the root-cause guard for the failure mode where a frozen contract referenced a host
+   * tool that the sandbox cannot see: previously the executor spent rounds re-reporting
+   * `command not found` while each round consumed review budget. The preflight is cheap (one probe
+   * per distinct target, 30s cap) and pauses with an actionable, resumable diagnosis instead.
+   */
+  private async guardAcceptanceEnvironment(phase: PhasePackage): Promise<StageBRunResult | undefined> {
+    if (this.acceptanceEnvironmentVerified.has(phase.phase.id)) return undefined;
+    const probes = planAcceptanceProbes(phase.acceptance.self_tests);
+    if (probes.length === 0) {
+      this.acceptanceEnvironmentVerified.add(phase.phase.id);
+      return undefined;
+    }
+    const missing: string[] = [];
+    const probeTimeout = Math.min(ACCEPTANCE_PROBE_TIMEOUT_MS, this.acceptanceTimeoutMs);
+    for (const probe of probes) {
+      if (this.options.signal?.aborted) {
+        return this.pause(phase, this.abortPause("preflight", "Execution & Review was cancelled during acceptance environment preflight."));
+      }
+      let result;
+      try {
+        result = await this.options.acceptanceRunner.run(probe.command, {
+          ...(this.options.signal ? { signal: this.options.signal } : {}),
+          timeout: probeTimeout,
+        });
+      } catch (error) {
+        missing.push(`${probe.test_id}: probing ${probe.target} failed: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
+      if (result.killed) {
+        missing.push(`${probe.test_id}: probe for ${probe.target} was killed before it completed.`);
+        continue;
+      }
+      if (result.code !== 0) {
+        missing.push(
+          `${probe.test_id}: ${probe.kind === "command" ? "command" : "executable path"} ${probe.target}`
+          + ` is not resolvable inside the acceptance sandbox (exit ${result.code}).`,
+        );
+      }
+    }
+    if (missing.length === 0) {
+      this.acceptanceEnvironmentVerified.add(phase.phase.id);
+      return undefined;
+    }
+    return await this.pause(phase, {
+      code: "ACCEPTANCE_ENVIRONMENT_MISSING",
+      stage: "preflight",
+      summary: `Acceptance environment is missing ${missing.length} of ${probes.length} probed requirement(s); no executor round was started.`,
+      detail: [
+        ...missing,
+        "",
+        "The frozen acceptance contract cannot be edited by the executor, so this is a host/plan mismatch, not a source failure.",
+        "Fix the host (install the tool, repair the symlink) or rewrite the phase acceptance contract, then resume.",
+        "",
+        ...describeAcceptanceSandbox(),
+      ].join("\n"),
+    });
+  }
+
+  /**
+   * Detect an acceptance failure that repeats byte-identically: the executor has no remaining lever
+   * (the contract is frozen and the environment is not the executor's to change), so spending the
+   * remaining review rounds on it is pure waste.
+   */
+  private async acceptanceRepeatPause(phase: PhasePackage, results: readonly AcceptanceResult[], round: number): Promise<StageBRunResult | undefined> {
+    const fingerprint = acceptanceFailureFingerprint(results);
+    if (fingerprint === undefined) {
+      this.acceptanceFingerprint = undefined;
+      this.acceptanceRepeatCount = 0;
+      return undefined;
+    }
+    if (fingerprint === this.acceptanceFingerprint) this.acceptanceRepeatCount += 1;
+    else {
+      this.acceptanceFingerprint = fingerprint;
+      this.acceptanceRepeatCount = 1;
+    }
+    if (this.acceptanceRepeatLimit <= 1 || this.acceptanceRepeatCount < this.acceptanceRepeatLimit) return undefined;
+    const failing = results.filter((result) => result.required && !result.passed).map((result) => result.id);
+    return await this.pause(phase, {
+      code: "ACCEPTANCE_BLOCKED_REPEAT",
+      stage: "acceptance",
+      summary: `Deterministic acceptance repeated the identical failure ${this.acceptanceRepeatCount} times (round ${round}); stopping before consuming the remaining review budget.`,
+      detail: [
+        `Failing self-tests: ${failing.join(", ") || "(none reported)"}`,
+        formatAcceptanceDiagnosis(results),
+        "An identical fingerprint across rounds means the round did not change the outcome: either the environment blocks the gate or the contract itself is unsatisfiable.",
+        "Repair the host/environment or revise the phase acceptance contract, then resume; a new fingerprint resets this guard.",
+      ].join("\n"),
+    });
   }
 
   private phaseState(phase: PhasePackage): PhaseState {
@@ -460,6 +574,8 @@ export class StageBController {
       `The sandbox exposes a read-only Git metadata mirror for the run's own history (planning baseline through the current phase base ${baseCommit}); it never mounts the shared host Git directory or unrelated history. Use Git to inspect status/diff, but never stage or commit. The plugin owns all commits.`,
       "You must work in the supplied workspace, inspect the source yourself, and execute every required self-test in the frozen acceptance contract on every round.",
       "Your structured self_tests entries must exactly copy every required test id and command and report passed only after actually running it.",
+      `acceptance_command_budget_ms: ${this.acceptanceTimeoutMs} (per required command unless the contract declares self_tests[].timeout_ms)`,
+      promptSection("ACCEPTANCE SANDBOX CONTRACT (the plugin runs these commands here, not in your shell)", describeAcceptanceSandbox().join("\n"), 6_000),
       "The plugin, not you, owns phase commits.",
       `golden_package_root: ${this.options.package.root}`,
       `golden_package_hash: ${this.state.package_hash}`,
@@ -595,6 +711,9 @@ export class StageBController {
       `Deterministic acceptance:\n${formatAcceptanceResults(acceptance)}`,
     ];
     if (validationError) pieces.push(`Executor evidence validation: ${validationError}`);
+    if (acceptance.some((result) => result.timed_out === true)) {
+      pieces.push(`Killed by the plugin budget, not by the project:\n${formatAcceptanceDiagnosis(acceptance)}`);
+    }
     if (outOfScope.length > 0) pieces.push(`Out-of-scope changed paths (must be corrected, do not reset history): ${outOfScope.join(", ")}`);
     if (review) pieces.push(formatReviewFeedback(review));
     pieces.push("Do not commit. Return a new structured execution report after fixing the findings and rerunning every required self-test.");
@@ -685,6 +804,10 @@ export class StageBController {
     let history = await this.loadReviewHistory(phase);
     let feedback: string | undefined = resumingFromCheckpoint ? this.resumeFeedback(phase, history) : undefined;
     let freshResumeTurn = resumingFromCheckpoint;
+    const environmentPause = await this.guardAcceptanceEnvironment(phase);
+    if (environmentPause) return environmentPause;
+    this.acceptanceFingerprint = undefined;
+    this.acceptanceRepeatCount = 0;
     while (phaseState.review_rounds < this.maxReviewRounds) {
       if (this.options.signal?.aborted) {
         return this.pause(phase, this.abortPause("phase", "Execution & Review was cancelled before phase completion."));
@@ -774,6 +897,8 @@ export class StageBController {
       await this.save();
       if (execution.status !== "complete" || evidenceError || outOfScope.length > 0 || !requiredAcceptancePassed(acceptance)) {
         feedback = this.feedbackForExecution(execution, acceptance, outOfScope, undefined, evidenceError);
+        const repeatPause = await this.acceptanceRepeatPause(phase, acceptance, round);
+        if (repeatPause) return repeatPause;
         if (round >= this.maxReviewRounds) {
           return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "acceptance", summary: `Phase did not pass deterministic validation after ${round} review rounds.` });
         }
@@ -883,6 +1008,8 @@ export class StageBController {
       const finalOutOfScope = await this.assertScope(phase);
       if (!requiredAcceptancePassed(finalAcceptance) || finalOutOfScope.length > 0) {
         feedback = this.feedbackForExecution(execution, finalAcceptance, finalOutOfScope, review);
+        const repeatPause = await this.acceptanceRepeatPause(phase, finalAcceptance, round);
+        if (repeatPause) return repeatPause;
         if (round >= this.maxReviewRounds) {
           return this.pause(phase, { code: "MAX_REVIEW_ROUNDS", stage: "acceptance", summary: `Acceptance failed after reviewer PASS on round ${round}.` });
         }

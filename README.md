@@ -184,6 +184,38 @@ When the budget expires, the run pauses as a resumable `TIMEOUT` checkpoint inst
 
 Every pause is classified in the persisted state and the `workflow_paused` run event: `TIMEOUT`, `HUMAN_STOP`, `SESSION_ABORT`, `PROCESS_RESTART`, `HARNESS_ERROR`, evidence/safety failures, and so on, together with `stage`, `round`, and whether the checkpoint is resumable. Repairable evidence pauses advertise a repair-and-resume path instead of outright refusal; a verified repair records `workflow_repair_verified` and an `EVIDENCE_REPAIRED` resumable checkpoint. `/plan-execute status` and the Pi state entry show the code; the live widget also shows the remaining budget (`12m left`) so a timeout is visible before it fires.
 
+### Acceptance command contract
+
+Every phase acceptance self-test runs inside the same containment boundary as the agents — not in the host shell — with `cwd` set to the run's dedicated worktree. A gate that works in your terminal can still be unrunnable there, so the contract is documented instead of discovered:
+
+- **Mounted read-write:** the dedicated per-run worktree (at its host absolute path).
+- **Mounted read-only:** the run package directory (`.pi-plan-execute-auto/<run-id>`), the worktree's `.git` pointer into the run's Git metadata mirror, `/usr`, `/bin`, `/lib`, `/lib64`, `/sbin`, `/usr/local`, `/etc/ssl/certs`, `/etc/hosts`, `/etc/passwd`, the plugin runtime under `/agent-runtime`, and a mirror of the host `~/.local/bin` as `<runtime-home>/.local/bin`.
+- **Mounted as private scratch:** `/tmp`.
+- **Hidden:** the host project root, the host home directory, and every other host path.
+- **PATH order:** `<runtime-home>/.local/bin`, `<runtime-home>/.cargo/bin`, `<runtime-home>/bin`, `/agent-runtime/node-bin`, `/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`.
+- **Environment:** private `HOME`, `TMPDIR=/tmp`, cleared host credentials, normal network access.
+
+Consequences for plan authors:
+
+1. Prefer repository-relative tool paths (`./.cache/go-toolchain/bin/go test ...`) over bare host commands.
+2. Declare every non-obvious tool in `self_tests[].requires`; the plugin probes each declared entry (and each command's leading executable) inside the real sandbox **before** the first executor round, and pauses with `ACCEPTANCE_ENVIRONMENT_MISSING` (resumable, with the mount list in the detail) instead of burning review rounds on `command not found`.
+3. Give genuinely slow gates an explicit `self_tests[].timeout_ms`. The plugin budget defaults to **10 minutes per command** and is overridable globally.
+
+```yaml
+self_tests:
+  - id: race
+    command: bash scripts/test-agent.sh race
+    required: true
+    timeout_ms: 900000      # 15 minutes; integers only, 5s..2h
+    requires:               # sandbox PATH command names or relative/absolute paths
+      - bash
+      - ./.cache/go-toolchain/bin/go
+```
+
+Both new fields are optional, so packages frozen by earlier plugin versions keep validating and resuming unchanged.
+
+A command killed by its budget is reported as `timed_out: true` with the effective `timeout_ms`, never as an anonymous signal death. If the same structural acceptance failure (same failing tests, same exit codes/timeouts) repeats `PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT` times (default **3**), the run pauses as a resumable `ACCEPTANCE_BLOCKED_REPEAT` instead of spending its remaining rounds on an outcome the executor cannot change.
+
 ## Isolation model
 
 The common `IsolationProvider` is platform-native. Linux/WSL uses `bubblewrap`; macOS uses Apple's Seatbelt policy through the system-owned `/usr/bin/sandbox-exec`. Its job is **containment**, not capability reduction.
@@ -295,7 +327,9 @@ Headless execution can additionally set:
 
 - `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=low|medium|high|max` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=low|medium|high|max` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides;
 - `PI_PLAN_EXECUTE_PERMISSION_MODE=autonomous|ask`;
-- `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`.
+- `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`;
+- `PI_PLAN_EXECUTE_ACCEPTANCE_TIMEOUT_MS=<milliseconds>` — default per-command acceptance budget (default 600000, clamped to 5000..7200000). Contract-level `self_tests[].timeout_ms` wins for that test;
+- `PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT=1..20` — consecutive identical structural acceptance failures tolerated before a resumable `ACCEPTANCE_BLOCKED_REPEAT` pause (default 3; `1` disables the guard).
 
 Interactive setup remains the normal workflow.
 

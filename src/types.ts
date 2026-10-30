@@ -44,6 +44,18 @@ export interface AcceptanceSelfTest {
   id: string;
   command: string;
   required: boolean;
+  /**
+   * Optional per-test wall-clock budget. Overrides the plugin-wide acceptance timeout so a
+   * legitimately slow gate (for example a race-enabled suite) cannot be killed by a default
+   * that was sized for fast unit commands.
+   */
+  timeout_ms?: number;
+  /**
+   * Optional environment requirements probed inside the real acceptance sandbox before the
+   * first executor round. Each entry is either a command name resolved through the sandbox
+   * PATH (`go`) or a repository-relative/absolute executable path (`./.cache/toolchain/bin/go`).
+   */
+  requires?: string[];
 }
 
 export interface AcceptanceContract {
@@ -148,6 +160,10 @@ export interface AcceptanceResult {
   passed: boolean;
   stdout: string;
   stderr: string;
+  /** True when the command exceeded its budget; distinguishes a timeout from a crash or signal. */
+  timed_out?: boolean;
+  /** Effective budget applied to this command, so a timeout report is self-explanatory. */
+  timeout_ms?: number;
 }
 
 export interface PhaseCompletionRecord {
@@ -215,6 +231,7 @@ export type KnownPauseCode =
   | "PROCESS_RESTART_EVIDENCE" | "STARTUP_EVIDENCE" | "WORKTREE_IDENTITY_MISMATCH"
   | "COMPLETION_GIT_EVIDENCE" | "WORKTREE_SETUP" | "EXECUTION_UNHANDLED"
   | "MAX_REVIEW_ROUNDS" | "ACCEPTANCE_FAILED"
+  | "ACCEPTANCE_ENVIRONMENT_MISSING" | "ACCEPTANCE_BLOCKED_REPEAT"
   | "WORKSPACE_SYMLINK_ESCAPE" | "EVIDENCE_REPAIRED";
 export type PauseStage =
   | "executor" | "reviewer" | "acceptance" | "commit" | "phase" | "setup" | "preflight" | "unknown";
@@ -305,6 +322,8 @@ export interface GitCommandResult {
   stderr: string;
   code: number;
   killed?: boolean;
+  /** True only when the process was killed because its own budget expired. */
+  timed_out?: boolean;
 }
 
 export interface GitOperations {

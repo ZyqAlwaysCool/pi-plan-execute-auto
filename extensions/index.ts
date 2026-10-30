@@ -7,6 +7,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
+import { clampAcceptanceTimeoutMs, DEFAULT_ACCEPTANCE_TIMEOUT_MS } from "../src/acceptance.js";
+import { describeAcceptanceSandbox } from "../src/acceptance-environment.js";
 import {
   formatValidationIssues,
   makeRunId,
@@ -92,7 +94,6 @@ import type {
 const WIDGET_KEY = "pi-plan-execute-auto";
 const STATE_ENTRY = "plan-execute-state";
 const PHASE_ENTRY = "plan-execute-phase";
-const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120 * 1000;
 /** Persist a timeline warning once this fraction of the whole-run budget is consumed. */
 export const BUDGET_WARNING_RATIO = 0.8;
 const REVIEW_ROUND_CHOICES = [3, 5, 8, 12, 20] as const;
@@ -116,6 +117,7 @@ const FINALIZE_PROMPT_LINES = [
   "The user explicitly invoked /plan-execute.",
   "Use the complete current conversation and repository investigation context to call plan_execute_finalize.",
   "Create a Golden Document Package with at least one ordered phase. Every phase needs its own spec, acceptance YAML contract, and required completion commit.",
+  "Acceptance self-tests run inside a minimal sandbox, not in the host shell. Declare every non-obvious tool in self_tests[].requires and give genuinely slow gates an explicit self_tests[].timeout_ms; never rely on a host-only absolute path or on a command that the sandbox PATH does not contain.",
   "Do not implement code or approve/freeze the package on the user's behalf. The plugin will validate the draft, let the human request revisions repeatedly, and ask for approval.",
   "Do not supply executor_model or reviewer_model: only the human's /plan-execute setup selection owns the ACP routing.",
   "After plan_execute_finalize succeeds, end this Main Pi turn with only a brief handoff that the validated draft is ready and the plugin Review & Approval UI will open.",
@@ -875,6 +877,10 @@ async function commandSetup(ctx: ExtensionCommandContext): Promise<void> {
         `✓ Isolation: ${isolation.provider}`,
         ...isolationDetails,
         "✓ Agent/tool network: normal host networking",
+        `✓ Acceptance command budget: ${Math.round(acceptanceTimeoutMs() / 1000)}s per command (PI_PLAN_EXECUTE_ACCEPTANCE_TIMEOUT_MS, or self_tests[].timeout_ms in the contract)`,
+        `✓ Identical acceptance failures tolerated: ${acceptanceRepeatLimit()} (PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT)`,
+        "",
+        ...describeAcceptanceSandbox(),
         "✓ Plugin-level socat dependency: none (Claude Code may require socat only for its own native Linux/WSL Bash sandbox)",
       ].join("\n"),
       "info",
@@ -1209,8 +1215,17 @@ export function stageTimeoutMs(profile?: ProjectPluginProfile, env: NodeJS.Proce
 }
 
 function acceptanceTimeoutMs(): number {
-  const parsed = Number(process.env.PI_PLAN_EXECUTE_ACCEPTANCE_TIMEOUT_MS ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACCEPTANCE_TIMEOUT_MS;
+  return clampAcceptanceTimeoutMs(process.env.PI_PLAN_EXECUTE_ACCEPTANCE_TIMEOUT_MS);
+}
+
+/**
+ * Consecutive identical acceptance failures tolerated before the run pauses with
+ * `ACCEPTANCE_BLOCKED_REPEAT`. `1` disables the guard.
+ */
+export function acceptanceRepeatLimit(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.PI_PLAN_EXECUTE_ACCEPTANCE_REPEAT_LIMIT ?? "");
+  if (!Number.isFinite(parsed) || parsed < 1) return 3;
+  return Math.min(20, Math.max(1, Math.round(parsed)));
 }
 
 /**
@@ -2104,6 +2119,7 @@ async function startStageB(
       harness: sessionPair,
       signal: linked.signal,
       acceptanceTimeoutMs: acceptanceTimeoutMs(),
+      acceptanceRepeatLimit: acceptanceRepeatLimit(),
       requireDedicatedWorktree: true,
       resumePaused: resumeRequested,
       saveState: (next) => writeWorkflowState(pkg.root, next),

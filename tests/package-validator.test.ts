@@ -307,3 +307,110 @@ test("plugin-owned run ids are stable-format and include independent entropy", (
   assert.match(first, /^run-[0-9]{8}t[0-9]{6}z-[0-9a-f]{16}$/u);
   assert.throws(() => makeRunId(at, "not-random"), /16 hexadecimal/);
 });
+
+function acceptanceInput(selfTestLines: string[]): FinalizeInput {
+  const input = validInput();
+  const acceptance = input.files.find((file) => file.path === "acceptance/phase-01.yaml");
+  if (!acceptance) throw new Error("test fixture is missing its acceptance file");
+  acceptance.content = [
+    "version: 1",
+    "phase_id: phase-01",
+    "scope:",
+    "  allowed_paths:",
+    "    - src/**",
+    "self_tests:",
+    ...selfTestLines,
+    "review:",
+    "  require_no_blocking_findings: true",
+    "commit:",
+    "  required: true",
+    "  allow_empty: false",
+    "",
+  ].join("\n");
+  return input;
+}
+
+test("self-tests may declare an explicit budget and environment requirements", async () => {
+  const cwd = await tempDir();
+  try {
+    const input = acceptanceInput([
+      "  - id: race",
+      "    command: bash scripts/test.sh race",
+      "    required: true",
+      "    timeout_ms: 900000",
+      "    requires:",
+      "      - go",
+      "      - ./.cache/toolchain/bin/go",
+    ]);
+    const written = await writeValidatedPackage(cwd, input, "validator-test");
+    const selfTest = written.package.phases[0]?.acceptance.self_tests[0];
+    assert.equal(selfTest?.timeout_ms, 900000);
+    assert.deepEqual(selfTest?.requires, ["go", "./.cache/toolchain/bin/go"]);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("self-tests without the new optional fields keep validating unchanged", async () => {
+  const cwd = await tempDir();
+  try {
+    const written = await writeValidatedPackage(cwd, validInput(), "validator-test");
+    const selfTest = written.package.phases[0]?.acceptance.self_tests[0];
+    assert.equal(selfTest?.id, "unit");
+    assert.equal(selfTest?.timeout_ms, undefined);
+    assert.equal(selfTest?.requires, undefined);
+    assert.equal("timeout_ms" in (selfTest ?? {}), false);
+    assert.equal("requires" in (selfTest ?? {}), false);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("invalid self-test budgets are rejected before any run starts", async () => {
+  for (const [value, label] of [["0", "zero"], ["999999999", "too large"], ["1.5", "fractional"], ["'soon'", "string"]]) {
+    const cwd = await tempDir();
+    try {
+      const input = acceptanceInput([
+        "  - id: unit",
+        "    command: node --test",
+        "    required: true",
+        `    timeout_ms: ${value}`,
+      ]);
+      await assert.rejects(
+        writeValidatedPackage(cwd, input, "validator-test"),
+        (error: unknown) => {
+          const issues = (error as { issues?: Array<{ code?: string; path?: string }> }).issues ?? [];
+          assert.ok(issues.some((entry) => entry.code === "SELF_TEST_TIMEOUT_INVALID"), `${label}: ${issues.map((entry) => entry.code).join(",")}`);
+          return true;
+        },
+      );
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  }
+});
+
+test("invalid environment requirements are rejected before any run starts", async () => {
+  const cases: Array<{ lines: string[]; label: string }> = [
+    { lines: ["    requires: []"], label: "empty array" },
+    { lines: ["    requires: go"], label: "not an array" },
+    { lines: ["    requires:", "      - go test"], label: "shell fragment" },
+    { lines: ["    requires:", "      - go", "      - go"], label: "duplicate" },
+  ];
+  for (const entry of cases) {
+    const cwd = await tempDir();
+    try {
+      const input = acceptanceInput([
+        "  - id: unit",
+        "    command: node --test",
+        "    required: true",
+        ...entry.lines,
+      ]);
+      await assert.rejects(
+        writeValidatedPackage(cwd, input, "validator-test"),
+        (error: unknown) => {
+          const issues = (error as { issues?: Array<{ code?: string }> }).issues ?? [];
+          assert.ok(
+            issues.some((code) => (code.code ?? "").startsWith("SELF_TEST_REQUIRES")),
+            `${entry.label}: ${issues.map((entry) => entry.code).join(",")}`,
+          );
+          return true;
+        },
+      );
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  }
+});

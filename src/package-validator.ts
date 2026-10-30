@@ -13,6 +13,11 @@ import {
 import { dirname, isAbsolute, join, posix, resolve, sep } from "node:path";
 import YAML from "yaml";
 import {
+  MAX_ACCEPTANCE_TIMEOUT_MS,
+  MIN_ACCEPTANCE_TIMEOUT_MS,
+  isValidAcceptanceTimeoutMs,
+} from "./acceptance.js";
+import {
   MANIFEST_FILE,
   RUNTIME_DIRECTORY,
   STATE_FILE,
@@ -32,6 +37,10 @@ import {
 
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** A declared environment requirement: a sandbox PATH command name or a relative/absolute path. */
+const ACCEPTANCE_REQUIREMENT_PATTERN = /^[A-Za-z0-9._/+@-]{1,200}$/;
+const MAX_ACCEPTANCE_REQUIREMENTS = 16;
+const MAX_ACCEPTANCE_SELF_TESTS = 64;
 
 export interface PackageValidationResult {
   ok: boolean;
@@ -313,6 +322,64 @@ function validateManifest(
   return manifest;
 }
 
+function validateSelfTestTimeout(
+  value: unknown,
+  path: string,
+  errors: PackageValidationIssue[],
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!isInteger(value) || !isValidAcceptanceTimeoutMs(value)) {
+    issue(
+      errors,
+      "SELF_TEST_TIMEOUT_INVALID",
+      path,
+      `optional per-test timeout must be an integer between ${MIN_ACCEPTANCE_TIMEOUT_MS} and ${MAX_ACCEPTANCE_TIMEOUT_MS} milliseconds.`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
+function validateSelfTestRequirements(
+  value: unknown,
+  path: string,
+  errors: PackageValidationIssue[],
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    issue(errors, "SELF_TEST_REQUIRES_INVALID", path, "optional requires must be an array of command names or paths.");
+    return undefined;
+  }
+  if (value.length === 0) {
+    issue(errors, "SELF_TEST_REQUIRES_INVALID", path, "optional requires must not be an empty array.");
+    return undefined;
+  }
+  if (value.length > MAX_ACCEPTANCE_REQUIREMENTS) {
+    issue(errors, "SELF_TEST_REQUIRES_INVALID", path, `optional requires must declare at most ${MAX_ACCEPTANCE_REQUIREMENTS} entries.`);
+    return undefined;
+  }
+  const requirements: string[] = [];
+  const seen = new Set<string>();
+  value.forEach((entry, index) => {
+    if (!isString(entry) || !ACCEPTANCE_REQUIREMENT_PATTERN.test(entry)) {
+      issue(
+        errors,
+        "SELF_TEST_REQUIRES_INVALID",
+        `${path}[${index}]`,
+        "requirement must be a command name (go) or a repository-relative/absolute executable path with no whitespace or shell metacharacters.",
+      );
+      return;
+    }
+    if (seen.has(entry)) {
+      issue(errors, "SELF_TEST_REQUIRES_DUPLICATE", `${path}[${index}]`, `duplicate requirement ${entry}.`);
+      return;
+    }
+    seen.add(entry);
+    requirements.push(entry);
+  });
+  return requirements.length === value.length ? requirements : undefined;
+}
+
 function validateAcceptance(
   value: unknown,
   phase: PhaseReference,
@@ -388,15 +455,31 @@ function validateAcceptance(
       if (typeof entry.required !== "boolean") {
         issue(errors, "SELF_TEST_REQUIRED_INVALID", `${path}.required`, "self test required must be boolean.");
       }
+      const timeoutMs = validateSelfTestTimeout(entry.timeout_ms, `${path}.timeout_ms`, errors);
+      const requires = validateSelfTestRequirements(entry.requires, `${path}.requires`, errors);
       if (
         isNonEmptyString(entry.id) &&
         ID_PATTERN.test(entry.id) &&
         isNonEmptyString(entry.command) &&
         typeof entry.required === "boolean"
       ) {
-        selfTests.push({ id: entry.id, command: entry.command.trim(), required: entry.required });
+        selfTests.push({
+          id: entry.id,
+          command: entry.command.trim(),
+          required: entry.required,
+          ...(timeoutMs !== undefined ? { timeout_ms: timeoutMs } : {}),
+          ...(requires !== undefined ? { requires } : {}),
+        });
       }
     });
+    if (value.self_tests.length > MAX_ACCEPTANCE_SELF_TESTS) {
+      issue(
+        errors,
+        "SELF_TESTS_TOO_MANY",
+        `${source}.self_tests`,
+        `self_tests must declare at most ${MAX_ACCEPTANCE_SELF_TESTS} entries.`,
+      );
+    }
   }
 
   if (selfTests.length === 0) {
