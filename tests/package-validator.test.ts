@@ -248,10 +248,10 @@ test("freeze binds the human-selected ACP models and high effort to the run", as
   }
 });
 
-test("low, medium and max ACP effort survive freeze and state reload without silent downgrade", async () => {
+test("low, medium, xhigh, ultra and max ACP effort survive freeze and state reload without silent downgrade", async () => {
   const cwd = await tempDir();
   try {
-    for (const reasoningEffort of ["low", "medium", "max"] as const) {
+    for (const reasoningEffort of ["low", "medium", "xhigh", "ultra", "max"] as const) {
       const runId = `effort-${reasoningEffort}`;
       const written = await writeValidatedPackage(cwd, validInput(), runId);
       await writeWorkflowState(written.package.root, createDraftState(written.package, runId));

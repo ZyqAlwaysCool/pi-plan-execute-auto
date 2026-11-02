@@ -698,3 +698,47 @@ test("stage timeout resolution prefers the approved profile and the explicit hea
   assert.equal(stageTimeoutMs(undefined, {} as NodeJS.ProcessEnv), 30 * 60 * 1000);
   assert.equal(stageTimeoutMs({ stageTimeoutMs: 0 } as ProjectPluginProfile, { PI_PLAN_EXECUTE_STAGE_B_TIMEOUT_MS: "60000" } as NodeJS.ProcessEnv), 0);
 });
+
+test("deeper backend reasoning labels survive profile save, reload and headless selection", async () => {
+  const { root, project, agentDir } = await fixture();
+  const keys = ["PI_PLAN_EXECUTE_EXECUTOR_MODEL", "PI_PLAN_EXECUTE_REVIEWER_MODEL",
+    "PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT", "PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT",
+    "PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK"] as const;
+  const before = keys.map((key) => process.env[key]);
+  try {
+    await saveProjectPluginProfile(project, {
+      executorModel: "pi/openai-codex/gpt-6.1-terra", reviewerModel: "codex/gpt-6.1-sol",
+      executorReasoningEffort: "xhigh", reviewerReasoningEffort: "ultra",
+    }, agentDir);
+    const loaded = await loadProjectPluginProfile(project, agentDir);
+    assert.equal(loaded?.executorReasoningEffort, "xhigh");
+    assert.equal(loaded?.reviewerReasoningEffort, "ultra");
+    for (const key of keys) delete process.env[key];
+    process.env.PI_PLAN_EXECUTE_EXECUTOR_MODEL = "pi/openai-codex/gpt-6.1-terra";
+    process.env.PI_PLAN_EXECUTE_REVIEWER_MODEL = "codex/gpt-6.1-sol";
+    process.env.PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT = "xhigh";
+    process.env.PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT = "ultra";
+    process.env.PI_PLAN_EXECUTE_ACCEPT_ACP_NETWORK_RISK = "1";
+    const selection = await approvedSetup(project, false, undefined, agentDir);
+    assert.equal(selection?.executorReasoningEffort, "xhigh");
+    assert.equal(selection?.reviewerReasoningEffort, "ultra");
+    assert.equal(selection?.profile?.reviewerReasoningEffort, "ultra");
+  } finally {
+    keys.forEach((key, index) => { if (before[index] === undefined) delete process.env[key]; else process.env[key] = before[index]; });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a malformed persisted reasoning label is still rejected on load", async () => {
+  const { root, project, agentDir } = await fixture();
+  try {
+    await saveProjectPluginProfile(project, { executorModel: "codex/gpt-6-luna", reviewerModel: "codex/gpt-6-luna", reviewerReasoningEffort: "xhigh" }, agentDir);
+    const profiles = join(agentDir, "plan-execute-auto", "profiles");
+    const [profileFile] = await readdir(profiles);
+    const path = join(profiles, profileFile!);
+    const saved = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    saved.reviewerReasoningEffort = "X HIGH";
+    await writeFile(path, `${JSON.stringify(saved)}\n`);
+    await assert.rejects(loadProjectPluginProfile(project, agentDir), /invalid|unsafe plan-execute configuration/i);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

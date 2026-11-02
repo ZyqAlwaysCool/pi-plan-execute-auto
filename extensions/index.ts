@@ -76,6 +76,8 @@ import {
   DEFAULT_STAGE_TIMEOUT_MS,
   MAX_STAGE_TIMEOUT_MS,
   MIN_STAGE_TIMEOUT_MS,
+  isValidReasoningEffort,
+  orderReasoningEfforts,
 } from "../src/types.js";
 import type {
   AcceptanceCommandRunner,
@@ -606,7 +608,8 @@ async function chooseRoleEffort(
   discover: () => Promise<ReasoningEffort[]>,
 ): Promise<ReasoningEffort | "default" | undefined> {
   const efforts = await withSetupProgress(ctx, `${role}: loading reasoning levels for ${model}`, discover);
-  const choices = (["low", "medium", "high", "max"] as const).filter((effort) => efforts.includes(effort));
+  // Backend catalog is authoritative: Codex advertises xhigh/ultra beyond the historical four.
+  const choices = orderReasoningEfforts(efforts);
   const chosen = await ctx.ui.select(`${role}: reasoning effort for ${model}`, [...choices, "backend default", "Cancel"]);
   if (!chosen || chosen === "Cancel") return undefined;
   return chosen === "backend default" ? "default" : selectStageBReasoningEffort(chosen);
@@ -1212,8 +1215,11 @@ function makeAcceptanceRunner(
 
 export function selectStageBReasoningEffort(value: string | undefined): ReasoningEffort | undefined {
   if (!value) return undefined;
-  if (value !== "low" && value !== "medium" && value !== "high" && value !== "max") {
-    throw new Error("PI_PLAN_EXECUTE_REASONING_EFFORT accepts only low, medium, high, or max.");
+  if (!isValidReasoningEffort(value)) {
+    throw new Error(
+      "Reasoning effort must be a backend-advertised label such as low, medium, high, xhigh, max, or ultra; " +
+      "run setup to see the levels your selected model actually advertises.",
+    );
   }
   return value;
 }

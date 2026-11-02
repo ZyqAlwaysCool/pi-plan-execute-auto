@@ -210,7 +210,37 @@ export interface PhaseState {
   last_error?: string;
 }
 
-export type ReasoningEffort = "low" | "medium" | "high" | "max";
+/**
+ * Reasoning label advertised by an ACP backend.
+ *
+ * Deliberately an open label rather than a closed union: Codex advertises
+ * `low / medium / high / xhigh / max` (some builds also `ultra`), and a hardcoded list silently
+ * dropped the deeper levels from setup and rejected them when resuming. The backend catalog is
+ * authoritative; the plugin only enforces a safe label shape and presence in that catalog.
+ */
+export type ReasoningEffort = string;
+
+/** Safe label shape for a backend-advertised reasoning level. */
+export const REASONING_EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/u;
+
+export function isValidReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === "string" && REASONING_EFFORT_PATTERN.test(value);
+}
+
+/** Display order for known levels; unknown advertised labels keep a stable lexical position. */
+const REASONING_EFFORT_RANK = new Map(
+  ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map((label, index) => [label, index] as const),
+);
+
+/** Deduplicate advertised levels and order them from cheapest to deepest for the setup dialog. */
+export function orderReasoningEfforts(advertised: readonly string[]): ReasoningEffort[] {
+  const unique = [...new Set(advertised.filter((label) => isValidReasoningEffort(label)))];
+  return unique.sort((left, right) => {
+    const leftRank = REASONING_EFFORT_RANK.get(left) ?? Number.MAX_SAFE_INTEGER;
+    const rightRank = REASONING_EFFORT_RANK.get(right) ?? Number.MAX_SAFE_INTEGER;
+    return leftRank === rightRank ? left.localeCompare(right) : leftRank - rightRank;
+  });
+}
 export type AgentPermissionMode = "autonomous" | "ask";
 
 /** Whole-run Execution & Review budget. `0` means no timeout. */

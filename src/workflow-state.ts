@@ -8,6 +8,7 @@ import {
 import { completionRecordRelativePath, validatePhaseCompletionRecord } from "./completion.js";
 import { createLocalGitOperations, GitWorkspace, phaseEvidenceHashesForRecord } from "./git.js";
 import {
+  isValidReasoningEffort,
   type PhaseState,
   type ValidatedPackage,
   type WorkflowState,
@@ -66,7 +67,7 @@ export async function loadValidatedRun(
     throw new Error(`Workflow ${runId} package hash does not match its frozen state.`);
   }
   for (const effort of [state.reasoning_effort, state.executor_reasoning_effort, state.reviewer_reasoning_effort]) {
-    if (effort !== undefined && !["low", "medium", "high", "max"].includes(effort)) {
+    if (effort !== undefined && !isValidReasoningEffort(effort)) {
       throw new Error(`Workflow ${runId} has an unsupported persisted reasoning effort.`);
     }
   }

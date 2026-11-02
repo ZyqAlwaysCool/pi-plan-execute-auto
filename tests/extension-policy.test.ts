@@ -27,13 +27,27 @@ import planExecuteAuto, {
   workflowPausedEvent,
 } from "../extensions/index.js";
 import { createPauseRecord } from "../src/pause.js";
+import { orderReasoningEfforts } from "../src/types.js";
 import type { ProjectPluginProfile } from "../src/plugin-config.js";
 
-test("Stage B accepts only explicit supported ACP reasoning levels", () => {
+test("Stage B accepts every backend-advertised reasoning label", () => {
   assert.equal(selectStageBReasoningEffort(undefined), undefined);
   assert.equal(selectStageBReasoningEffort(""), undefined);
-  for (const effort of ["low", "medium", "high", "max"]) assert.equal(selectStageBReasoningEffort(effort), effort);
-  assert.throws(() => selectStageBReasoningEffort("ultra"), /accepts only low, medium, high, or max/);
+  for (const effort of ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
+    assert.equal(selectStageBReasoningEffort(effort), effort);
+  }
+  for (const invalid of ["HIGH", "x high", "xhigh\n", "-high", "x".repeat(40)]) {
+    assert.throws(() => selectStageBReasoningEffort(invalid), /backend-advertised label/);
+  }
+});
+
+test("reasoning labels are deduplicated and ordered cheapest to deepest", () => {
+  assert.deepEqual(
+    orderReasoningEfforts(["max", "high", "xhigh", "high", "low", "ultra", "medium"]),
+    ["low", "medium", "high", "xhigh", "max", "ultra"],
+  );
+  assert.deepEqual(orderReasoningEfforts(["turbo", "high"]), ["high", "turbo"]);
+  assert.deepEqual(orderReasoningEfforts(["HIGH", "", "high"]), ["high"]);
 });
 
 test("settings sync keeps a frozen run identical to the approved profile", () => {

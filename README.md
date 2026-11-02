@@ -158,7 +158,7 @@ Setup performs an environment preflight before saving configuration:
   - macOS: Apple's system `/usr/bin/sandbox-exec` Seatbelt launcher;
 - the selected isolation provider passes its preflight before any Executor/Reviewer session can start;
 - installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi;
-- Executor model/reasoning and Reviewer model/reasoning are chosen independently;
+- Executor model/reasoning and Reviewer model/reasoning are chosen independently. The reasoning list is the model's **own advertised catalog**, so backend-specific levels such as Codex `xhigh` and `ultra` appear when the selected Codex build advertises them. The plugin no longer hardcodes `low/medium/high/max`;
 - an optional live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable; choosing **No** skips the check and setup still completes normally;
 - if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;
@@ -345,7 +345,7 @@ npm run test:acp:pi:required
 
 Headless execution can additionally set:
 
-- `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=low|medium|high|max` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=low|medium|high|max` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides;
+- `PI_PLAN_EXECUTE_EXECUTOR_REASONING_EFFORT=<label>` and `PI_PLAN_EXECUTE_REVIEWER_REASONING_EFFORT=<label>` (independent, optional); legacy `PI_PLAN_EXECUTE_REASONING_EFFORT` applies to both roles and cannot be combined with per-role overrides. `<label>` is any level the selected model advertises (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` on current Codex builds). A label the runtime does not advertise is refused at start/resume preflight rather than downgraded;
 - `PI_PLAN_EXECUTE_PERMISSION_MODE=autonomous|ask`;
 - `PI_PLAN_EXECUTE_MAX_REVIEW_ROUNDS=1..100`;
 - `PI_PLAN_EXECUTE_ACCEPTANCE_TIMEOUT_MS=<milliseconds>` — default per-command acceptance budget (default 600000, clamped to 5000..7200000). Contract-level `self_tests[].timeout_ms` wins for that test;

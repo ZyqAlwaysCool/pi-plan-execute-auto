@@ -10,7 +10,14 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { AcpAgent } from "@automatalabs/workflows";
 import { createSandboxedBackend, supportedBackendForModel, verifySandboxBoundary } from "./sandbox.js";
 import { configureAcpAgent } from "./acp-configuration.js";
-import { DEFAULT_MAX_REVIEW_ROUNDS, isValidStageTimeoutMs, type AgentPermissionMode, type ReasoningEffort } from "./types.js";
+import {
+  DEFAULT_MAX_REVIEW_ROUNDS,
+  isValidReasoningEffort,
+  isValidStageTimeoutMs,
+  orderReasoningEfforts,
+  type AgentPermissionMode,
+  type ReasoningEffort,
+} from "./types.js";
 
 const execFile = promisify(execFileCallback);
 const MAX_PROFILE_BYTES = 16 * 1024;
@@ -244,7 +251,7 @@ export async function probeAcpConfiguration(
       for (const choice of option.options) {
         const leaves = "value" in choice ? [choice] : choice.options;
         for (const leaf of leaves) {
-          if (leaf.value === "low" || leaf.value === "medium" || leaf.value === "high" || leaf.value === "max") efforts.add(leaf.value);
+          if (isValidReasoningEffort(leaf.value)) efforts.add(leaf.value);
         }
       }
     }
@@ -254,7 +261,7 @@ export async function probeAcpConfiguration(
       const response = await agent.prompt("Connectivity probe only: reply READY. Do not call tools or edit files.", { signal: AbortSignal.timeout(90_000) });
       if (!response.text.trim()) throw new Error(`${backend} ACP connectivity probe returned no model response.`);
     }
-    return { models: [...ids].sort(), efforts: [...efforts] };
+    return { models: [...ids].sort(), efforts: orderReasoningEfforts([...efforts]) };
   } finally {
     await agent?.close({ keep: true }).catch(() => {});
     try { await sandbox?.cleanup(); } finally { await rm(root, { recursive: true, force: true }); }
@@ -295,9 +302,9 @@ function validateProfile(value: unknown, identity: { projectRoot: string; gitEnt
     typeof value.executorModel !== "string" || typeof value.reviewerModel !== "string" ||
     typeof value.networkRiskApprovedAt !== "string" || !Number.isFinite(Date.parse(value.networkRiskApprovedAt)) ||
     typeof value.configSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.configSha256) ||
-    (value.reasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reasoningEffort as string)) ||
-    (value.executorReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.executorReasoningEffort as string)) ||
-    (value.reviewerReasoningEffort !== undefined && !["low", "medium", "high", "max"].includes(value.reviewerReasoningEffort as string)) ||
+    (value.reasoningEffort !== undefined && !isValidReasoningEffort(value.reasoningEffort)) ||
+    (value.executorReasoningEffort !== undefined && !isValidReasoningEffort(value.executorReasoningEffort)) ||
+    (value.reviewerReasoningEffort !== undefined && !isValidReasoningEffort(value.reviewerReasoningEffort)) ||
     (value.reasoningEffort !== undefined && (value.executorReasoningEffort !== undefined || value.reviewerReasoningEffort !== undefined)) ||
     (value.permissionMode !== "autonomous" && value.permissionMode !== "ask") ||
     (value.stageTimeoutMs !== undefined && !isValidStageTimeoutMs(value.stageTimeoutMs)) ||
