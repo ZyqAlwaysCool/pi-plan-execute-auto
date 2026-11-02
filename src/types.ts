@@ -229,7 +229,8 @@ export function isValidReasoningEffort(value: unknown): value is ReasoningEffort
 
 /** Display order for known levels; unknown advertised labels keep a stable lexical position. */
 const REASONING_EFFORT_RANK = new Map(
-  ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map((label, index) => [label, index] as const),
+  ["off", "none", "disabled", "default", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+    .map((label, index) => [label, index] as const),
 );
 
 /** Deduplicate advertised levels and order them from cheapest to deepest for the setup dialog. */

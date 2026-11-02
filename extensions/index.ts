@@ -603,16 +603,21 @@ async function chooseConfiguredModel(
   return normalizeSelectedModel(selected.backend as AcpBackend, model);
 }
 
-async function chooseRoleEffort(
+export async function chooseRoleEffort(
   ctx: ExtensionCommandContext, role: "Executor" | "Reviewer", model: string,
   discover: () => Promise<ReasoningEffort[]>,
 ): Promise<ReasoningEffort | "default" | undefined> {
   const efforts = await withSetupProgress(ctx, `${role}: loading reasoning levels for ${model}`, discover);
-  // Backend catalog is authoritative: Codex advertises xhigh/ultra beyond the historical four.
+  // Backend catalog is authoritative: codex/claude expose xhigh, pi thinkingLevel exposes
+  // off/minimal/xhigh, opencode exposes non-think. Claude and OpenCode already advertise a literal
+  // "default" level, so do not show a second, equivalent "backend default" entry for them.
   const choices = orderReasoningEfforts(efforts);
-  const chosen = await ctx.ui.select(`${role}: reasoning effort for ${model}`, [...choices, "backend default", "Cancel"]);
+  const catalogsDefault = choices.includes("default");
+  const options = catalogsDefault ? choices : [...choices, "backend default"];
+  const chosen = await ctx.ui.select(`${role}: reasoning effort for ${model}`, [...options, "Cancel"]);
   if (!chosen || chosen === "Cancel") return undefined;
-  return chosen === "backend default" ? "default" : selectStageBReasoningEffort(chosen);
+  if (chosen === "backend default" || chosen === "default") return "default";
+  return selectStageBReasoningEffort(chosen);
 }
 
 function setupProfileSummary(profile: ProjectPluginProfile): string {

@@ -158,7 +158,16 @@ Setup performs an environment preflight before saving configuration:
   - macOS: Apple's system `/usr/bin/sandbox-exec` Seatbelt launcher;
 - the selected isolation provider passes its preflight before any Executor/Reviewer session can start;
 - installed Agent CLIs and their versions are shown; slow CLI/ACP model discovery, reasoning-level discovery, and connectivity probes show a live progress spinner in Pi;
-- Executor model/reasoning and Reviewer model/reasoning are chosen independently. The reasoning list is the model's **own advertised catalog**, so backend-specific levels such as Codex `xhigh` and `ultra` appear when the selected Codex build advertises them. The plugin no longer hardcodes `low/medium/high/max`;
+- Executor model/reasoning and Reviewer model/reasoning are chosen independently. The reasoning list is the model's **own advertised catalog**, discovered by ACP category (`thought_level`) rather than by a fixed option id, and shown cheapest to deepest. Current catalogs:
+
+  | Backend | Effort option | Advertised levels (observed) |
+  | --- | --- | --- |
+  | `codex/*` | `reasoning_effort` | low, medium, high, xhigh, max, ultra |
+  | `claude/*` | `effort` | default, low, medium, high, xhigh, max |
+  | `opencode/*` | `effort` | default, high, max, non-think (model-specific) |
+  | `pi/*` | `thinkingLevel` | off, minimal, low, medium, high, xhigh, max |
+
+  The plugin no longer hardcodes `low/medium/high/max`, and it does not invent levels a runtime did not advertise. When the catalog already contains a literal `default` level (Claude, OpenCode), the dialog does not add a second, equivalent "backend default" entry;
 - an optional live connectivity check is offered for each selected model/effort pair and is clearly marked as potentially billable; choosing **No** skips the check and setup still completes normally;
 - if Claude is selected, the wizard checks whether the user's own Claude native Bash sandbox is enabled and conditionally verifies `socat`;
 - review-loop limit and permission handling are explained and selected;

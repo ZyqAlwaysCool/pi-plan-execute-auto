@@ -14,10 +14,10 @@ import {
   DEFAULT_MAX_REVIEW_ROUNDS,
   isValidReasoningEffort,
   isValidStageTimeoutMs,
-  orderReasoningEfforts,
   type AgentPermissionMode,
   type ReasoningEffort,
 } from "./types.js";
+import { collectAdvertisedEfforts } from "./reasoning-efforts.js";
 
 const execFile = promisify(execFileCallback);
 const MAX_PROFILE_BYTES = 16 * 1024;
@@ -245,23 +245,14 @@ export async function probeAcpConfiguration(
         }
       }
     }
-    const efforts = new Set<ReasoningEffort>();
-    for (const option of agent.configOptions) {
-      if (option.type !== "select" || (option.id !== "reasoning_effort" && option.category !== "thought_level" && option.id !== "variant")) continue;
-      for (const choice of option.options) {
-        const leaves = "value" in choice ? [choice] : choice.options;
-        for (const leaf of leaves) {
-          if (isValidReasoningEffort(leaf.value)) efforts.add(leaf.value);
-        }
-      }
-    }
+    const efforts = collectAdvertisedEfforts(agent.configOptions);
     await sandbox.scrubCredentials();
     if (connectivityCheck) {
       if (!selectedModel) throw new Error("A selected model is required for an ACP provider call.");
       const response = await agent.prompt("Connectivity probe only: reply READY. Do not call tools or edit files.", { signal: AbortSignal.timeout(90_000) });
       if (!response.text.trim()) throw new Error(`${backend} ACP connectivity probe returned no model response.`);
     }
-    return { models: [...ids].sort(), efforts: orderReasoningEfforts([...efforts]) };
+    return { models: [...ids].sort(), efforts };
   } finally {
     await agent?.close({ keep: true }).catch(() => {});
     try { await sandbox?.cleanup(); } finally { await rm(root, { recursive: true, force: true }); }

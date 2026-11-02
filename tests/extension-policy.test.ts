@@ -676,3 +676,20 @@ test("an existing custom limit stays visible and selectable in the editor", asyn
   assert.equal(await chooseReviewRoundLimit(capturing, 37), 37);
   assert.equal(await chooseReviewRoundLimit(ctx, 37), 37);
 });
+
+test("reasoning-effort dialogs list the full advertised catalog and avoid a duplicate default", async () => {
+  const { chooseRoleEffort } = await import("../extensions/index.js");
+  const seen: string[][] = [];
+  const ctx = {
+    cwd: process.cwd(), hasUI: true,
+    ui: {
+      setStatus() {}, notify() {},
+      async select(_title: string, choices: string[]) { seen.push(choices); return "xhigh"; },
+    },
+  } as unknown as Parameters<typeof chooseRoleEffort>[0];
+  assert.equal(await chooseRoleEffort(ctx, "Reviewer", "codex/gpt-6.1-sol", async () => ["low", "medium", "high", "xhigh", "max", "ultra"]), "xhigh");
+  assert.deepEqual(seen[0], ["low", "medium", "high", "xhigh", "max", "ultra", "backend default", "Cancel"]);
+  const second = { ...ctx, ui: { ...ctx.ui, select: async (_title: string, choices: string[]) => { seen.push(choices); return "default"; } } } as unknown as Parameters<typeof chooseRoleEffort>[0];
+  assert.equal(await chooseRoleEffort(second, "Reviewer", "claude/sonnet", async () => ["default", "low", "medium", "high", "xhigh", "max"]), "default");
+  assert.deepEqual(seen[1], ["default", "low", "medium", "high", "xhigh", "max", "Cancel"]);
+});

@@ -1,6 +1,6 @@
 {
   "name": "pi-plan-execute-auto",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Plan-and-execute workflow for Pi coding agent: human-approved phased plans, isolated per-phase execution, independent Executor and Reviewer agent CLI sessions, deterministic acceptance, rework loops, one validated git commit per phase, and resumable pause/stop.",
   "type": "module",
   "license": "MIT",
